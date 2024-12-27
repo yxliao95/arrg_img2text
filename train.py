@@ -56,7 +56,8 @@ class ImageTextDataset(Dataset):
         self.samples = self._process_data(img_dataset, text_dataset)
 
     def _process_data(self, img_dataset, text_dataset):
-        filtered_dataset = self._align_img_text(img_dataset, text_dataset)
+        # filtered_dataset = self._align_img_text(img_dataset, text_dataset)
+        new_ds = self._concat_text_to_img(img_dataset, text_dataset)
 
         def _process_img(batch_samples):
             batch_samples["pixel_values"] = []
@@ -70,9 +71,71 @@ class ImageTextDataset(Dataset):
             return batch_samples
 
         # The transform function is applied on-the-fly on batches when hf_dataset.__getitem__ is called.
-        filtered_dataset.set_transform(transform=_process_img)
+        new_ds.set_transform(transform=_process_img)
 
-        return filtered_dataset
+        return new_ds
+
+    def _concat_text_to_img(self, img_dataset, text_dataset):
+        rowId_img2text_map = {}
+        for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
+            data_split, imgDs_row_idx, section_name = doc_key.split("#")
+            rowId_img2text_map[int(imgDs_row_idx)] = int(textDs_row_idx)
+
+        # 因为要添加了额外的分量任务，所以text中没有的数据，在img中也要保留
+        textDs_column_names = text_dataset.column_names
+
+        def map_func(example, idx):
+            # 将 text_ds 的数据拼接到 img_ds 的数据中
+            if idx in rowId_img2text_map:
+                textDs_row_idx = rowId_img2text_map[idx]
+                textDS_row = text_dataset[textDs_row_idx]
+            else:
+                textDS_row = {col: None for col in textDs_column_names}
+            example.update(textDS_row)
+
+            # effusion 的分类任务标签
+            # present, absent, uncertain = 1, 0.5, 0
+            def get_effusion_label():
+                is_effusion_uncertain = False
+                if not textDS_row["cxrgraph_ent"]:
+                    return 0  # 默认为absent
+
+                for sent_ents, sent_radlexes in zip(textDS_row["cxrgraph_ent"], textDS_row["radlex"]):
+                    # 获取radlex中的effusion和pleural effusion
+                    candidate_nodes = []
+                    for radlex in sent_radlexes:
+                        if any([rid == radlex["radlex_id"] for rid in ["http://radlex.org/RID/RID4872", "http://radlex.org/RID/RID38588", "http://radlex.org/RID/RID34539"]]):
+                            candidate_nodes.append(radlex)
+
+                    # 如果ent的start和end，被candidate_radlex覆盖，就返回True
+                    def has_matched_candidate(tok_start, tok_end):
+                        for start, end in [radlex["tok_indices"] for radlex in candidate_nodes]:
+                            if tok_start >= start and tok_end <= end:
+                                return True
+                        return False
+
+                    # 通过radlex来选择cxrgraph的ent
+                    # 如果没有与radlex匹配的ent，那么就默认没有effusion；
+                    # 如果有匹配的ent：
+                    # 1. 只要有一个 effusion ent 被预测为 Present，就视为有effusion
+                    # 2. 对于plueral，其 type 为 Anatomy，不会对默认值产生影响 （默认没有 effusion）
+                    for ent in sent_ents:
+                        tok_start, tok_end = ent["tok_indices"]
+                        if has_matched_candidate(tok_start, tok_end):
+                            if ent["ent_type"] == "Observation-Present":
+                                # 只要有一个 effusion ent 被预测为 present, 就直接返回 present
+                                return 1
+                            elif ent["ent_type"] == "Observation-Uncertain":
+                                # 如果有一个 effusion ent 被预测为 Uncertain，且没有其他被预测为 present 的 effusion ent，就视为 Uncertain
+                                is_effusion_uncertain = True
+
+                return 0.5 if is_effusion_uncertain else 0
+
+            example["effusion_label"] = get_effusion_label()
+            return example
+
+        img_dataset = img_dataset.map(map_func, with_indices=True)
+        return img_dataset
 
     def _align_img_text(self, img_dataset, text_dataset):
         ds_indices_text_img = []
