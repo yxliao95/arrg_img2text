@@ -1,0 +1,4 @@
+编程语言：Python
+模型范式：深度强化学习
+框架：torch, torchvision，transformers, datasets
+CUDA: 12.4

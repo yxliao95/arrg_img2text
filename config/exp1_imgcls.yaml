@@ -1,0 +1,17 @@
+output_name: imgcls_exp1
+
+output_dir:
+  result: /home/yuxiang/liao/workspace/arrg_img2text/outputs/results
+  checkpoint: /home/yuxiang/liao/workspace/arrg_img2text/outputs/checkpoints
+  log: /home/yuxiang/liao/workspace/arrg_img2text/outputs/logs
+
+data_path:
+  mimic: /home/yuxiang/liao/resources/datasets/mimic-cxr
+  interpret: /home/yuxiang/liao/resources/datasets/interpret-cxr
+  interpret-test-public: /home/yuxiang/liao/resources/datasets/interpret-cxr-test-public
+  custom_text: /home/yuxiang/liao/workspace/arrg_preprocessing/outputs/interpret_text_exp/interpret_text_findings_effusion
+
+target_section: findings
+
+model_name_or_path:
+  clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
