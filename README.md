@@ -11,6 +11,8 @@ We are using CUDA/12.4
 - `conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.4 -c pytorch -c nvidia -y`
 - `pip install transformers` (==4.47.1)
 - `pip install datasets` (==3.2.0)
+- `pip install imagehash` (==4.3.1)
+<!-- - `pip install tensorboard` (==2.18.0) -->
 
 If CPU only
 
