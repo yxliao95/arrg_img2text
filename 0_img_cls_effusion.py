@@ -386,6 +386,7 @@ def train(model, train_dataloader, valid_dataloader):
     LOGGER.info("Total epochs = %d, total iterations per epoch = %d", train_cfg["num_epochs"], len(train_dataloader))
     LOGGER.info("Total optimization steps = %d", total_num_steps)
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
+    check_memory()
 
     status_info = StatusInfo()
     model.zero_grad()
@@ -423,6 +424,7 @@ def train(model, train_dataloader, valid_dataloader):
                 status_info.update_batch_info(curr_check_point="batch", curr_eval_split="validation")
                 eval_result_dict = evaluate(model, target_dataloader=valid_dataloader, status_info=status_info)
                 check_and_save(model, eval_result_dict, status_info)
+                check_memory()
 
         end = time.time()
         LOGGER.info("Batch training time: %d minutes (including in_batch eval)", (end - start) / 60)
@@ -522,6 +524,7 @@ def evaluate(model, target_dataloader, status_info=None):
 
     end = time.time()
     LOGGER.info("Evaluation time: %d minutes", (end - start) / 60)
+    check_memory()
     return task_f1
 
 
@@ -571,6 +574,17 @@ def load_model(model_path):
 
 def save_model(model, output_dir):
     model.save_pretrained(output_dir)
+
+
+def check_memory():
+    # 获取当前 GPU 设备的属性
+    device = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(device)
+    # 获取 GPU 总显存
+    total_memory = device_properties.total_memory / 1024**3  # 转换为 GB
+    # 获取Torch总占用显存
+    total_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+    LOGGER.info(f"Memory reserved: {total_reserved:.2f} / {total_memory:.2f} GB")
 
 
 #############################################
