@@ -4,10 +4,8 @@
 
 We are using CUDA/12.4
 
-- `conda create -n arrg_reinforce python=3.11 -y`
-    - conda create --name arrg_img2text --clone arrg_reinforce
-    - conda remove --name arrg_reinforce --all
-- `conda activate arrg_reinforce`
+- `conda create -n arrg_img2text python=3.11 -y`
+- `conda activate arrg_img2text`
 - `conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.4 -c pytorch -c nvidia -y`
 - `pip install transformers` (==4.47.1)
 - `pip install datasets` (==3.2.0)
