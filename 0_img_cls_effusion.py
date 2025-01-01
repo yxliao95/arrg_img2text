@@ -674,20 +674,20 @@ def set_seed(seed):
 
 #############################################
 
-def get_args(max_partition):
+def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--from_bash", action="store_true")
     parser.add_argument("--config_file", type=str, help=f".yaml file")
     return parser.parse_args()
 
 if __name__ == "__main__":
-    args = get_args(max_partition)
+    args = get_args()
     if args.from_bash:
         proj_cfg_file_name = args.config_file
     else:
         proj_cfg_file_name = "exp1_imgcls.yaml"
         
-    CONFIG = load_proj_config(file_name=config_file_name)
+    CONFIG = load_proj_config(file_name=proj_cfg_file_name)
     LOGGER = init_logger(log_file_mode="w")
     LOGGER.debug(CONFIG)
 
