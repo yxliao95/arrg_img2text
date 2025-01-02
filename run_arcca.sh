@@ -48,3 +48,6 @@ python /scratch/c.c21051562/workspace/arrg_img2text/test_email.py
 # Client side:
 # ssh -L 6007:localhost:6006 yuxiang@10.97.37.97
 # tensorboard --logdir=/home/yuxiang/liao/workspace/arrg_img2text/outputs/logs --port=6006
+
+# ssh -L 6007:localhost:6006 -J c.c21051562@hawklogin.cf.ac.uk c.c21051562@ccs2111
+# tensorboard --logdir=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs

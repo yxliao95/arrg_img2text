@@ -23,8 +23,6 @@ model:
 
 train:
   seed: 42
-  batch_size: 16
-  num_epochs: 30
   grad_accum_steps: 1
   warmup_proportion: 0.1
   weight_decay: 0.0
@@ -32,8 +30,10 @@ train:
   mlc_lr: 0.0001
   clip_grad_norm: 1.0
 
+  batch_size: 32
+  num_epochs: 30
   print_loss_per_n_steps: 100
-  eval_per_steps: 2000
+  eval_per_steps: 5000 # 550395 / 32 = 17199
 
 eval:
   batch_size: 32
