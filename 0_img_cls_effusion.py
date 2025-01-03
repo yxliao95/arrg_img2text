@@ -128,9 +128,9 @@ class ImageTextDataset(Dataset):
                 selected_image_indices = []
                 if len(images) <= 2:
                     selected_images = images
-                    selected_image_indices = list(range(len(images))) # [0] / [0, 1]
+                    selected_image_indices = list(range(len(images)))  # [0] / [0, 1]
                 else:
-                    
+
                     n = len(images)
                     max_hash_distance = -1
                     for i in range(0, n):
@@ -145,7 +145,7 @@ class ImageTextDataset(Dataset):
                                 max_hash_distance = hash_distance
                                 selected_images = [images[i], images[j]]
                                 selected_image_indices = [i, j]
-                
+
                 piexl_values = self.processor(images=selected_images, return_tensors="pt").pixel_values
                 batch_samples["selected_pixel_values"].append(piexl_values)
                 batch_samples["selected_image_indices"].append(selected_image_indices)
@@ -175,15 +175,52 @@ class ImageTextDataset(Dataset):
             else:
                 textDS_row = {col: None for col in textDs_column_names}
             example.update(textDS_row)
-            
-            example["effusion_label"] = self._get_effusion_label(col_cxrgraph_ent=textDS_row["cxrgraph_ent"], col_radlex=textDS_row["radlex"])  # [present, absent, uncertain]
+
+            # effusion 的分类任务标签 one-hot: [present, absent, uncertain]
+            def get_effusion_label():
+                is_effusion_uncertain = False
+                if not textDS_row["cxrgraph_ent"]:
+                    return [0, 1, 0]  # 默认为absent
+
+                for sent_ents, sent_radlexes in zip(textDS_row["cxrgraph_ent"], textDS_row["radlex"]):
+                    # 获取radlex中的effusion和pleural effusion
+                    candidate_nodes = []
+                    for radlex in sent_radlexes:
+                        if any([rid == radlex["radlex_id"] for rid in ["http://radlex.org/RID/RID4872", "http://radlex.org/RID/RID38588", "http://radlex.org/RID/RID34539"]]):
+                            candidate_nodes.append(radlex)
+
+                    # 如果ent的start和end，被candidate_radlex覆盖，就返回True
+                    def has_matched_candidate(tok_start, tok_end):
+                        for start, end in [radlex["tok_indices"] for radlex in candidate_nodes]:
+                            if tok_start >= start and tok_end <= end:
+                                return True
+                        return False
+
+                    # 通过radlex来选择cxrgraph的ent
+                    # 如果没有与radlex匹配的ent，那么就默认没有effusion；
+                    # 如果有匹配的ent：
+                    # 1. 只要有一个 effusion ent 被预测为 Present，就视为有effusion
+                    # 2. 对于plueral，其 type 为 Anatomy，不会对默认值产生影响 （默认没有 effusion）
+                    for ent in sent_ents:
+                        tok_start, tok_end = ent["tok_indices"]
+                        if has_matched_candidate(tok_start, tok_end):
+                            if ent["ent_type"] == "Observation-Present":
+                                # 只要有一个 effusion ent 被预测为 present, 就直接返回 present
+                                return [1, 0, 0]
+                            elif ent["ent_type"] == "Observation-Uncertain":
+                                # 如果有一个 effusion ent 被预测为 Uncertain，且没有其他被预测为 present 的 effusion ent，就视为 Uncertain
+                                is_effusion_uncertain = True
+
+                return [0, 0, 1] if is_effusion_uncertain else [0, 1, 0]
+
+            example["effusion_label"] = get_effusion_label()  # [present, absent, uncertain]
             return example
 
         new_dataset = img_dataset.map(map_func, with_indices=True)
 
         return new_dataset
 
-    def _concat_img_to_text(self, img_dataset, text_dataset):
+    def _align_img_text(self, img_dataset, text_dataset):
         ds_indices_text_img = []
         for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
             data_split, imgDs_row_idx, section_name = doc_key.split("#")
@@ -191,55 +228,12 @@ class ImageTextDataset(Dataset):
 
         sorted_ds_indices_text_img = sorted(ds_indices_text_img, key=lambda x: x[1])
 
-        # 按照 text_ds 的顺序，将 img_ds 的数据拼接到 text_ds 的数据中
         filtered_img_ds = img_dataset.select([x[1] for x in sorted_ds_indices_text_img])
         filtered_text_ds = text_dataset.select([x[0] for x in sorted_ds_indices_text_img])
 
         filtered_dataset = concatenate_datasets([filtered_img_ds, filtered_text_ds], axis=1)
-        
-        def map_func(example):
-            example["effusion_label"] = self._get_effusion_label(col_cxrgraph_ent=example["cxrgraph_ent"], col_radlex=example["radlex"])  # [present, absent, uncertain]
 
-        new_dataset = filtered_dataset.map(map_func)
-        
-        return new_dataset
-    
-    # effusion 的分类任务标签 one-hot: [present, absent, uncertain]
-    def _get_effusion_label(self, col_cxrgraph_ent, col_radlex):
-        is_effusion_uncertain = False
-        if not col_cxrgraph_ent:
-            return [0, 1, 0]  # 默认为absent
-
-        for sent_ents, sent_radlexes in zip(col_cxrgraph_ent, col_radlex):
-            # 获取radlex中的effusion和pleural effusion
-            candidate_nodes = []
-            for radlex in sent_radlexes:
-                if any([rid == radlex["radlex_id"] for rid in ["http://radlex.org/RID/RID4872", "http://radlex.org/RID/RID38588", "http://radlex.org/RID/RID34539"]]):
-                    candidate_nodes.append(radlex)
-
-            # 如果ent的start和end，被candidate_radlex覆盖，就返回True
-            def has_matched_candidate(tok_start, tok_end):
-                for start, end in [radlex["tok_indices"] for radlex in candidate_nodes]:
-                    if tok_start >= start and tok_end <= end:
-                        return True
-                return False
-
-            # 通过radlex来选择cxrgraph的ent
-            # 如果没有与radlex匹配的ent，那么就默认没有effusion；
-            # 如果有匹配的ent：
-            # 1. 只要有一个 effusion ent 被预测为 Present，就视为有effusion
-            # 2. 对于plueral，其 type 为 Anatomy，不会对默认值产生影响 （默认没有 effusion）
-            for ent in sent_ents:
-                tok_start, tok_end = ent["tok_indices"]
-                if has_matched_candidate(tok_start, tok_end):
-                    if ent["ent_type"] == "Observation-Present":
-                        # 只要有一个 effusion ent 被预测为 present, 就直接返回 present
-                        return [1, 0, 0]
-                    elif ent["ent_type"] == "Observation-Uncertain":
-                        # 如果有一个 effusion ent 被预测为 Uncertain，且没有其他被预测为 present 的 effusion ent，就视为 Uncertain
-                        is_effusion_uncertain = True
-
-        return [0, 0, 1] if is_effusion_uncertain else [0, 1, 0]
+        return filtered_dataset
 
     def print_label_distribution(self):
         key_map = {(1, 0, 0): "present", (0, 1, 0): "absent", (0, 0, 1): "uncertain"}
