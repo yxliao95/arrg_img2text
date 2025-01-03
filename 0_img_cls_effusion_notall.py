@@ -113,7 +113,7 @@ class ImageTextDataset(Dataset):
 
     def _process_data(self, img_dataset, text_dataset):
         # filtered_dataset = self._align_img_text(img_dataset, text_dataset)
-        new_ds = self._concat_text_to_img(img_dataset, text_dataset)
+        new_ds = self._concat_img_to_text(img_dataset, text_dataset)
         self.label_counter = Counter([tuple(i) for i in new_ds["effusion_label"]])
         self.print_label_distribution()
 
@@ -161,16 +161,18 @@ class ImageTextDataset(Dataset):
     def _concat_text_to_img(self, img_dataset, text_dataset):
         rowId_img2text_map = {}
         for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
-            data_split, imgDs_row_idx, section_name = doc_key.split("#")
-            rowId_img2text_map[int(imgDs_row_idx)] = int(textDs_row_idx)
+            data_split, img_id, section_name = doc_key.split("#")
+            rowId_img2text_map[int(img_id)] = int(textDs_row_idx)
 
         # 因为要添加了额外的分量任务，所以text中没有的数据，在img中也要保留
         textDs_column_names = text_dataset.column_names
 
-        def map_func(example, idx):
+        def map_func(example):
             # 将 text_ds 的数据拼接到 img_ds 的数据中
-            if idx in rowId_img2text_map:
-                textDs_row_idx = rowId_img2text_map[idx]
+            # 由于可能在测试时使用裁剪后的 img_ds 数据集，所以使用 img_id 列的值来作为 key
+            img_id = example["img_id"]
+            if img_id in rowId_img2text_map:
+                textDs_row_idx = rowId_img2text_map[img_id]
                 textDS_row = text_dataset[textDs_row_idx]
             else:
                 textDS_row = {col: None for col in textDs_column_names}
@@ -179,26 +181,31 @@ class ImageTextDataset(Dataset):
             example["effusion_label"] = self._get_effusion_label(col_cxrgraph_ent=textDS_row["cxrgraph_ent"], col_radlex=textDS_row["radlex"])  # [present, absent, uncertain]
             return example
 
-        new_dataset = img_dataset.map(map_func, with_indices=True)
+        new_dataset = img_dataset.map(map_func)
 
         return new_dataset
 
     def _concat_img_to_text(self, img_dataset, text_dataset):
-        ds_indices_text_img = []
+        ds_textRowId_imgId = []
         for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
-            data_split, imgDs_row_idx, section_name = doc_key.split("#")
-            ds_indices_text_img.append((int(textDs_row_idx), int(imgDs_row_idx)))
+            data_split, img_id, section_name = doc_key.split("#")
+            ds_textRowId_imgId.append((int(textDs_row_idx), int(img_id)))
 
-        sorted_ds_indices_text_img = sorted(ds_indices_text_img, key=lambda x: x[1])
+        # 按照 img_id 排序
+        sorted_ds_textRowId_imgId = sorted(ds_textRowId_imgId, key=lambda x: x[1])
 
-        # 按照 text_ds 的顺序，将 img_ds 的数据拼接到 text_ds 的数据中
-        filtered_img_ds = img_dataset.select([x[1] for x in sorted_ds_indices_text_img])
-        filtered_text_ds = text_dataset.select([x[0] for x in sorted_ds_indices_text_img])
+        # 如果传入的是裁剪后的 img_ds 数据集，那么 img_id 与 img_row_id 不一定是一一对应的
+        ds_imgId_imgRowId = {img_id: img_row_id for img_row_id, img_id in enumerate(img_dataset["img_id"])}
+
+        # 按照 img_id 的顺序，将 img_ds 的数据拼接到 text_ds 的数据中
+        filtered_img_ds = img_dataset.select([ds_imgId_imgRowId[img_id] for _, img_id in sorted_ds_textRowId_imgId if img_id in ds_imgId_imgRowId])
+        filtered_text_ds = text_dataset.select([text_row_id for text_row_id, _ in sorted_ds_textRowId_imgId])
 
         filtered_dataset = concatenate_datasets([filtered_img_ds, filtered_text_ds], axis=1)
 
         def map_func(example):
             example["effusion_label"] = self._get_effusion_label(col_cxrgraph_ent=example["cxrgraph_ent"], col_radlex=example["radlex"])  # [present, absent, uncertain]
+            return example
 
         new_dataset = filtered_dataset.map(map_func)
 
@@ -544,9 +551,18 @@ def main(img_dataset, text_dataset):
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
-    vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
-    test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
+    # train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
+    # vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
+    # test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
+
+    # train_dataset = ImageTextDataset(img_dataset["train"].select(range(550295, 550395)), text_dataset["train"], processor=processor)
+    # vaild_dataset = ImageTextDataset(img_dataset["validation"].select(range(14011, 14111)), text_dataset["validation"], processor=processor)
+    # test_dataset = ImageTextDataset(img_dataset["test"].select(range(3577, 3677)), text_dataset["test"], processor=processor)
+
+    train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"].select(range(170601, 170801)), processor=processor)
+    vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"].select(range(4153, 4353)), processor=processor)
+    test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"].select(range(2036, 2136)), processor=processor)
+
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
     test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -585,6 +601,8 @@ def save_model(model, output_dir):
 
 
 def check_memory():
+    if not torch.cuda.is_available():
+        return
     # 获取当前 GPU 设备的属性
     device = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(device)
@@ -612,9 +630,14 @@ def load_datasets(data_paths):
     dataset_test = load_from_disk(data_paths["interpret-test-public"])
 
     ds_img = DatasetDict({"train": dataset_train_dev["train"], "validation": dataset_train_dev["validation"], "test": dataset_test["test"]})
+    for split in ds_img:
+        ds_img[split] = ds_img[split].add_column("img_id", range(len(ds_img[split])))
     LOGGER.debug("Loaded image-report dataset: %s", ds_img)
 
     ds_text = load_from_disk(data_paths["custom_text"])
+
+    for split in ds_text:
+        ds_text[split] = ds_text[split].add_column("text_id", range(len(ds_text[split])))
     LOGGER.debug("Loaded custom split_text dataset: %s", ds_text)
 
     return ds_img, ds_text
