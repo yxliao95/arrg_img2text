@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=exp1
+#SBATCH --job-name=0_imgcls_allimg
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number.
@@ -29,7 +29,10 @@ conda activate $env
 echo "Loaded $conda, env: $env"
 nvcc -V
 
-python /scratch/c.c21051562/workspace/arrg_img2text/0_img_cls_effusion.py --from_bash --config_file exp1_imgcls_arcca.yaml
+cfg_dir=/scratch/c.c21051562/workspace/arrg_img2text/config/arcca
+
+# python /scratch/c.c21051562/workspace/arrg_img2text/0_img_cls_effusion_allimg.py --from_bash --config_file $cfg_dir/0_imgcls_allimg.yaml
+python /scratch/c.c21051562/workspace/arrg_img2text/0_img_cls_effusion_notallimg.py --from_bash --config_file $cfg_dir/0_imgcls_notallimg.yaml
 
 python /scratch/c.c21051562/workspace/arrg_img2text/test_email.py
 

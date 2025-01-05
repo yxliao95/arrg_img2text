@@ -113,7 +113,7 @@ class ImageTextDataset(Dataset):
 
     def _process_data(self, img_dataset, text_dataset):
         # filtered_dataset = self._align_img_text(img_dataset, text_dataset)
-        new_ds = self._concat_text_to_img(img_dataset, text_dataset)
+        new_ds = self._concat_img_to_text(img_dataset, text_dataset)
         self.label_counter = Counter([tuple(i) for i in new_ds["effusion_label"]])
         self.print_label_distribution()
 
@@ -554,9 +554,14 @@ def main(img_dataset, text_dataset):
     train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
     vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
     test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
+
     # train_dataset = ImageTextDataset(img_dataset["train"].select(range(550295, 550395)), text_dataset["train"], processor=processor)
     # vaild_dataset = ImageTextDataset(img_dataset["validation"].select(range(14011, 14111)), text_dataset["validation"], processor=processor)
     # test_dataset = ImageTextDataset(img_dataset["test"].select(range(3577, 3677)), text_dataset["test"], processor=processor)
+
+    # train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"].select(range(170601, 170801)), processor=processor)
+    # vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"].select(range(4153, 4353)), processor=processor)
+    # test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"].select(range(2036, 2136)), processor=processor)
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -638,9 +643,14 @@ def load_datasets(data_paths):
     return ds_img, ds_text
 
 
-def load_proj_config(file_name):
-    proj_dir = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(proj_dir, "config", file_name), "r") as f:
+def load_proj_config(file_name_or_path):
+    if not os.path.exists(file_name_or_path):
+        file_path = file_name_or_path
+    else:
+        proj_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(proj_dir, "config", file_name_or_path)
+    
+    with open(file_path, "r") as f:
         config = yaml.safe_load(f)
 
     output_dirs = config["output_dir"]
@@ -704,18 +714,18 @@ def set_seed(seed):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--from_bash", action="store_true")
-    parser.add_argument("--config_file", type=str, help=f".yaml file")
+    parser.add_argument("--config_file", type=str, help=f".yaml file path")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = get_args()
     if args.from_bash:
-        proj_cfg_file_name = args.config_file
+        proj_cfg_file_name_or_path = args.config_file
     else:
-        proj_cfg_file_name = "exp1_imgcls.yaml"
+        proj_cfg_file_name_or_path = "0_imgcls.yaml"
 
-    CONFIG = load_proj_config(file_name=proj_cfg_file_name)
+    CONFIG = load_proj_config(file_name_or_path=proj_cfg_file_name_or_path)
     LOGGER = init_logger(log_file_mode="w")
     LOGGER.debug(CONFIG)
 

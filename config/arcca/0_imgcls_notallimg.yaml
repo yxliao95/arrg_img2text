@@ -1,0 +1,39 @@
+output_name: 0_imgcls_effu_notallimg_try1
+
+output_dir:
+  result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
+  model: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models
+  checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs/checkpoints
+  log: /scratch/c.c21051562/workspace/arrg_img2text/outputs/logs
+
+data_path:
+  mimic: /scratch/c.c21051562/resources/datasets/mimic-cxr
+  interpret: /scratch/c.c21051562/resources/datasets/interpret-cxr
+  interpret-test-public: /scratch/c.c21051562/resources/datasets/interpret-cxr-test-public
+  custom_text: /scratch/c.c21051562/resources/datasets/interpret_text_exp/interpret_text_findings_effusion
+
+target_section: findings
+
+model_name_or_path:
+  clip: /scratch/c.c21051562/resources/downloaded_models/clip-vit-base-patch32
+
+model:
+  vision_backbone: clip
+  num_classes: 3
+
+train:
+  seed: 42
+  grad_accum_steps: 1
+  warmup_proportion: 0.1
+  weight_decay: 0.0
+  lr: 0.0001
+  mlc_lr: 0.0001
+  clip_grad_norm: 1.0
+
+  batch_size: 64
+  num_epochs: 10
+  print_loss_per_n_steps: 100
+  eval_per_steps: 1500 # 550395 / 32 = 17199, 170801 / 64 = 2669
+
+eval:
+  batch_size: 64

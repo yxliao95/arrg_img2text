@@ -1,4 +1,4 @@
-output_name: imgcls_exp1
+output_name: 0_imgcls_effu_allimg_try2
 
 output_dir:
   result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
@@ -30,10 +30,10 @@ train:
   mlc_lr: 0.0001
   clip_grad_norm: 1.0
 
-  batch_size: 32
-  num_epochs: 30
+  batch_size: 64
+  num_epochs: 10
   print_loss_per_n_steps: 100
-  eval_per_steps: 5000 # 550395 / 32 = 17199
+  eval_per_steps: 1500 # 550395 / 32 = 17199, 170801 / 64 = 2669
 
 eval:
-  batch_size: 32
+  batch_size: 64
