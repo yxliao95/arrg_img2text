@@ -1,4 +1,4 @@
-output_name: imgcls_exp1
+output_name: 0_imgcls_effu_allimg_try2
 
 output_dir:
   result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
@@ -23,7 +23,7 @@ model:
 
 train:
   seed: 42
-  batch_size: 32
+  batch_size: 128
   num_epochs: 30
   grad_accum_steps: 1
   warmup_proportion: 0.1
@@ -33,7 +33,7 @@ train:
   clip_grad_norm: 1.0
 
   print_loss_per_n_steps: 100
-  eval_per_steps: 2000
+  eval_per_steps: 0
 
 eval:
-  batch_size: 32
+  batch_size: 128
