@@ -70,6 +70,7 @@ class AttentionPooling(nn.Module):
         """
         super().__init__()
         self.attention_layer = nn.Linear(feature_dim, 1)  # 用于计算权重的注意力层
+        self.layernorm = nn.LayerNorm(feature_dim)  # 池化后的归一化
 
     def forward(self, img_features, attention_mask=None):
         """
@@ -91,6 +92,8 @@ class AttentionPooling(nn.Module):
 
         # 加权求和得到池化特征 (bsz, feature_dim)
         pooled_features = torch.bmm(attention_weights.unsqueeze(1), img_features).squeeze(1)
+
+        pooled_features = self.layernorm(pooled_features)
 
         return pooled_features
 
