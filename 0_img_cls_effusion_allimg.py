@@ -570,6 +570,9 @@ def main(img_dataset, text_dataset):
     end = time.time()
     LOGGER.info("Total training time: %d minutes", (end - start) / 60)
 
+    model = load_model(CONFIG["output_dir"]["model"])
+    model.to(DEVICE)
+
     start = time.time()
     evaluate(model, test_dataloader)
     end = time.time()
@@ -580,6 +583,7 @@ def main(img_dataset, text_dataset):
 # Utils
 #############################################
 def init_model(model_name_or_path, model_base_cfg):
+    LOGGER.info("Initializing model of %s", model_name_or_path)
     config = AutoConfig.from_pretrained(model_name_or_path)
     model_config = CustomModelConfig(vision_config=config.vision_config, base_config=model_base_cfg)
     model = CustomModel(config=model_config)
@@ -588,11 +592,13 @@ def init_model(model_name_or_path, model_base_cfg):
 
 def load_model(model_path):
     model = CustomModel.from_pretrained(model_path)
+    LOGGER.info("Pre-trained model loaded from %s", model_path)
     return model
 
 
 def save_model(model, output_dir):
     model.save_pretrained(output_dir)
+    LOGGER.info("Model saved to %s", output_dir)
 
 
 def check_memory():
@@ -639,12 +645,12 @@ def load_datasets(data_paths):
 
 
 def load_proj_config(file_name_or_path):
-    if not os.path.exists(file_name_or_path):
+    if os.path.exists(file_name_or_path):
         file_path = file_name_or_path
     else:
         proj_dir = os.path.dirname(os.path.abspath(__file__))
         file_path = os.path.join(proj_dir, "config", file_name_or_path)
-    
+
     with open(file_path, "r") as f:
         config = yaml.safe_load(f)
 

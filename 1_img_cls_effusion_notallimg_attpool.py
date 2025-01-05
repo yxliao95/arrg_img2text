@@ -62,6 +62,39 @@ class CustomModelConfig(PretrainedConfig):
         self.num_labels = self.base_config["num_classes"] if self.base_config else 2
 
 
+class AttentionPooling(nn.Module):
+    def __init__(self, feature_dim):
+        """
+        初始化 Attention Pooling 模块
+        :param feature_dim: 输入特征的维度 (feature_dim)
+        """
+        super(AttentionPooling, self).__init__()
+        self.attention_layer = nn.Linear(feature_dim, 1)  # 用于计算权重的注意力层
+
+    def forward(self, img_features, attention_mask=None):
+        """
+        前向传播
+        :param img_features: 输入的图像特征，维度为 (bsz, num_img_fea, feature_dim)
+        :param attention_mask: 注意力掩码，维度为 (bsz, num_img_fea)，值为 0 的位置表示无效特征。
+        :return: 池化后的图像特征，维度为 (bsz, feature_dim)
+        """
+        # 计算注意力权重 (bsz, num_img_fea, 1)
+        attention_logits = self.attention_layer(img_features)
+        attention_logits = attention_logits.squeeze(-1)  # 移除最后一个维度，变成 (bsz, num_img_fea)
+
+        if attention_mask is not None:
+            # 将 mask 中无效部分设置为 -inf
+            attention_logits = attention_logits.masked_fill(attention_mask == 0, float("-inf"))
+
+        # 通过 softmax 计算归一化权重 (bsz, num_img_fea)
+        attention_weights = nn.functional.softmax(attention_logits, dim=-1)
+
+        # 加权求和得到池化特征 (bsz, feature_dim)
+        pooled_features = torch.bmm(attention_weights.unsqueeze(1), img_features).squeeze(1)
+
+        return pooled_features
+
+
 class CustomModel(PreTrainedModel):
     config_class = CustomModelConfig
 
@@ -69,21 +102,40 @@ class CustomModel(PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.vision_encoder = CLIPVisionModel(config.vision_config)
+        self.attention_pooling = AttentionPooling(config.vision_config.hidden_size)
         self.classifier = torch.nn.Linear(self.config.vision_config.hidden_size, config.num_labels)
+
+    def concat_img_features(self, last_hidden_state, image_idx_map):
+        # 因为每个样本的输入图像数量不同，可能是 1 或 2 张，所以需要对图像特征重新拼接和填充
+        img_feature_list = []
+
+        for img_indices in image_idx_map:
+            cls_feature = last_hidden_state[img_indices, 0, :]
+            img_features = last_hidden_state[img_indices, 1:, :]  # could be eighter 1 or 2 images
+            reshaped_img_features = img_features.reshape(-1, img_features.size(-1))  # (49, dim) or (98, dim)
+            img_feature_list.append(reshaped_img_features)
+
+        bsz = len(img_feature_list)
+        num_features = max([img_features.size(0) for img_features in img_feature_list])
+        feature_dim = img_feature_list[0].size(-1)
+
+        img_features_padded = torch.zeros((bsz, num_features, feature_dim)).to(DEVICE)  # 初始化张量
+        img_attention_mask = torch.zeros((bsz, num_features), dtype=torch.int).to(DEVICE)  # 初始化掩码
+
+        for i, img_features in enumerate(img_feature_list):
+            num_valid_features = img_features.size(0)
+            img_features_padded[i, :num_valid_features, :] = img_features  # 填充有效特征
+            img_attention_mask[i, :num_valid_features] = 1  # 有效部分掩码设置为 1
+
+        return img_features_padded, img_attention_mask
 
     def forward(self, input_dict, return_loss=False):
         outputs = self.vision_encoder(pixel_values=input_dict["pixel_values"])
         last_hidden_state = outputs.last_hidden_state
 
-        pooled_features = []
-        for img_indices in input_dict["image_idx_map"]:
-            cls_feature = last_hidden_state[img_indices, 0, :]
-            img_features = last_hidden_state[img_indices, 1:, :]
+        img_features_padded, img_attention_mask = self.concat_img_features(last_hidden_state=last_hidden_state, image_idx_map=input_dict["image_idx_map"])
+        pooled_features = self.attention_pooling(img_features_padded, attention_mask=img_attention_mask)  # (bsz, dim)
 
-            pooled_feature = torch.mean(img_features, dim=[0, 1], keepdim=True)
-            pooled_features.append(pooled_feature)
-
-        pooled_features = torch.cat(pooled_features, dim=0).squeeze(1)
         logits = self.classifier(pooled_features)
 
         if return_loss:
@@ -551,17 +603,17 @@ def main(img_dataset, text_dataset):
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
-    vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
-    test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
+    # train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
+    # vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
+    # test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
 
     # train_dataset = ImageTextDataset(img_dataset["train"].select(range(550295, 550395)), text_dataset["train"], processor=processor)
     # vaild_dataset = ImageTextDataset(img_dataset["validation"].select(range(14011, 14111)), text_dataset["validation"], processor=processor)
     # test_dataset = ImageTextDataset(img_dataset["test"].select(range(3577, 3677)), text_dataset["test"], processor=processor)
 
-    # train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"].select(range(170601, 170801)), processor=processor)
-    # vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"].select(range(4153, 4353)), processor=processor)
-    # test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"].select(range(2036, 2136)), processor=processor)
+    train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"].select(range(170601, 170801)), processor=processor)
+    vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"].select(range(4153, 4353)), processor=processor)
+    test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"].select(range(2036, 2136)), processor=processor)
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -625,7 +677,6 @@ def check_memory():
 
 
 def load_datasets(data_paths):
-
     dataset_interpret = load_from_disk(data_paths["interpret"])
     LOGGER.debug("%s loaded from interpret_cxr", [f"{split}:{len(ds)}" for split, ds in dataset_interpret.items()])
     dataset_mimic = load_from_disk(data_paths["mimic"])
@@ -729,7 +780,7 @@ if __name__ == "__main__":
     if args.from_bash:
         proj_cfg_file_name_or_path = args.config_file
     else:
-        proj_cfg_file_name_or_path = "0_imgcls.yaml"
+        proj_cfg_file_name_or_path = "1_imgcls_attpool.yaml"
 
     CONFIG = load_proj_config(file_name_or_path=proj_cfg_file_name_or_path)
     LOGGER = init_logger(log_file_mode="w")

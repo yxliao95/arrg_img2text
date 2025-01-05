@@ -1,0 +1,39 @@
+output_name: imgcls_attpool_exp1
+
+output_dir:
+  result: /home/yuxiang/liao/workspace/arrg_img2text/outputs/results
+  model: /home/yuxiang/liao/workspace/arrg_img2text/outputs/models
+  checkpoint: /home/yuxiang/liao/workspace/arrg_img2text/outputs/checkpoints
+  log: /home/yuxiang/liao/workspace/arrg_img2text/outputs/logs
+
+data_path:
+  mimic: /home/yuxiang/liao/resources/datasets/mimic-cxr
+  interpret: /home/yuxiang/liao/resources/datasets/interpret-cxr
+  interpret-test-public: /home/yuxiang/liao/resources/datasets/interpret-cxr-test-public
+  custom_text: /home/yuxiang/liao/workspace/arrg_preprocessing/outputs/interpret_text_exp/interpret_text_findings_effusion
+
+target_section: findings
+
+model_name_or_path:
+  clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
+
+model:
+  vision_backbone: clip
+  num_classes: 3
+
+train:
+  seed: 42
+  batch_size: 8
+  num_epochs: 10
+  grad_accum_steps: 1
+  warmup_proportion: 0.1
+  weight_decay: 0.0
+  lr: 0.00001
+  mlc_lr: 0.00001
+  clip_grad_norm: 1.0
+
+  print_loss_per_n_steps: 1
+  eval_per_steps: 20
+
+eval:
+  batch_size: 16
