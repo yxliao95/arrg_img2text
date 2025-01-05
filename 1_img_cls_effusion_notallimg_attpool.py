@@ -68,7 +68,7 @@ class AttentionPooling(nn.Module):
         初始化 Attention Pooling 模块
         :param feature_dim: 输入特征的维度 (feature_dim)
         """
-        super(AttentionPooling, self).__init__()
+        super().__init__()
         self.attention_layer = nn.Linear(feature_dim, 1)  # 用于计算权重的注意力层
 
     def forward(self, img_features, attention_mask=None):
@@ -107,6 +107,7 @@ class CustomModel(PreTrainedModel):
 
     def concat_img_features(self, last_hidden_state, image_idx_map):
         # 因为每个样本的输入图像数量不同，可能是 1 或 2 张，所以需要对图像特征重新拼接和填充
+        # input_dict["image_idx_map"] 是一个嵌套list，每个样本对应一个list，list中的元素是图像在 last_hidden_state 中的索引
         img_feature_list = []
 
         for img_indices in image_idx_map:
@@ -435,13 +436,15 @@ def train(model, train_dataloader, valid_dataloader):
     assert model_params[0][0].startswith("vision_encoder")  # check the layer name
     assert model_params[-1][0].startswith("classifier")
     vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder")]
+    pooler_params = [(n, p) for n, p in model_params if n.startswith("attention_pooling")]
     classifier_params = [(n, p) for n, p in model_params if n.startswith("classifier")]
 
     no_decay_names = ["bias", "layer_norm1.weight", "layer_norm2.weight"]
     optimizer_grouped_parameters = [
         {"params": [p for n, p in vis_enc_params if any(nd_name in n for nd_name in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
         {"params": [p for n, p in vis_enc_params if all(nd_name not in n for nd_name in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-        {"params": [p for n, p in classifier_params], "lr": train_cfg["mlc_lr"], "weight_decay": 0.0},
+        {"params": [p for n, p in pooler_params], "lr": train_cfg["lr"], "weight_decay": 0.0},
+        {"params": [p for n, p in classifier_params], "lr": train_cfg["lr"], "weight_decay": 0.0},
     ]
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)

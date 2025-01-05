@@ -29,7 +29,6 @@ train:
   warmup_proportion: 0.1
   weight_decay: 0.0
   lr: 0.0001
-  mlc_lr: 0.0001
   clip_grad_norm: 1.0
 
   print_loss_per_n_steps: 100
