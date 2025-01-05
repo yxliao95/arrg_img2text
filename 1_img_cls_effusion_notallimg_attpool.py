@@ -490,7 +490,7 @@ def train(model, train_dataloader, valid_dataloader):
             status_info.finish_batch()
 
             # checkpoint, eval at specific steps:
-            if status_info.global_updates % train_cfg["eval_per_steps"] == 0:
+            if train_cfg["eval_per_steps"] > 0 and status_info.global_updates % train_cfg["eval_per_steps"] == 0:
                 status_info.update_batch_info(curr_check_point="batch", curr_eval_split="validation")
                 eval_result_dict = evaluate(model, target_dataloader=valid_dataloader, status_info=status_info)
                 check_and_save(model, eval_result_dict, status_info)
