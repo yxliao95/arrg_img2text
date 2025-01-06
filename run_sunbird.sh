@@ -31,9 +31,10 @@ nvcc -V
 
 cfg_dir=/scratch/c.c21051562/workspace/arrg_img2text/config/sunbird
 
-python /scratch/c.c21051562/workspace/arrg_img2text/0_img_cls_effusion_notallimg.py --from_bash --config_file $cfg_dir/0_imgcls_notallimg.yaml
+# python /scratch/c.c21051562/workspace/arrg_img2text/0_img_cls_effusion_notallimg.py --from_bash --config_file $cfg_dir/0_imgcls_notallimg.yaml
+python /scratch/c.c21051562/workspace/arrg_img2text/1_img_cls_effusion_notallimg_attpool.py --from_bash --config_file $cfg_dir/1_imgcls_notallimg_attpool.yaml
 
-python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Done: 0_imgcls_notallimg"
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Done: 1_imgcls_notallimg_attpool"
 
 # sbatch /scratch/c.c21051562/workspace/arrg_img2text/run_sunbird.sh
 # scontrol show job JOBID

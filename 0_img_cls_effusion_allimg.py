@@ -554,6 +554,7 @@ def main(img_dataset, text_dataset):
     train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
     vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
     test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
+    
     # train_dataset = ImageTextDataset(img_dataset["train"].select(range(550295, 550395)), text_dataset["train"], processor=processor)
     # vaild_dataset = ImageTextDataset(img_dataset["validation"].select(range(14011, 14111)), text_dataset["validation"], processor=processor)
     # test_dataset = ImageTextDataset(img_dataset["test"].select(range(3577, 3677)), text_dataset["test"], processor=processor)

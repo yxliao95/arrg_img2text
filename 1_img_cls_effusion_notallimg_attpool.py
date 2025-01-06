@@ -609,17 +609,17 @@ def main(img_dataset, text_dataset):
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    # train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
-    # vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
-    # test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
+    train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
+    vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
+    test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
 
     # train_dataset = ImageTextDataset(img_dataset["train"].select(range(550295, 550395)), text_dataset["train"], processor=processor)
     # vaild_dataset = ImageTextDataset(img_dataset["validation"].select(range(14011, 14111)), text_dataset["validation"], processor=processor)
     # test_dataset = ImageTextDataset(img_dataset["test"].select(range(3577, 3677)), text_dataset["test"], processor=processor)
 
-    train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"].select(range(170601, 170801)), processor=processor)
-    vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"].select(range(4153, 4353)), processor=processor)
-    test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"].select(range(2036, 2136)), processor=processor)
+    # train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"].select(range(170601, 170801)), processor=processor)
+    # vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"].select(range(4153, 4353)), processor=processor)
+    # test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"].select(range(2036, 2136)), processor=processor)
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
