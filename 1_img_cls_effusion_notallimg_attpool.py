@@ -123,8 +123,8 @@ class CustomModel(PreTrainedModel):
         num_features = max([img_features.size(0) for img_features in img_feature_list])
         feature_dim = img_feature_list[0].size(-1)
 
-        img_features_padded = torch.zeros((bsz, num_features, feature_dim)).to(DEVICE)  # 初始化张量
-        img_attention_mask = torch.zeros((bsz, num_features), dtype=torch.int).to(DEVICE)  # 初始化掩码
+        img_features_padded = torch.zeros((bsz, num_features, feature_dim), device=DEVICE)  # 初始化张量
+        img_attention_mask = torch.zeros((bsz, num_features), dtype=torch.int, device=DEVICE)  # 初始化掩码
 
         for i, img_features in enumerate(img_feature_list):
             num_valid_features = img_features.size(0)
@@ -499,11 +499,12 @@ def train(model, train_dataloader, valid_dataloader):
                 check_and_save(model, eval_result_dict, status_info)
                 check_memory()
 
-        end = time.time()
-        LOGGER.info("Batch training time: %d minutes (including in_batch eval)", (end - start) / 60)
-        status_info.update_batch_info(curr_check_point="epoch", curr_eval_split="validation")
         eval_result_dict = evaluate(model, target_dataloader=valid_dataloader, status_info=status_info)
+        status_info.update_batch_info(curr_check_point="epoch", curr_eval_split="validation")
+        end = time.time()
         check_and_save(model, eval_result_dict, status_info)
+        check_memory()
+        LOGGER.info("Batch training time: %d minutes (including eval)", (end - start) / 60)
 
     LOGGER.info("Best achieved: %s", status_info.dev_best)
 
