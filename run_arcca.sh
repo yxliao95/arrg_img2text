@@ -54,3 +54,4 @@ python /scratch/c.c21051562/workspace/arrg_img2text/test_email.py
 
 # ssh -L 6007:localhost:6006 -J c.c21051562@hawklogin.cf.ac.uk c.c21051562@ccs2111
 # tensorboard --logdir=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs
+# mlflow server --host 127.0.0.1 --port 6006

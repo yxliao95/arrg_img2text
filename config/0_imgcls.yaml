@@ -14,6 +14,12 @@ data_path:
 
 target_section: findings
 
+# path to checkpoint or, bool;
+# if True, then use the `output_dir.checkpoint/output_name` as the checkpoint path
+resume_from_checkpoint: False
+
+mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
+
 model_name_or_path:
   clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
 
@@ -33,7 +39,7 @@ train:
   clip_grad_norm: 1.0
 
   print_loss_per_n_steps: 1
-  eval_per_steps: 20
+  eval_per_steps: 5
 
 eval:
   batch_size: 16
