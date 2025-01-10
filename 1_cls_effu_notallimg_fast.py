@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -343,6 +344,22 @@ class StatusInfo:
             return True
         return False
 
+    def get_resumed_epoch_and_iter(self):
+        epoch_resumed = 0
+        iter_resumed = 0
+        if self.curr_checkpoint_at == "":
+            return epoch_resumed, iter_resumed
+
+        # Prepare the next epoch and iter indices for continue training
+        if self.curr_checkpoint_at == "epoch":
+            epoch_resumed = self.curr_epoch + 1
+        elif self.curr_checkpoint_at == "batch":
+            epoch_resumed = self.curr_epoch
+            iter_resumed = self.curr_batch_iter + 1
+        else:
+            raise ValueError(f"Invaild STATUS_INFO.curr_checkpoint_at: {self.curr_checkpoint_at}")
+        return epoch_resumed, iter_resumed
+
     def state_dict(self):
         return asdict(self)
 
@@ -395,6 +412,7 @@ class MLflowTracker:
     def launch_tracker():
         if CONFIG["resume_from_checkpoint"]:
             mlf_tracker = MLflowTracker(url=CONFIG["mlflow_url"], run_id=STATUS_INFO.run_id)
+            epoch_resumed, iter_resumed = STATUS_INFO.get_resumed_epoch_and_iter()
             mlf_tracker.set_tag(str(CONFIG["jobid"]), f"resume:{epoch_resumed},{iter_resumed}")
         else:
             # Start a new mlflow run
@@ -408,6 +426,10 @@ class MLflowTracker:
 
 
 def evaluate(model, target_dataloader):
+    data_ids = []
+    data_preds = []
+    data_golds = []
+
     eval_results = {
         "present": {
             "num_gold_label": 0,
@@ -436,7 +458,8 @@ def evaluate(model, target_dataloader):
     with torch.no_grad():
         for input_tensors_dict in target_dataloader:
             # Model inference
-            out = model(input_dict=input_tensors_dict)
+            model_accessor = get_model_accessor(model)
+            out = model_accessor(input_dict=input_tensors_dict)
             logits = out["logits"]
 
             _, predicted_labels = logits.max(dim=-1)
@@ -444,13 +467,27 @@ def evaluate(model, target_dataloader):
             preds = predicted_labels.cpu().numpy()  # (8,)
             golds = gold_labels.cpu().numpy()
 
-            key_map = {0: "present", 1: "absent", 2: "uncertain"}
-            for gold, pred in zip(golds, preds):
-                eval_results[key_map[gold]]["num_gold_label"] += 1
-                eval_results[key_map[pred]]["num_pred_label"] += 1
+            # gather_object across gpus
+            data_ids.extend(gather_object(input_tensors_dict["data_id_list"]))
+            data_preds.extend(gather(preds))
+            data_golds.extend(gather(golds))
 
-                if gold == pred:
-                    eval_results[key_map[gold]]["num_correct_label"] += 1
+    # Truncate duplicated data. 最后一个batch的数据会重复，因此需要丢弃重复数据
+    if ACCELERATOR.use_distributed:
+        LOGGER.debug("Eval, before truncation, ids=%s", data_ids)
+        data_ids = data_ids[: target_dataloader.total_dataset_length]
+        assert len(data_ids) == len(dataloader.dataset)
+        LOGGER.debug("Eval, after truncation, ids=%s", data_ids)
+        data_preds = data_preds[: dataloader.total_dataset_length]
+        data_golds = data_golds[: dataloader.total_dataset_length]
+
+    key_map = {0: "present", 1: "absent", 2: "uncertain"}
+    for gold, pred in zip(data_golds, data_preds):
+        eval_results[key_map[gold]]["num_gold_label"] += 1
+        eval_results[key_map[pred]]["num_pred_label"] += 1
+
+        if gold == pred:
+            eval_results[key_map[gold]]["num_correct_label"] += 1
 
     # Evaluate the results
     task_f1 = {}
@@ -464,8 +501,9 @@ def evaluate(model, target_dataloader):
         LOGGER.info("[%s]: P: %.3f, R: %.3f, 【F1: %.3f】", eval_field, p, r, f1 * 100)
         task_f1[eval_field] = f1
 
-    if STATUS_INFO:
-        STATUS_INFO.curr_eval_split
+        if STATUS_INFO:
+            prefix = f"{STATUS_INFO.curr_eval_split}_{eval_field}"
+            MLFLOW_TRACKER.log({f"{prefix}_precision": p, f"{prefix}_recall": r, f"{prefix}_f1": f1}, step=STATUS_INFO.global_iters)
 
     end = time.time()
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
@@ -512,6 +550,7 @@ def train(model, train_dataloader, valid_dataloader):
     LOGGER.info("Total epochs = %d, total iterations per epoch = %d", train_cfg["num_epochs"], len(train_dataloader))
     LOGGER.info("Total optimization steps = %d", total_num_steps)
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
+    LOGGER.info("Accelerator mixed_precision = %s", ACCELERATOR.mixed_precision)
 
     check_memory()
 
@@ -529,7 +568,7 @@ def train(model, train_dataloader, valid_dataloader):
 
         start = time.time()
         for curr_iter, batch_inputs_dict in enumerate(active_dataloader, start=iter_resumed if curr_epoch == epoch_resumed else 0):
-            with ACCELERATOR.accumulate(model):
+            with ACCELERATOR.autocast(), ACCELERATOR.accumulate(model):
                 # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_updates=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
 
                 model.train()
@@ -544,13 +583,7 @@ def train(model, train_dataloader, valid_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                log_and_update_status(
-                    curr_epoch=curr_epoch,
-                    curr_iter=curr_iter,
-                    loss=loss.item(),
-                    bsz=batch_inputs_dict["effusion_labels"].size(0),
-                    lr=scheduler.get_last_lr()[0],
-                )
+                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["effusion_labels"].size(0), lr=scheduler.get_last_lr()[0])
 
                 # eval and save
                 validation_process(model, valid_dataloader)
@@ -586,7 +619,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
     print_loss_per_n_steps = CONFIG["train"]["print_loss_per_n_steps"]
     if STATUS_INFO.global_updates == 1 or STATUS_INFO.global_updates % print_loss_per_n_steps == 0:
         avg_loss = STATUS_INFO.batch_loss / STATUS_INFO.batch_trained_examples
-        LOGGER.debug(
+        LOGGER.info(
             "p=%s, Epoch=%d, iter=%d, steps=%d, loss=%.9f",
             ACCELERATOR.process_index,
             STATUS_INFO.curr_epoch,
@@ -630,8 +663,9 @@ def check_results_and_save_model(model, eval_result_dict):
     score = score / num_metrics
 
     LOGGER.info("****************************** Checkpoint ******************************")
-    LOGGER.info("Current [dev] f1: %.3f, at epoch %d, iter %d (%s)", score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_checkpoint_at)
-    LOGGER.info("Best [dev] f1: %.3f, at epoch %d, iter %d", STATUS_INFO.dev_best["score"] * 100, STATUS_INFO.dev_best["at_epoch"], STATUS_INFO.dev_best["at_iter"])
+    LOGGER.info("Current [%s] avg-f1: %.3f, at epoch %d, iter %d (%s)", STATUS_INFO.curr_eval_split, score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_checkpoint_at)
+    LOGGER.info("Best [%s] avg-f1: %.3f, at epoch %d, iter %d", STATUS_INFO.curr_eval_split, STATUS_INFO.dev_best["score"] * 100, STATUS_INFO.dev_best["at_epoch"], STATUS_INFO.dev_best["at_iter"])
+    MLFLOW_TRACKER.log({f"{STATUS_INFO.curr_eval_split}_avg_f1": score}, step=STATUS_INFO.global_iters)
 
     # checkpointing
     save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
@@ -642,28 +676,18 @@ def check_results_and_save_model(model, eval_result_dict):
 
 
 def check_status_and_resume_checkpoint():
-    epoch_resumed = 0
-    iter_resumed = 0
+    epoch_resumed, iter_resumed = 0, 0
     resume_from_checkpoint = CONFIG["resume_from_checkpoint"]
 
     if resume_from_checkpoint:
         LOGGER.info("****************************** Resume checkpoint ******************************")
-        checkpoint_dir = resume_from_checkpoint if isinstance(resume_from_checkpoint, str) and os.path.exists(resume_from_checkpoint) else CONFIG["output_dir"]["checkpoint"]
-
         # STATUS_INFO will also be loaded automatically in load_state as we have already registered it via ACCELERATOR.register_for_checkpointing(STATUS_INFO)
+        checkpoint_dir = resume_from_checkpoint if isinstance(resume_from_checkpoint, str) and os.path.exists(resume_from_checkpoint) else CONFIG["output_dir"]["checkpoint"]
         load_checkpoint(checkpoint_dir)
-
         LOGGER.info("p=%d, Resumed status info %s", ACCELERATOR.process_index, STATUS_INFO.state_dict(), main_process_only=False)
 
         # Prepare the next epoch and iter indices for continue training
-        if STATUS_INFO.curr_checkpoint_at == "epoch":
-            epoch_resumed = STATUS_INFO.curr_epoch + 1
-        elif STATUS_INFO.curr_checkpoint_at == "batch":
-            epoch_resumed = STATUS_INFO.curr_epoch
-            iter_resumed = STATUS_INFO.curr_batch_iter + 1
-        else:
-            raise ValueError(f"Invaild STATUS_INFO.curr_checkpoint_at: {STATUS_INFO.curr_checkpoint_at}")
-
+        epoch_resumed, iter_resumed = STATUS_INFO.get_resumed_epoch_and_iter()
         LOGGER.info("p=%d, epoch_resumed %d, iter_resumed %d", ACCELERATOR.process_index, epoch_resumed, iter_resumed, main_process_only=False)
 
     return epoch_resumed, iter_resumed
@@ -724,19 +748,18 @@ def load_model(model_path):
 def save_checkpoint(checkpoint_dir, max_to_keep=5):
     ckp_path = os.path.join(checkpoint_dir, f"epoch_{STATUS_INFO.curr_epoch}_iter_{STATUS_INFO.curr_batch_iter}")
     ACCELERATOR.save_state(ckp_path, safe_serialization=False)
-    LOGGER.info("Checkpoint saved to %s", checkpoint_dir)
+    LOGGER.info("Checkpoint saved to %s", ckp_path)
 
     # 如果文件数量超过 max_to_keep，删除旧的 checkpoint
+    max_to_keep = CONFIG["max_checkpoints_to_keep"] if CONFIG["max_checkpoints_to_keep"] else max_to_keep
     if ACCELERATOR.is_main_process:
         # os.path.getctime 按创建时间排序
         checkpoint_files = sorted(glob.glob(os.path.join(checkpoint_dir, "epoch_*_iter_*")), key=os.path.getctime)
         if len(checkpoint_files) > max_to_keep:
             old_checkpoints = checkpoint_files[:-max_to_keep]  # 排除最近的 max_to_keep 个
             for old_checkpoint in old_checkpoints:
-                if os.path.isdir(old_checkpoint):  # 如果 checkpoint 是文件夹
-                    os.rmdir(old_checkpoint)
-                else:  # 如果 checkpoint 是文件
-                    os.remove(old_checkpoint)
+                if os.path.isdir(old_checkpoint):
+                    shutil.rmtree(old_checkpoint)
                 LOGGER.info("Old checkpoint removed: %s", old_checkpoint)
 
 
@@ -839,7 +862,7 @@ def init_accelerator():
     # 如果OOM，可以尝试设置 sync_each_batch=True，但是会导致训练速度变慢
     # adjust_scheduler=False，我们在train方法中手动计算 scheduler 在使用梯度累计后的 step
     plugin = GradientAccumulationPlugin(num_steps=CONFIG["train"]["grad_accum_steps"], adjust_scheduler=False, sync_with_dataloader=True)
-    ACCELERATOR = Accelerator(dataloader_config=dataloader_cfg, gradient_accumulation_plugin=plugin)
+    ACCELERATOR = Accelerator(mixed_precision=CONFIG["train"]["mixed_precision"], dataloader_config=dataloader_cfg, gradient_accumulation_plugin=plugin)
     DEVICE = ACCELERATOR.device
 
     if ACCELERATOR.is_local_main_process:
