@@ -4,6 +4,7 @@
 #############################################
 import argparse
 import datetime
+import glob
 import json
 import logging
 import os
@@ -321,82 +322,29 @@ def collate_fn(batch_data):
 class StatusInfo:
     curr_epoch: int = field(default=0)
     curr_batch_iter: int = field(default=0)
-    curr_check_point: str = field(default="")  # "epoch" or "batch"
+    curr_checkpoint_at: str = field(default="")  # "epoch" or "batch"
     curr_eval_split: str = field(default="")  # "validation" or "test"
 
-    global_batch_iters: int = field(default=0)
+    global_iters: int = field(default=0)
     global_updates: int = field(default=0)
-    dev_best: dict = field(default_factory=lambda: {"score": 0.0, "at_epoch": 0, "at_iter": 0, "at_global_iter": 0, "check_at": ""})
+    dev_best: dict = field(default_factory=lambda: {"score": 0.0, "at_epoch": 0, "at_iter": 0, "check_at": ""})
 
     batch_loss: int = field(default=0)
     batch_trained_examples: int = field(default=0)
 
     run_id: dict = field(default="")
 
-    def update_batch_info(self, curr_epoch=None, curr_iter=None, curr_check_point=None, curr_eval_split=None):
-        if curr_epoch is not None:
-            self.curr_epoch = curr_epoch
-        if curr_iter is not None:
-            self.curr_batch_iter = curr_iter
-        if curr_check_point is not None:
-            self.curr_check_point = curr_check_point
-        if curr_eval_split is not None:
-            self.curr_eval_split = curr_eval_split
-
-    def add_batch_loss(self, loss, bsz):
-        self.batch_trained_examples += bsz
-        self.batch_loss += loss * bsz
-
-    def finish_batch(self):
-        self.global_batch_iters += 1
-
-    def finish_update(self):
-        self.global_updates += 1
-
-    def do_print(self, print_loss_per_n_steps):
-        if self.global_updates == 0:
-            return False
-        if self.global_updates == 1:
-            return True
-        if self.global_updates % print_loss_per_n_steps == 0:
-            return True
-        return False
-
-    def print_avg_loss_and_clear(self):
-        avg_loss = self.batch_loss / self.batch_trained_examples
-        LOGGER.debug(
-            "Train proc=%s, epoch=%d, iter=%d, steps=%d, loss=%.9f",
-            ACCELERATOR.process_index,
-            self.curr_epoch,
-            self.curr_batch_iter,
-            self.global_updates,
-            avg_loss,
-            main_process_only=False,
-        )
-        # TENSORBOARD.add_scalar(f"{CONFIG['output_name']}/loss", avg_loss, self.global_batch_iters)
-        self.clear_batch_loss_info()
-
-    def clear_batch_loss_info(self):
-        self.batch_loss, self.batch_trained_examples = 0, 0
-
     def is_achieving_best_dev_score(self, score):
         if score >= self.dev_best["score"]:
             self.dev_best["score"] = score
             self.dev_best["at_iter"] = self.curr_batch_iter
             self.dev_best["at_epoch"] = self.curr_epoch
-            self.dev_best["at_global_epoch"] = self.global_batch_iters
-            self.dev_best["check_at"] = self.curr_check_point
+            self.dev_best["check_at"] = self.curr_checkpoint_at
             return True
         return False
 
     def state_dict(self):
         return asdict(self)
-
-    def draw_eval_details(self, eval_field, p, r, f1):
-        # TENSORBOARD.add_scalar(f"{CONFIG['output_name']}_{self.curr_eval_split}_{eval_field}/pecision", p * 100, self.global_batch_iters)
-        # TENSORBOARD.add_scalar(f"{CONFIG['output_name']}_{self.curr_eval_split}_{eval_field}/recall", r * 100, self.global_batch_iters)
-        # TENSORBOARD.add_scalar(f"{CONFIG['output_name']}_{self.curr_eval_split}_{eval_field}/f1", f1 * 100, self.global_batch_iters)
-        pass
 
     def load_state_dict(self, state_dict):
         for k, v in state_dict.items():
@@ -447,7 +395,7 @@ class MLflowTracker:
     def launch_tracker():
         if CONFIG["resume_from_checkpoint"]:
             mlf_tracker = MLflowTracker(url=CONFIG["mlflow_url"], run_id=STATUS_INFO.run_id)
-            mlf_tracker.set_tag(str(CONFIG["jobid"]), f"resume:{resume_epoch_start},{resume_iter_start}")
+            mlf_tracker.set_tag(str(CONFIG["jobid"]), f"resume:{epoch_resumed},{iter_resumed}")
         else:
             # Start a new mlflow run
             mlf_tracker = MLflowTracker(url=CONFIG["mlflow_url"], run_name=CONFIG["output_name"])
@@ -459,136 +407,7 @@ class MLflowTracker:
         return mlf_tracker
 
 
-def train(model, train_dataloader, valid_dataloader):
-    train_cfg = CONFIG["train"]
-
-    model_params = list(model.named_parameters())
-    assert model_params[0][0].startswith("vision_encoder")  # check the layer name
-    assert model_params[-1][0].startswith("classifier")
-    vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder")]
-    classifier_params = [(n, p) for n, p in model_params if n.startswith("classifier")]
-
-    no_decay_names = ["bias", "layer_norm1.weight", "layer_norm2.weight"]
-    optimizer_grouped_parameters = [
-        {"params": [p for n, p in vis_enc_params if any(nd_name in n for nd_name in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
-        {"params": [p for n, p in vis_enc_params if all(nd_name not in n for nd_name in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-        {"params": [p for n, p in classifier_params], "lr": train_cfg["mlc_lr"], "weight_decay": 0.0},
-    ]
-
-    optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
-    total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
-
-    # Prepare for multi GPUs. All prepared and registered objs will be checkpointed automatically
-    model, optimizer, train_dataloader, valid_dataloader, scheduler = ACCELERATOR.prepare(model, optimizer, train_dataloader, valid_dataloader, scheduler)
-    ACCELERATOR.register_for_checkpointing(STATUS_INFO)
-
-    # Checkpoint resume
-    resume_epoch_start, resume_iter_start = check_and_resume()
-    MLFLOW_TRACKER = MLflowTracker.launch_tracker()
-    LOGGER.info("p=%d, resume_epoch_start %d, resume_iter_start %d", ACCELERATOR.process_index, resume_epoch_start, resume_iter_start, main_process_only=False)
-
-    LOGGER.info("****************************** Training ******************************")
-    LOGGER.info("Total samples = %d, batch size = %d", len(train_dataloader.dataset), train_cfg["batch_size"])
-    LOGGER.info("Total epochs = %d, total iterations per epoch = %d", train_cfg["num_epochs"], len(train_dataloader))
-    LOGGER.info("Total optimization steps = %d", total_num_steps)
-    LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
-    LOGGER.info("Resume from epoch %d, iter %d", resume_epoch_start, resume_iter_start)
-    check_memory()
-
-    model.zero_grad()
-    for curr_epoch in range(resume_epoch_start, train_cfg["num_epochs"]):
-        # Ensure dataloader batches is reproducable
-        train_dataloader.set_epoch(curr_epoch)
-
-        # We need to skip steps until we reach the resumed step
-        # After the first iteration, we need to go back to the original dataloader
-        if CONFIG["resume_from_checkpoint"] and curr_epoch == resume_epoch_start and resume_iter_start > 0:
-            active_dataloader = ACCELERATOR.skip_first_batches(train_dataloader, resume_iter_start)
-        else:
-            active_dataloader = train_dataloader
-
-        start = time.time()
-        for curr_iter, batch_inputs_dict in enumerate(active_dataloader, start=resume_iter_start if curr_epoch == resume_epoch_start else 0):
-            # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_updates=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_batch_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
-
-            model.train()
-            model_accessor = get_model_accessor(model)
-            out = model_accessor(input_dict=batch_inputs_dict, return_loss=True)
-            loss = out["loss"]
-
-            ACCELERATOR.backward(loss)
-
-            STATUS_INFO.update_batch_info(curr_epoch=curr_epoch, curr_iter=curr_iter)
-            STATUS_INFO.add_batch_loss(loss=loss.item(), bsz=batch_inputs_dict["effusion_labels"].size(0))
-
-            if train_cfg["clip_grad_norm"] > 0:
-                ACCELERATOR.clip_grad_norm_(model.parameters(), train_cfg["clip_grad_norm"])
-
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-            MLFLOW_TRACKER.log(
-                {
-                    "epoch": curr_epoch,
-                    "loss": STATUS_INFO.batch_loss / STATUS_INFO.batch_trained_examples,
-                    "lr": scheduler.get_last_lr()[0],
-                    "global_updates": STATUS_INFO.global_updates + 1,
-                },
-                step=STATUS_INFO.global_batch_iters,
-            )
-
-            STATUS_INFO.finish_update()
-            if STATUS_INFO.do_print(train_cfg["print_loss_per_n_steps"]):
-                STATUS_INFO.print_avg_loss_and_clear()
-
-            STATUS_INFO.finish_batch()
-
-            # checkpoint, eval at specific steps:
-            if train_cfg["eval_per_steps"] > 0 and STATUS_INFO.global_updates % train_cfg["eval_per_steps"] == 0:
-                STATUS_INFO.update_batch_info(curr_check_point="batch", curr_eval_split="validation")
-                eval_result_dict = evaluate(model, target_dataloader=valid_dataloader, STATUS_INFO=STATUS_INFO)
-                check_and_save(model, eval_result_dict, STATUS_INFO)
-                check_memory()
-
-        end = time.time()
-        LOGGER.info("Batch training time: %d minutes (including in_batch eval)", (end - start) / 60)
-        STATUS_INFO.update_batch_info(curr_check_point="epoch", curr_eval_split="validation")
-        eval_result_dict = evaluate(model, target_dataloader=valid_dataloader, STATUS_INFO=STATUS_INFO)
-        check_and_save(model, eval_result_dict, STATUS_INFO)
-
-    LOGGER.info("Best achieved: %s", STATUS_INFO.dev_best)
-
-
-def check_and_save(model, eval_result_dict, STATUS_INFO):
-    # Check
-    score = 0
-    num_metrics = 0
-    for metric_key in ["present", "absent", "uncertain"]:
-        if metric_key in eval_result_dict:
-            score += eval_result_dict[metric_key]
-            num_metrics += 1
-    score = score / num_metrics
-    # TENSORBOARD.add_scalar(f"{CONFIG['output_name']}/{STATUS_INFO.curr_eval_split}_avg_f1", score * 100, STATUS_INFO.global_batch_iters)
-
-    achieved_best = STATUS_INFO.is_achieving_best_dev_score(score)
-
-    # Save the best
-    if achieved_best:
-        save_model(model, CONFIG["output_dir"]["model"])
-        LOGGER.info("Model saved to %s", CONFIG["output_dir"]["model"])
-
-    # checkpointing
-    if STATUS_INFO.curr_check_point:
-        LOGGER.info("****************************** Checkpoint ******************************")
-        LOGGER.info("Current [dev] f1: %.3f, at epoch %d, iter %d (%s)", score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_check_point)
-        LOGGER.info("Best [dev] f1: %.3f, at epoch %d, iter %d", STATUS_INFO.dev_best["score"] * 100, STATUS_INFO.dev_best["at_epoch"], STATUS_INFO.dev_best["at_iter"])
-        save_model(model, CONFIG["output_dir"]["checkpoint"])
-        LOGGER.info("Model checkpointed to %s", CONFIG["output_dir"]["checkpoint"])
-
-
-def evaluate(model, target_dataloader, STATUS_INFO=None):
+def evaluate(model, target_dataloader):
     eval_results = {
         "present": {
             "num_gold_label": 0,
@@ -645,37 +464,214 @@ def evaluate(model, target_dataloader, STATUS_INFO=None):
         LOGGER.info("[%s]: P: %.3f, R: %.3f, 【F1: %.3f】", eval_field, p, r, f1 * 100)
         task_f1[eval_field] = f1
 
-        if STATUS_INFO:
-            STATUS_INFO.draw_eval_details(eval_field, p, r, f1)
+    if STATUS_INFO:
+        STATUS_INFO.curr_eval_split
 
     end = time.time()
-    LOGGER.info("Evaluation time: %d minutes", (end - start) / 60)
+    LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
     check_memory()
     return task_f1
 
 
-def check_and_resume():
-    resume_epoch_start = 0
-    resume_iter_start = 0
+def train(model, train_dataloader, valid_dataloader):
+    global MLFLOW_TRACKER, STATUS_INFO
+
+    train_cfg = CONFIG["train"]
+
+    # hyperparameters
+    model_params = list(model.named_parameters())
+    assert model_params[0][0].startswith("vision_encoder")  # check the layer name
+    assert model_params[-1][0].startswith("classifier")
+    vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder")]
+    classifier_params = [(n, p) for n, p in model_params if n.startswith("classifier")]
+
+    no_decay_names = ["bias", "layer_norm1.weight", "layer_norm2.weight"]
+    optimizer_grouped_parameters = [
+        {"params": [p for n, p in vis_enc_params if any(nd_name in n for nd_name in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
+        {"params": [p for n, p in vis_enc_params if all(nd_name not in n for nd_name in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
+        {"params": [p for n, p in classifier_params], "lr": train_cfg["mlc_lr"], "weight_decay": 0.0},
+    ]
+
+    optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
+    total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
+
+    # Prepare for multi GPUs. All prepared and registered objs will be checkpointed automatically
+    model, optimizer, train_dataloader, valid_dataloader, scheduler = ACCELERATOR.prepare(model, optimizer, train_dataloader, valid_dataloader, scheduler)
+    STATUS_INFO = StatusInfo()
+    ACCELERATOR.register_for_checkpointing(STATUS_INFO)
+
+    # check and resume checkpoint if needed
+    epoch_resumed, iter_resumed = check_status_and_resume_checkpoint()
+
+    # Launch after resuming STATUS_INFO
+    MLFLOW_TRACKER = MLflowTracker.launch_tracker()
+
+    LOGGER.info("****************************** Training ******************************")
+    LOGGER.info("Total samples = %d, batch size = %d", len(train_dataloader.dataset), train_cfg["batch_size"])
+    LOGGER.info("Total epochs = %d, total iterations per epoch = %d", train_cfg["num_epochs"], len(train_dataloader))
+    LOGGER.info("Total optimization steps = %d", total_num_steps)
+    LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
+
+    check_memory()
+
+    model.zero_grad()
+    for curr_epoch in range(epoch_resumed, train_cfg["num_epochs"]):
+        # Ensure dataloader batches is reproducable
+        train_dataloader.set_epoch(curr_epoch)
+
+        # We need to skip steps until we reach the resumed step
+        # After the first iteration, we need to go back to the original dataloader
+        if CONFIG["resume_from_checkpoint"] and curr_epoch == epoch_resumed and iter_resumed > 0:
+            active_dataloader = ACCELERATOR.skip_first_batches(train_dataloader, iter_resumed)
+        else:
+            active_dataloader = train_dataloader
+
+        start = time.time()
+        for curr_iter, batch_inputs_dict in enumerate(active_dataloader, start=iter_resumed if curr_epoch == epoch_resumed else 0):
+            with ACCELERATOR.accumulate(model):
+                # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_updates=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
+
+                model.train()
+                model_accessor = get_model_accessor(model)
+                out = model_accessor(input_dict=batch_inputs_dict, return_loss=True)
+                loss = out["loss"]
+
+                ACCELERATOR.backward(loss)
+                if train_cfg["clip_grad_norm"] > 0:
+                    ACCELERATOR.clip_grad_norm_(model.parameters(), train_cfg["clip_grad_norm"])
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                log_and_update_status(
+                    curr_epoch=curr_epoch,
+                    curr_iter=curr_iter,
+                    loss=loss.item(),
+                    bsz=batch_inputs_dict["effusion_labels"].size(0),
+                    lr=scheduler.get_last_lr()[0],
+                )
+
+                # eval and save
+                validation_process(model, valid_dataloader)
+
+        end = time.time()
+        LOGGER.info("Batch training time: %s ", seconds_to_time_str(end - start))
+
+    LOGGER.info("Best achieved: %s", STATUS_INFO.dev_best)
+    MLFLOW_TRACKER.finish()
+
+
+def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
+    STATUS_INFO.curr_epoch = curr_epoch
+    STATUS_INFO.curr_batch_iter = curr_iter
+    STATUS_INFO.batch_trained_examples += bsz
+    STATUS_INFO.batch_loss += loss * bsz
+    STATUS_INFO.global_iters += 1
+
+    if ACCELERATOR.sync_gradients:
+        STATUS_INFO.global_updates += 1
+
+    # Log every iteration
+    MLFLOW_TRACKER.log(
+        {
+            "epoch": curr_epoch,
+            "loss": loss,
+            "lr": lr,
+            "global_updates": STATUS_INFO.global_updates,
+        },
+        step=STATUS_INFO.global_iters,
+    )
+
+    print_loss_per_n_steps = CONFIG["train"]["print_loss_per_n_steps"]
+    if STATUS_INFO.global_updates == 1 or STATUS_INFO.global_updates % print_loss_per_n_steps == 0:
+        avg_loss = STATUS_INFO.batch_loss / STATUS_INFO.batch_trained_examples
+        LOGGER.debug(
+            "p=%s, Epoch=%d, iter=%d, steps=%d, loss=%.9f",
+            ACCELERATOR.process_index,
+            STATUS_INFO.curr_epoch,
+            STATUS_INFO.curr_batch_iter,
+            STATUS_INFO.global_updates,
+            avg_loss,
+            main_process_only=False,
+        )
+        STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
+
+
+def validation_process(model, valid_dataloader):
+    train_cfg = CONFIG["train"]
+    do_eval = True
+
+    # eval at the end of each epoch
+    if STATUS_INFO.curr_batch_iter + 1 == len(valid_dataloader):
+        STATUS_INFO.curr_checkpoint_at = "epoch"
+        STATUS_INFO.curr_eval_split = "validation"
+    # eval at specific steps:
+    elif train_cfg["eval_per_steps"] > 0 and STATUS_INFO.global_updates % train_cfg["eval_per_steps"] == 0:
+        STATUS_INFO.curr_checkpoint_at = "batch"
+        STATUS_INFO.curr_eval_split = "validation"
+    else:
+        do_eval = False
+
+    if do_eval:
+        eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
+        check_results_and_save_model(model, eval_result_dict)
+        check_memory()
+
+
+def check_results_and_save_model(model, eval_result_dict):
+    # Check
+    score = 0
+    num_metrics = 0
+    for metric_key in ["present", "absent", "uncertain"]:
+        if metric_key in eval_result_dict:
+            score += eval_result_dict[metric_key]
+            num_metrics += 1
+    score = score / num_metrics
+
+    LOGGER.info("****************************** Checkpoint ******************************")
+    LOGGER.info("Current [dev] f1: %.3f, at epoch %d, iter %d (%s)", score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_checkpoint_at)
+    LOGGER.info("Best [dev] f1: %.3f, at epoch %d, iter %d", STATUS_INFO.dev_best["score"] * 100, STATUS_INFO.dev_best["at_epoch"], STATUS_INFO.dev_best["at_iter"])
+
+    # checkpointing
+    save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
+
+    # Save the best
+    if STATUS_INFO.is_achieving_best_dev_score(score):
+        save_model(model, CONFIG["output_dir"]["model"])
+
+
+def check_status_and_resume_checkpoint():
+    epoch_resumed = 0
+    iter_resumed = 0
     resume_from_checkpoint = CONFIG["resume_from_checkpoint"]
 
     if resume_from_checkpoint:
-        checkpoint_dir = resume_from_checkpoint if isinstance(resume_from_checkpoint, str) and os.path.exists(resume_from_checkpoint) else CONFIG.output_checkpoint_dir
+        LOGGER.info("****************************** Resume checkpoint ******************************")
+        checkpoint_dir = resume_from_checkpoint if isinstance(resume_from_checkpoint, str) and os.path.exists(resume_from_checkpoint) else CONFIG["output_dir"]["checkpoint"]
 
-        # STATUS_INFO will be loaded automatically in load_state as we have already registered it via ACCELERATOR.register_for_checkpointing(STATUS_INFO)
-        ACCELERATOR.load_state(checkpoint_dir)
+        # STATUS_INFO will also be loaded automatically in load_state as we have already registered it via ACCELERATOR.register_for_checkpointing(STATUS_INFO)
+        load_checkpoint(checkpoint_dir)
+
         LOGGER.info("p=%d, Resumed status info %s", ACCELERATOR.process_index, STATUS_INFO.state_dict(), main_process_only=False)
 
         # Prepare the next epoch and iter indices for continue training
-        if STATUS_INFO.curr_check_point == "epoch":
-            resume_epoch_start = STATUS_INFO.curr_epoch + 1
-        elif STATUS_INFO.curr_check_point == "batch":
-            resume_epoch_start = STATUS_INFO.curr_epoch
-            resume_iter_start = STATUS_INFO.curr_batch_iter + 1
+        if STATUS_INFO.curr_checkpoint_at == "epoch":
+            epoch_resumed = STATUS_INFO.curr_epoch + 1
+        elif STATUS_INFO.curr_checkpoint_at == "batch":
+            epoch_resumed = STATUS_INFO.curr_epoch
+            iter_resumed = STATUS_INFO.curr_batch_iter + 1
         else:
-            raise ValueError(f"Invaild STATUS_INFO.curr_check_point: {STATUS_INFO.curr_check_point}")
+            raise ValueError(f"Invaild STATUS_INFO.curr_checkpoint_at: {STATUS_INFO.curr_checkpoint_at}")
 
-    return resume_epoch_start, resume_iter_start
+        LOGGER.info("p=%d, epoch_resumed %d, iter_resumed %d", ACCELERATOR.process_index, epoch_resumed, iter_resumed, main_process_only=False)
+
+    return epoch_resumed, iter_resumed
+
+
+#############################################
+# Utils
+#############################################
 
 
 def get_model_accessor(model):
@@ -685,11 +681,6 @@ def get_model_accessor(model):
     else:
         model_accessor = model
     return model_accessor
-
-
-#############################################
-# Utils
-#############################################
 
 
 def check_memory():
@@ -713,14 +704,45 @@ def seconds_to_time_str(seconds):
     return f"{hours:.0f}h {minutes:.0f}min {seconds:.1f}s"
 
 
+def load_checkpoint(checkpoint_dir):
+    """training_info will be loaded automatically in load_state as we have already registered it via ACCELERATOR.register_for_checkpointing(training_info)"""
+    # 如果 checkpoint_dir 是 CONFIG["output_dir"]["checkpoint"]，就选择最新的 checkpoint
+    checkpoint_list = sorted(glob.glob(os.path.join(checkpoint_dir, "epoch_*_iter_*")), key=os.path.getctime)
+    if len(checkpoint_list) > 0:
+        checkpoint_dir = checkpoint_list[-1]
+
+    ACCELERATOR.load_state(checkpoint_dir)
+    LOGGER.info("Checkpoint loaded from %s", checkpoint_dir)
+
+
 def load_model(model_path):
     model = CustomModel.from_pretrained(model_path)
     LOGGER.info("Pre-trained model loaded from %s", model_path)
     return model
 
 
+def save_checkpoint(checkpoint_dir, max_to_keep=5):
+    ckp_path = os.path.join(checkpoint_dir, f"epoch_{STATUS_INFO.curr_epoch}_iter_{STATUS_INFO.curr_batch_iter}")
+    ACCELERATOR.save_state(ckp_path, safe_serialization=False)
+    LOGGER.info("Checkpoint saved to %s", checkpoint_dir)
+
+    # 如果文件数量超过 max_to_keep，删除旧的 checkpoint
+    if ACCELERATOR.is_main_process:
+        # os.path.getctime 按创建时间排序
+        checkpoint_files = sorted(glob.glob(os.path.join(checkpoint_dir, "epoch_*_iter_*")), key=os.path.getctime)
+        if len(checkpoint_files) > max_to_keep:
+            old_checkpoints = checkpoint_files[:-max_to_keep]  # 排除最近的 max_to_keep 个
+            for old_checkpoint in old_checkpoints:
+                if os.path.isdir(old_checkpoint):  # 如果 checkpoint 是文件夹
+                    os.rmdir(old_checkpoint)
+                else:  # 如果 checkpoint 是文件
+                    os.remove(old_checkpoint)
+                LOGGER.info("Old checkpoint removed: %s", old_checkpoint)
+
+
 def save_model(model, output_dir):
-    model.save_pretrained(output_dir)
+    unwrapped_model = ACCELERATOR.unwrap_model(model)
+    unwrapped_model.save_pretrained(output_dir, is_main_process=ACCELERATOR.is_main_process, save_function=ACCELERATOR.save)
     LOGGER.info("Model saved to %s", output_dir)
 
 
@@ -812,10 +834,12 @@ def load_datasets(data_paths):
 def init_accelerator():
     global ACCELERATOR, DEVICE
 
-    # However, if no_sync is disabled via sync_each_batch=True, then the memory consumption for gradient_accumulation_steps=16 reverts to that of gradient_accumulation_steps=1.
     dataloader_cfg = DataLoaderConfiguration(use_seedable_sampler=True)
-    # gradient_accumulation_plugin = GradientAccumulationPlugin(num_steps=CONFIG.grad_accum_steps, sync_each_batch=True)
-    ACCELERATOR = Accelerator(dataloader_config=dataloader_cfg)
+    # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
+    # 如果OOM，可以尝试设置 sync_each_batch=True，但是会导致训练速度变慢
+    # adjust_scheduler=False，我们在train方法中手动计算 scheduler 在使用梯度累计后的 step
+    plugin = GradientAccumulationPlugin(num_steps=CONFIG["train"]["grad_accum_steps"], adjust_scheduler=False, sync_with_dataloader=True)
+    ACCELERATOR = Accelerator(dataloader_config=dataloader_cfg, gradient_accumulation_plugin=plugin)
     DEVICE = ACCELERATOR.device
 
     if ACCELERATOR.is_local_main_process:
@@ -919,7 +943,7 @@ def main(img_dataset, text_dataset):
     start = time.time()
     train(model, train_dataloader, valid_dataloader)
     end = time.time()
-    LOGGER.info("Total training time: %d minutes", (end - start) / 60)
+    LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
     model = load_model(CONFIG["output_dir"]["model"])
     model.to(DEVICE)
@@ -927,7 +951,7 @@ def main(img_dataset, text_dataset):
     start = time.time()
     evaluate(model, test_dataloader)
     end = time.time()
-    LOGGER.info("Final evaluation time: %d minutes", (end - start) / 60)
+    LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
 
 
 if __name__ == "__main__":
@@ -938,12 +962,8 @@ if __name__ == "__main__":
     LOGGER.debug(CONFIG)
     set_seed(CONFIG["train"]["seed"])
     img_dataset, text_dataset = load_datasets(data_paths=CONFIG["data_path"])
-    STATUS_INFO = StatusInfo()
-    # TENSORBOARD = SummaryWriter(log_dir=CONFIG["output_dir"]["log"])
 
     start0 = time.time()
     main(img_dataset, text_dataset)
     end0 = time.time()
-    LOGGER.info("Total time: %d ", seconds_to_time_str(end0 - start0))
-
-    # TENSORBOARD.close()
+    LOGGER.info("Total time: %s ", seconds_to_time_str(end0 - start0))

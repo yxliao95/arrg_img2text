@@ -15,7 +15,7 @@ data_path:
 target_section: findings
 
 # path to checkpoint or, bool;
-# if True, then use the `output_dir.checkpoint/output_name` as the checkpoint path
+# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
 resume_from_checkpoint: False
 
 mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
@@ -31,7 +31,7 @@ train:
   seed: 42
   batch_size: 8
   num_epochs: 10
-  grad_accum_steps: 1
+  grad_accum_steps: 2
   warmup_proportion: 0.1
   weight_decay: 0.0
   lr: 0.00001
