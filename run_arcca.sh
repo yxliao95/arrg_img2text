@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=0_imgcls_allimg
+#SBATCH --job-name=1_imgcls_notallimg_fast_try1
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number.
@@ -9,7 +9,7 @@
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
 #SBATCH --partition=gpu_v100
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 ### SBATCH -t 0-00:00
 
 # Number of CPU cores per task to allocate
@@ -29,12 +29,26 @@ conda activate $env
 echo "Loaded $conda, env: $env"
 nvcc -V
 
-cfg_dir=/scratch/c.c21051562/workspace/arrg_img2text/config/arcca
+nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
+echo "MLflow server started"
 
-# python /scratch/c.c21051562/workspace/arrg_img2text/0_img_cls_effusion_allimg.py --from_bash --config_file $cfg_dir/0_imgcls_allimg.yaml
-python /scratch/c.c21051562/workspace/arrg_img2text/0_img_cls_effusion_notallimg.py --from_bash --config_file $cfg_dir/0_imgcls_notallimg.yaml
+echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
+accelerate launch --multi_gpu /scratch/c.c21051562/workspace/arrg_img2text/1_img_cls_effusion_notallimg_attpool.py --from_bash --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/arcca/1_imgcls_notallimg_fast.yaml --output_name $SLURM_JOB_NAME --jobid $SLURM_JOB_ID
+echo "Script finished."
 
 python /scratch/c.c21051562/workspace/arrg_img2text/test_email.py
+
+# 查找所有运行中的 MLflow 进程
+pids=$(ps aux | grep '[m]lflow' | awk '{print $2}')
+echo "Killing MLflow server processes: $pids"
+if [ -z "$pids" ]; then
+  echo "No MLflow processes found."
+else
+  for pid in $pids; do
+    kill $pid
+    echo "Stopped process with PID: $pid"
+  done
+fi
 
 # sbatch /scratch/c.c21051562/workspace/arrg_img2text/run_arcca.sh
 # scontrol show job JOBID
