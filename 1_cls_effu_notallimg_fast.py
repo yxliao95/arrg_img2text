@@ -672,9 +672,9 @@ def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
         do_eval = False
 
     if do_eval:
+        check_memory()
         eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
         check_results_and_save_model(model, eval_result_dict)
-        check_memory()
 
 def final_test_process(model, test_dataloader):
     model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)

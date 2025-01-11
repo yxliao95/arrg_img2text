@@ -45,11 +45,11 @@ accelerate launch \
     # --resume_from_checkpoint
 echo "Script finished."
 
-python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Done: $SLURM_JOB_NAME"
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Done: $SLURM_JOB_NAME"
 
 # 查找所有运行中的 MLflow 进程
 pids=$(ps aux | grep '[m]lflow' | awk '{print $2}')
-echo "Killing MLflow server processes: $pids"
+echo "Killing MLflow server processes: $pids" 
 if [ -z "$pids" ]; then
   echo "No MLflow processes found."
 else
@@ -58,7 +58,7 @@ else
     echo "Stopped process with PID: $pid"
   done
 fi
-
+  
 
 # sbatch /scratch/c.c21051562/workspace/arrg_img2text/run_sunbird.sh
 # scontrol show job JOBID
@@ -74,7 +74,7 @@ fi
 # ssh -L 6007:localhost:6006 yuxiang@10.97.37.97
 # ssh -L 6007:localhost:6006 -J c.c21051562@sunbird.swansea.ac.uk c.c21051562@ccs2111
 
-# ssh -L 6007:localhost:6006 -J c.c21051562@sunbird.swansea.ac.uk
+# ssh -L 6007:localhost:6006 c.c21051562@sunbird.swansea.ac.uk
 # cd /scratch/c.c21051562/workspace/arrg_img2text/outputs/
 # conda activate arrg_img2text
 # mlflow server --host 127.0.0.1 --port 6006
