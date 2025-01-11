@@ -29,13 +29,13 @@ model:
 
 train:
   seed: 42
-  batch_size: 64
-  num_epochs: 100
+  batch_size: 128
+  num_epochs: 60
   grad_accum_steps: 1
   warmup_proportion: 0.1
   weight_decay: 0.0
-  lr: 0.00005
-  mlc_lr: 0.00005
+  lr: 0.00001
+  mlc_lr: 0.00001
   clip_grad_norm: 1.0
   mixed_precision: bf16 # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
