@@ -632,9 +632,9 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
     # Log every iteration
     MLFLOW_TRACKER.log(
         {
-            "epoch": curr_epoch,
-            "loss": loss,
             "lr": lr,
+            "loss": loss,
+            "epoch": curr_epoch,
             "global_update_steps": STATUS_INFO.global_update_steps,
         },
         step=STATUS_INFO.global_iters,
@@ -987,7 +987,7 @@ def main(img_dataset, text_dataset):
     # Get dataloader for training and testing
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=True)
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False)
     train_dataloader, valid_dataloader, test_dataloader = ACCELERATOR.prepare(train_dataloader, valid_dataloader, test_dataloader)
 
     # Training
