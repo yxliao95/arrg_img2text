@@ -467,20 +467,17 @@ def evaluate(model, target_dataloader):
             preds = predicted_labels.cpu().numpy()  # (8,)
             golds = gold_labels.cpu().numpy()
 
-            # gather_object across gpus
-            data_ids.extend(gather_object(input_tensors_dict["data_id_list"]))
-            data_preds.extend(gather(preds))
-            data_golds.extend(gather(golds))
+            # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
+            data_ids.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["data_id_list"], use_gather_object=True))
+            data_preds.extend(ACCELERATOR.gather_for_metrics(preds, use_gather_object=True))
+            data_golds.extend(ACCELERATOR.gather_for_metrics(golds, use_gather_object=True))
 
-    # Truncate duplicated data. 最后一个batch的数据会重复，因此需要丢弃重复数据
-    if ACCELERATOR.use_distributed:
-        LOGGER.debug("Eval, before truncation, ids=%s", data_ids)
-        data_ids = data_ids[: target_dataloader.total_dataset_length]
-        assert len(data_ids) == len(dataloader.dataset)
-        LOGGER.debug("Eval, after truncation, ids=%s", data_ids)
-        data_preds = data_preds[: dataloader.total_dataset_length]
-        data_golds = data_golds[: dataloader.total_dataset_length]
-
+    assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
+    assert len(data_ids) == target_dataloader.total_dataset_length, f"Gathered data size ({len(data_ids)}) should equals to dataset size ({target_dataloader.total_dataset_length})"
+    # LOGGER.debug("p=%s, len=%s, data_ids: %s", ACCELERATOR.process_index, len(data_ids), data_ids)
+    # LOGGER.debug("p=%s, len=%s, data_preds: %s", ACCELERATOR.process_index, len(data_preds), data_preds)
+    # LOGGER.debug("p=%s, len=%s, data_golds: %s", ACCELERATOR.process_index, len(data_golds), data_golds)
+    
     key_map = {0: "present", 1: "absent", 2: "uncertain"}
     for gold, pred in zip(data_golds, data_preds):
         eval_results[key_map[gold]]["num_gold_label"] += 1

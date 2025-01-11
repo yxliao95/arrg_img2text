@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=1_imgcls_notallimg_fast_try1
-#SBATCH --account=scw2258
+#SBATCH --account=scw1991
 
 # job stdout file. The '%J' to Slurm is replaced with the job number.
 #SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/stdout/stdout_%J.log

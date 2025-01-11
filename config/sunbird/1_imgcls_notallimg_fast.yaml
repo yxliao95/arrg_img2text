@@ -1,0 +1,47 @@
+output_name: 1_imgcls_effu_allimg_attpool_try1
+
+output_dir:
+  result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
+  model: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models
+  checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs/checkpoints
+  log: /scratch/c.c21051562/workspace/arrg_img2text/outputs/logs
+
+data_path:
+  mimic: /scratch/c.c21051562/resources/data/mimic-cxr
+  interpret: /scratch/c.c21051562/resources/data/interpret-cxr
+  interpret-test-public: /scratch/c.c21051562/resources/data/interpret-cxr-test-public
+  custom_text: /scratch/c.c21051562/resources/data/interpret_text_exp/interpret_text_findings_effusion
+
+target_section: findings
+
+model_name_or_path:
+  clip: /scratch/c.c21051562/resources/downloaded_models/clip-vit-base-patch32
+
+# path to checkpoint or, bool;
+# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
+resume_from_checkpoint: True
+
+mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
+max_checkpoints_to_keep: 3
+
+model:
+  vision_backbone: clip
+  num_classes: 3
+
+train:
+  seed: 42
+  batch_size: 16
+  num_epochs: 10
+  grad_accum_steps: 2
+  warmup_proportion: 0.1
+  weight_decay: 0.0
+  lr: 0.00001
+  mlc_lr: 0.00001
+  clip_grad_norm: 1.0
+  mixed_precision: bf16 # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
+
+  print_loss_per_n_steps: 1
+  eval_per_steps: 20 # 550395 / 32 = 17199, 170801 / 64 = 2669
+
+eval:
+  batch_size: 64
