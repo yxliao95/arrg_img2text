@@ -610,7 +610,7 @@ def train(model, train_dataloader, valid_dataloader):
                 log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["effusion_labels"].size(0), lr=scheduler.get_last_lr()[0])
 
                 # eval and save
-                validation_process(model, valid_dataloader)
+                validation_process(model, valid_dataloader, max_num_iters_per_epoch=len(train_dataloader))
 
         end = time.time()
         LOGGER.info("Batch training time: %s ", seconds_to_time_str(end - start))
@@ -655,14 +655,13 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
         STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
 
 
-def validation_process(model, valid_dataloader):
+def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
     train_cfg = CONFIG["train"]
-    do_eval = True
-    if STATUS_INFO.global_update_steps == 1:
-        do_eval = False
+    # global_update_steps == 0 时，默认不评估
+    do_eval = True if STATUS_INFO.global_update_steps > 0 else False
         
     # eval at the end of each epoch
-    if STATUS_INFO.curr_batch_iter + 1 == len(valid_dataloader):
+    if STATUS_INFO.curr_batch_iter + 1 == max_num_iters_per_epoch:
         STATUS_INFO.curr_checkpoint_at = "epoch"
         STATUS_INFO.curr_eval_split = "validation"
     # eval at specific steps:
