@@ -19,7 +19,7 @@ model_name_or_path:
 
 # path to checkpoint or, bool;
 # if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
-resume_from_checkpoint: True
+resume_from_checkpoint: False
 
 mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
 max_checkpoints_to_keep: 3
@@ -31,7 +31,7 @@ model:
 train:
   seed: 42
   batch_size: 16
-  num_epochs: 10
+  num_epochs: 3
   grad_accum_steps: 2
   warmup_proportion: 0.1
   weight_decay: 0.0
@@ -41,7 +41,7 @@ train:
   mixed_precision: bf16 # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
   print_loss_per_n_steps: 1
-  eval_per_steps: 20 # 550395 / 32 = 17199, 170801 / 64 = 2669
+  eval_per_steps: 0 # 550395 / 32 = 17199, 170801 / 64 = 2669
 
 eval:
   batch_size: 64

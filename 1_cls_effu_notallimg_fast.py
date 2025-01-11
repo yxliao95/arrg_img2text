@@ -119,15 +119,10 @@ class CustomModel(PreTrainedModel):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, num_labels), labels.view(-1, num_labels))
 
-            return {
-                "logits": logits,
-                "loss": loss,
-            }
+            return logits, loss
 
         else:
-            return {
-                "logits": logits,
-            }
+            return logits
 
 
 class ImageTextDataset(Dataset):
@@ -458,9 +453,7 @@ def evaluate(model, target_dataloader):
     with torch.no_grad():
         for input_tensors_dict in target_dataloader:
             # Model inference
-            model_accessor = get_model_accessor(model)
-            out = model_accessor(input_dict=input_tensors_dict)
-            logits = out["logits"]
+            logits = model(input_dict=input_tensors_dict)
 
             _, predicted_labels = logits.max(dim=-1)
             _, gold_labels = input_tensors_dict["effusion_labels"].max(dim=-1)
@@ -514,7 +507,7 @@ def train(model, train_dataloader, valid_dataloader):
     train_cfg = CONFIG["train"]
 
     # hyperparameters
-    model_params = list(model.named_parameters())
+    model_params = list(ACCELERATOR.unwrap_model(model).named_parameters())
     assert model_params[0][0].startswith("vision_encoder")  # check the layer name
     assert model_params[-1][0].startswith("classifier")
     vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder")]
@@ -532,7 +525,7 @@ def train(model, train_dataloader, valid_dataloader):
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
 
     # Prepare for multi GPUs. All prepared and registered objs will be checkpointed automatically
-    model, optimizer, train_dataloader, valid_dataloader, scheduler = ACCELERATOR.prepare(model, optimizer, train_dataloader, valid_dataloader, scheduler)
+    optimizer, scheduler = ACCELERATOR.prepare(optimizer, scheduler)
     STATUS_INFO = StatusInfo()
     ACCELERATOR.register_for_checkpointing(STATUS_INFO)
 
@@ -569,9 +562,7 @@ def train(model, train_dataloader, valid_dataloader):
                 # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_updates=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
 
                 model.train()
-                model_accessor = get_model_accessor(model)
-                out = model_accessor(input_dict=batch_inputs_dict, return_loss=True)
-                loss = out["loss"]
+                logits, loss = model(input_dict=batch_inputs_dict, return_loss=True)
 
                 ACCELERATOR.backward(loss)
                 if train_cfg["clip_grad_norm"] > 0:
@@ -647,6 +638,9 @@ def validation_process(model, valid_dataloader):
         eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
         check_results_and_save_model(model, eval_result_dict)
         check_memory()
+
+def final_test_process(model, test_dataloader):
+    model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
 
 
 def check_results_and_save_model(model, eval_result_dict):
@@ -948,26 +942,30 @@ def init_proj_config():
 
 
 def main(img_dataset, text_dataset):
-    train_cfg = CONFIG["train"]
-    eval_cfg = CONFIG["eval"]
     model_base_cfg = CONFIG["model"]
-
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
+    
+    # Get dataloader for training and testing
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
     train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=True)
+    train_dataloader, valid_dataloader, test_dataloader = ACCELERATOR.prepare(train_dataloader, valid_dataloader, test_dataloader)
 
+    # Training
     model = init_model(model_name_or_path, model_base_cfg)
     model.to(DEVICE)
+    model = ACCELERATOR.prepare(model)
 
     start = time.time()
     train(model, train_dataloader, valid_dataloader)
     end = time.time()
     LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
+    # Testing
     model = load_model(CONFIG["output_dir"]["model"])
     model.to(DEVICE)
-
+    model = ACCELERATOR.prepare(model)
+    
     start = time.time()
     evaluate(model, test_dataloader)
     end = time.time()
