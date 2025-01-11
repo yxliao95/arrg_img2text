@@ -14,6 +14,7 @@ import shutil
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from typing import Any, Optional, Tuple, Union
 
 import datasets
 import imagehash
@@ -32,8 +33,8 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from transformers.modeling_outputs import BaseModelOutput
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -77,13 +78,45 @@ class CustomModelConfig(PretrainedConfig):
         self.num_labels = self.base_config["num_classes"] if self.base_config else 2
 
 
+class CustomCLIPVisionModel(CLIPVisionModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.vision_model.post_layernorm = None
+        
+    def forward(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = True,
+        output_hidden_states: Optional[bool] = True,
+        interpolate_pos_encoding: bool = False,
+        return_dict: Optional[bool] = True,
+    ) -> Union[Tuple, BaseModelOutput]:
+        
+        hidden_states = self.vision_model.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+        hidden_states = self.vision_model.pre_layrnorm(hidden_states)
+
+        encoder_outputs = self.vision_model.encoder(
+            inputs_embeds=hidden_states,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        last_hidden_state = encoder_outputs[0]
+        
+        return BaseModelOutput(
+            last_hidden_state=last_hidden_state,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
 class CustomModel(PreTrainedModel):
     config_class = CustomModelConfig
 
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.vision_encoder = CLIPVisionModel(config.vision_config)
+        self.vision_encoder = CustomCLIPVisionModel(config.vision_config)
         self.classifier = torch.nn.Linear(self.config.vision_config.hidden_size, config.num_labels)
 
     def reshape_img_features(self, last_hidden_state, image_indices_map):
@@ -509,8 +542,8 @@ def train(model, train_dataloader, valid_dataloader):
     # hyperparameters
     model_params = list(ACCELERATOR.unwrap_model(model).named_parameters())
     assert model_params[0][0].startswith("vision_encoder")  # check the layer name
-    assert model_params[-1][0].startswith("classifier")
-    vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder")]
+    assert model_params[199][0].startswith("classifier")
+    vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder") and "post_layernorm" not in n]
     classifier_params = [(n, p) for n, p in model_params if n.startswith("classifier")]
 
     no_decay_names = ["bias", "layer_norm1.weight", "layer_norm2.weight"]

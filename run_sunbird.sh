@@ -33,7 +33,7 @@ nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/scrat
 echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TORCH_DISTRIBUTED_DEBUG=INFO
 accelerate launch --multi_gpu --main_process_port 29555 /scratch/c.c21051562/workspace/arrg_img2text/1_cls_effu_notallimg_fast.py --from_bash --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/1_imgcls_notallimg_fast.yaml --output_name $SLURM_JOB_NAME --jobid $SLURM_JOB_ID
 echo "Script finished."
 
