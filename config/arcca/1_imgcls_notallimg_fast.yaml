@@ -1,4 +1,7 @@
 output_name: 00_test
+# path to checkpoint or, bool;
+# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
+resume_from_checkpoint: False
 
 output_dir:
   result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
@@ -14,15 +17,11 @@ data_path:
 
 target_section: findings
 
-# path to checkpoint or, bool;
-# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
-resume_from_checkpoint: False
-
-mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
-max_checkpoints_to_keep: 3
-
 model_name_or_path:
   clip: /scratch/c.c21051562/resources/downloaded_models/clip-vit-base-patch32
+
+mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
+max_checkpoints_to_keep: 5
 
 model:
   vision_backbone: clip
@@ -30,18 +29,18 @@ model:
 
 train:
   seed: 42
-  batch_size: 16
-  num_epochs: 10
-  grad_accum_steps: 2
+  batch_size: 64
+  num_epochs: 100
+  grad_accum_steps: 1
   warmup_proportion: 0.1
   weight_decay: 0.0
-  lr: 0.00001
-  mlc_lr: 0.00001
+  lr: 0.00005
+  mlc_lr: 0.00005
   clip_grad_norm: 1.0
   mixed_precision: fp16 # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
-  print_loss_per_n_steps: 1
-  eval_per_steps: 20 # 550395 / 32 = 17199, 170801 / 64 = 2669
+  print_loss_per_n_steps: 100 # logging loss on .log file
+  eval_per_steps: 0 # 550395 / 32 = 17199, 170801 / 64 = 2669
 
 eval:
   batch_size: 64
