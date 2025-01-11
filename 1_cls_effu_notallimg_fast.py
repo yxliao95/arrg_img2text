@@ -1,6 +1,8 @@
 #############################################
 # 基于 0_img_cls_effusion_notallimg.py
-# 改进：使用A100时比V100慢，考虑动态调整图像数量时的遍历导致的性能问题，改用torch的批处理操作
+# 改进：
+# 使用A100时比V100慢，考虑动态调整图像数量时的遍历导致的性能问题，改用torch的批处理操作
+# 使用Accelerate；使用Mix-precision；改用MLFlow代替Tensorboard
 #############################################
 import argparse
 import datetime
@@ -81,6 +83,7 @@ class CustomModelConfig(PretrainedConfig):
 class CustomCLIPVisionModel(CLIPVisionModel):
     def __init__(self, config):
         super().__init__(config)
+        # Unused parameters will cause errors when using Accelerate, need to be removed
         self.vision_model.post_layernorm = None
         
     def forward(
@@ -355,7 +358,7 @@ class StatusInfo:
     curr_eval_split: str = field(default="")  # "validation" or "test"
 
     global_iters: int = field(default=0)
-    global_updates: int = field(default=0)
+    global_update_steps: int = field(default=0)
     dev_best: dict = field(default_factory=lambda: {"score": 0.0, "at_epoch": 0, "at_iter": 0, "check_at": ""})
 
     batch_loss: int = field(default=0)
@@ -542,7 +545,7 @@ def train(model, train_dataloader, valid_dataloader):
     # hyperparameters
     model_params = list(ACCELERATOR.unwrap_model(model).named_parameters())
     assert model_params[0][0].startswith("vision_encoder")  # check the layer name
-    assert model_params[199][0].startswith("classifier")
+    assert model_params[197][0].startswith("classifier")
     vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder") and "post_layernorm" not in n]
     classifier_params = [(n, p) for n, p in model_params if n.startswith("classifier")]
 
@@ -592,7 +595,7 @@ def train(model, train_dataloader, valid_dataloader):
         start = time.time()
         for curr_iter, batch_inputs_dict in enumerate(active_dataloader, start=iter_resumed if curr_epoch == epoch_resumed else 0):
             with ACCELERATOR.autocast(), ACCELERATOR.accumulate(model):
-                # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_updates=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
+                # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_update_steps=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
 
                 model.train()
                 logits, loss = model(input_dict=batch_inputs_dict, return_loss=True)
@@ -624,7 +627,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
     STATUS_INFO.global_iters += 1
 
     if ACCELERATOR.sync_gradients:
-        STATUS_INFO.global_updates += 1
+        STATUS_INFO.global_update_steps += 1
 
     # Log every iteration
     MLFLOW_TRACKER.log(
@@ -632,20 +635,20 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
             "epoch": curr_epoch,
             "loss": loss,
             "lr": lr,
-            "global_updates": STATUS_INFO.global_updates,
+            "global_update_steps": STATUS_INFO.global_update_steps,
         },
         step=STATUS_INFO.global_iters,
     )
 
     print_loss_per_n_steps = CONFIG["train"]["print_loss_per_n_steps"]
-    if STATUS_INFO.global_updates == 1 or STATUS_INFO.global_updates % print_loss_per_n_steps == 0:
+    if STATUS_INFO.global_update_steps == 1 or STATUS_INFO.global_update_steps % print_loss_per_n_steps == 0:
         avg_loss = STATUS_INFO.batch_loss / STATUS_INFO.batch_trained_examples
         LOGGER.info(
             "p=%s, Epoch=%d, iter=%d, steps=%d, loss=%.9f",
             ACCELERATOR.process_index,
             STATUS_INFO.curr_epoch,
             STATUS_INFO.curr_batch_iter,
-            STATUS_INFO.global_updates,
+            STATUS_INFO.global_update_steps,
             avg_loss,
             main_process_only=False,
         )
@@ -655,13 +658,15 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
 def validation_process(model, valid_dataloader):
     train_cfg = CONFIG["train"]
     do_eval = True
-
+    if STATUS_INFO.global_update_steps == 1:
+        do_eval = False
+        
     # eval at the end of each epoch
     if STATUS_INFO.curr_batch_iter + 1 == len(valid_dataloader):
         STATUS_INFO.curr_checkpoint_at = "epoch"
         STATUS_INFO.curr_eval_split = "validation"
     # eval at specific steps:
-    elif train_cfg["eval_per_steps"] > 0 and STATUS_INFO.global_updates % train_cfg["eval_per_steps"] == 0:
+    elif train_cfg["eval_per_steps"] > 0 and STATUS_INFO.global_update_steps % train_cfg["eval_per_steps"] == 0:
         STATUS_INFO.curr_checkpoint_at = "batch"
         STATUS_INFO.curr_eval_split = "validation"
     else:
@@ -939,6 +944,7 @@ def init_proj_config():
 
     parser.add_argument("--output_name", type=str)
     parser.add_argument("--jobid", type=int)
+    parser.add_argument("--resume_from_checkpoint", action="store_true")
 
     args = parser.parse_args()
 
@@ -953,6 +959,7 @@ def init_proj_config():
     if args.from_bash:
         CONFIG["output_name"] = args.output_name
         CONFIG["jobid"] = args.jobid
+        CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
     else:
         CONFIG["jobid"] = "00000"
 
@@ -960,11 +967,11 @@ def init_proj_config():
     output_dirs["result"] = os.path.join(output_dirs["result"], CONFIG["output_name"])
     output_dirs["model"] = os.path.join(output_dirs["model"], CONFIG["output_name"])
     output_dirs["checkpoint"] = os.path.join(output_dirs["checkpoint"], CONFIG["output_name"])
-    output_dirs["log"] = os.path.join(output_dirs["log"], CONFIG["output_name"])
+    # output_dirs["log"] = os.path.join(output_dirs["log"], CONFIG["output_name"])
     os.makedirs(output_dirs["result"], exist_ok=True)
     os.makedirs(output_dirs["model"], exist_ok=True)
     os.makedirs(output_dirs["checkpoint"], exist_ok=True)
-    os.makedirs(output_dirs["log"], exist_ok=True)
+    # os.makedirs(output_dirs["log"], exist_ok=True)
 
     for key in CONFIG["train"]:
         if "lr" in key:

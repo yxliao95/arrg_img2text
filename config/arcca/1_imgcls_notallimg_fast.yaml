@@ -4,7 +4,7 @@ output_dir:
   result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
   model: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models
   checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs/checkpoints
-  log: /scratch/c.c21051562/workspace/arrg_img2text/outputs/logs
+  # log: /scratch/c.c21051562/workspace/arrg_img2text/outputs/logs
 
 data_path:
   mimic: /scratch/c.c21051562/resources/datasets/mimic-cxr

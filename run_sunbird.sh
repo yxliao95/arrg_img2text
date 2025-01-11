@@ -3,9 +3,9 @@
 #SBATCH --job-name=1_imgcls_notallimg_fast_try1
 #SBATCH --account=scw2258
 
-# job stdout file. The '%J' to Slurm is replaced with the job number.
-#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/stdout/stdout_%J.log
-#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/stderr/stderr_%J.log
+# job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
+#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stdout/stdout_%J.log
+#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
 #SBATCH --partition=accel_ai_dev
@@ -33,8 +33,16 @@ nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/scrat
 echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
-export TORCH_DISTRIBUTED_DEBUG=INFO
-accelerate launch --multi_gpu --main_process_port 29555 /scratch/c.c21051562/workspace/arrg_img2text/1_cls_effu_notallimg_fast.py --from_bash --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/1_imgcls_notallimg_fast.yaml --output_name $SLURM_JOB_NAME --jobid $SLURM_JOB_ID
+# export TORCH_DISTRIBUTED_DEBUG=INFO
+accelerate launch \
+    --multi_gpu \
+    --main_process_port 29555 \
+    /scratch/c.c21051562/workspace/arrg_img2text/1_cls_effu_notallimg_fast.py \
+    --from_bash \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/1_imgcls_notallimg_fast.yaml \
+    --output_name $SLURM_JOB_NAME \
+    --jobid $SLURM_JOB_ID \
+    # --resume_from_checkpoint
 echo "Script finished."
 
 python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Done: $SLURM_JOB_NAME"
