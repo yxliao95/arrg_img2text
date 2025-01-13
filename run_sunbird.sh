@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=1_imgcls_notallimg_fast_try1
+#SBATCH --job-name=1_imgcls_notallimg_fast_try3
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name

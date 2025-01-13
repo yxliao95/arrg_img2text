@@ -629,20 +629,21 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
     if ACCELERATOR.sync_gradients:
         STATUS_INFO.global_update_steps += 1
 
-    # Log every iteration
-    MLFLOW_TRACKER.log(
-        {
-            "lr": lr,
-            "loss": loss,
-            "epoch": curr_epoch,
-            "global_update_steps": STATUS_INFO.global_update_steps,
-        },
-        step=STATUS_INFO.global_iters,
-    )
-
+    # Logging too often may slow down the process
     print_loss_per_n_steps = CONFIG["train"]["print_loss_per_n_steps"]
     if STATUS_INFO.global_update_steps == 1 or STATUS_INFO.global_update_steps % print_loss_per_n_steps == 0:
         avg_loss = STATUS_INFO.batch_loss / STATUS_INFO.batch_trained_examples
+        
+        MLFLOW_TRACKER.log(
+            {
+                "lr": lr,
+                "avg_loss": avg_loss,
+                "epoch": STATUS_INFO.curr_epoch,
+                "global_update_steps": STATUS_INFO.global_update_steps,
+            },
+            step=STATUS_INFO.global_iters,
+        )
+        
         LOGGER.info(
             "p=%s, Epoch=%d, iter=%d, steps=%d, loss=%.9f",
             ACCELERATOR.process_index,
