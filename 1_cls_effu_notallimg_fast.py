@@ -561,15 +561,15 @@ def train(model, train_dataloader, valid_dataloader):
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
 
-    # Prepare for multi GPUs. All prepared and registered objs will be checkpointed automatically
-    optimizer, scheduler = ACCELERATOR.prepare(optimizer, scheduler)
+    # 1. Prepare for multi GPUs. All prepared and registered objs will be checkpointed automatically
+    train_dataloader, valid_dataloader, optimizer, scheduler = ACCELERATOR.prepare(train_dataloader, valid_dataloader, optimizer, scheduler)
     STATUS_INFO = StatusInfo()
     ACCELERATOR.register_for_checkpointing(STATUS_INFO)
 
-    # check and resume checkpoint if needed
+    # 2. Check and resume checkpoint if needed
     epoch_resumed, iter_resumed = check_status_and_resume_checkpoint()
-
-    # Launch after resuming STATUS_INFO
+    
+    # 3. Launch after resuming STATUS_INFO
     MLFLOW_TRACKER = MLflowTracker.launch_tracker()
 
     LOGGER.info("****************************** Training ******************************")
@@ -595,11 +595,15 @@ def train(model, train_dataloader, valid_dataloader):
 
         start = time.time()
         for curr_iter, batch_inputs_dict in enumerate(active_dataloader, start=iter_resumed if curr_epoch == epoch_resumed else 0):
-            with ACCELERATOR.autocast(), ACCELERATOR.accumulate(model):
+            with ACCELERATOR.accumulate(model):
                 # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_update_steps=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
-
-                model.train()
-                logits, loss = model(input_dict=batch_inputs_dict, return_loss=True)
+                # Not necessarily need ACCELERATOR.autocast()
+                # Accelerate enables automatic mixed precision, so autocast() is only needed if there are other mixed precision operations besides those performed on loss by backward() which already handles the scaling.
+                with ACCELERATOR.autocast():
+                    model.train()
+                    logits, loss = model(input_dict=batch_inputs_dict, return_loss=True)
+                    test = torch.matmul(logits, logits.T)
+                    LOGGER.debug(test.dtype)
 
                 ACCELERATOR.backward(loss)
                 if train_cfg["clip_grad_norm"] > 0:
@@ -607,6 +611,8 @@ def train(model, train_dataloader, valid_dataloader):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+            
+                assert 1==0
 
                 log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["effusion_labels"].size(0), lr=scheduler.get_last_lr()[0])
 
@@ -905,6 +911,7 @@ def init_accelerator():
 
     LOGGER.info("Available cuda: %d", torch.cuda.device_count())
     LOGGER.info("Accelerator state: %s", ACCELERATOR.state)
+    LOGGER.info("Accelerator mixed_precision: %s", ACCELERATOR.mixed_precision)
     LOGGER.info("Accelerator process idx: %d, device: %s", ACCELERATOR.process_index, ACCELERATOR.device)
     LOGGER.info([i for i in CONFIG.items() if i[0][0] != "_"])
 
@@ -986,12 +993,12 @@ def init_proj_config():
 def main(img_dataset, text_dataset):
     model_base_cfg = CONFIG["model"]
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
+    
 
     # Get dataloader for training and testing
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
     train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=True)
-    train_dataloader, valid_dataloader, test_dataloader = ACCELERATOR.prepare(train_dataloader, valid_dataloader, test_dataloader)
 
     # Training
     model = init_model(model_name_or_path, model_base_cfg)
@@ -1006,7 +1013,7 @@ def main(img_dataset, text_dataset):
     # Testing
     model = load_model(CONFIG["output_dir"]["model"])
     model.to(DEVICE)
-    model = ACCELERATOR.prepare(model)
+    model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
 
     start = time.time()
     evaluate(model, test_dataloader)
@@ -1015,7 +1022,6 @@ def main(img_dataset, text_dataset):
 
 
 if __name__ == "__main__":
-
     init_proj_config()
     init_logger()
     init_accelerator()
@@ -1023,6 +1029,7 @@ if __name__ == "__main__":
     set_seed(CONFIG["train"]["seed"])
     img_dataset, text_dataset = load_datasets(data_paths=CONFIG["data_path"])
 
+    check_memory()
     start0 = time.time()
     main(img_dataset, text_dataset)
     end0 = time.time()

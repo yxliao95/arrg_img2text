@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=1_imgcls_notallimg_fast_try3
+#SBATCH --job-name=1_imgcls_notallimg_fast_000test
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
@@ -8,7 +8,7 @@
 #SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
-#SBATCH --partition=accel_ai
+#SBATCH --partition=gpu
 #SBATCH --gres=gpu:2
 ### SBATCH -t 0-00:00
 
@@ -33,8 +33,8 @@ nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/scrat
 echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
-# export TORCH_DISTRIBUTED_DEBUG=INFO
-accelerate launch \
+export TORCH_DISTRIBUTED_DEBUG=INFO
+accelerate launch\
     --multi_gpu \
     --main_process_port 29555 \
     /scratch/c.c21051562/workspace/arrg_img2text/1_cls_effu_notallimg_fast.py \
