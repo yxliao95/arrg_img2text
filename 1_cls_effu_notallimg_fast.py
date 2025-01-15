@@ -36,7 +36,6 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
-from transformers.modeling_outputs import BaseModelOutput
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -47,6 +46,7 @@ from transformers import (
     PreTrainedModel,
     get_linear_schedule_with_warmup,
 )
+from transformers.modeling_outputs import BaseModelOutput
 
 CONFIG = None
 LOGGER = None
@@ -85,7 +85,7 @@ class CustomCLIPVisionModel(CLIPVisionModel):
         super().__init__(config)
         # Unused parameters will cause errors when using Accelerate, need to be removed
         self.vision_model.post_layernorm = None
-        
+
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
@@ -94,7 +94,7 @@ class CustomCLIPVisionModel(CLIPVisionModel):
         interpolate_pos_encoding: bool = False,
         return_dict: Optional[bool] = True,
     ) -> Union[Tuple, BaseModelOutput]:
-        
+
         hidden_states = self.vision_model.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
         hidden_states = self.vision_model.pre_layrnorm(hidden_states)
 
@@ -106,12 +106,13 @@ class CustomCLIPVisionModel(CLIPVisionModel):
         )
 
         last_hidden_state = encoder_outputs[0]
-        
+
         return BaseModelOutput(
             last_hidden_state=last_hidden_state,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+
 
 class CustomModel(PreTrainedModel):
     config_class = CustomModelConfig
@@ -506,7 +507,7 @@ def evaluate(model, target_dataloader):
     # LOGGER.debug("p=%s, len=%s, data_ids: %s", ACCELERATOR.process_index, len(data_ids), data_ids)
     # LOGGER.debug("p=%s, len=%s, data_preds: %s", ACCELERATOR.process_index, len(data_preds), data_preds)
     # LOGGER.debug("p=%s, len=%s, data_golds: %s", ACCELERATOR.process_index, len(data_golds), data_golds)
-    
+
     key_map = {0: "present", 1: "absent", 2: "uncertain"}
     for gold, pred in zip(data_golds, data_preds):
         eval_results[key_map[gold]]["num_gold_label"] += 1
@@ -633,7 +634,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
     print_loss_per_n_steps = CONFIG["train"]["print_loss_per_n_steps"]
     if STATUS_INFO.global_update_steps == 1 or STATUS_INFO.global_update_steps % print_loss_per_n_steps == 0:
         avg_loss = STATUS_INFO.batch_loss / STATUS_INFO.batch_trained_examples
-        
+
         MLFLOW_TRACKER.log(
             {
                 "lr": lr,
@@ -643,7 +644,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
             },
             step=STATUS_INFO.global_iters,
         )
-        
+
         LOGGER.info(
             "p=%s, Epoch=%d, iter=%d, steps=%d, loss=%.9f",
             ACCELERATOR.process_index,
@@ -660,7 +661,7 @@ def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
     train_cfg = CONFIG["train"]
     # global_update_steps == 0 时，默认不评估
     do_eval = True if STATUS_INFO.global_update_steps > 0 else False
-        
+
     # eval at the end of each epoch
     if STATUS_INFO.curr_batch_iter + 1 == max_num_iters_per_epoch:
         STATUS_INFO.curr_checkpoint_at = "epoch"
@@ -676,6 +677,7 @@ def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
         check_memory()
         eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
         check_results_and_save_model(model, eval_result_dict)
+
 
 def final_test_process(model, test_dataloader):
     model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
@@ -984,11 +986,11 @@ def init_proj_config():
 def main(img_dataset, text_dataset):
     model_base_cfg = CONFIG["model"]
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
-    
+
     # Get dataloader for training and testing
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False)
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=True)
     train_dataloader, valid_dataloader, test_dataloader = ACCELERATOR.prepare(train_dataloader, valid_dataloader, test_dataloader)
 
     # Training
@@ -1005,7 +1007,7 @@ def main(img_dataset, text_dataset):
     model = load_model(CONFIG["output_dir"]["model"])
     model.to(DEVICE)
     model = ACCELERATOR.prepare(model)
-    
+
     start = time.time()
     evaluate(model, test_dataloader)
     end = time.time()
