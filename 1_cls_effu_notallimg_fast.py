@@ -602,8 +602,6 @@ def train(model, train_dataloader, valid_dataloader):
                 with ACCELERATOR.autocast():
                     model.train()
                     logits, loss = model(input_dict=batch_inputs_dict, return_loss=True)
-                    test = torch.matmul(logits, logits.T)
-                    LOGGER.debug(test.dtype)
 
                 ACCELERATOR.backward(loss)
                 if train_cfg["clip_grad_norm"] > 0:
