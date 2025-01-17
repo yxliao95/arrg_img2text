@@ -610,8 +610,6 @@ def train(model, train_dataloader, valid_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
             
-                assert 1==0
-
                 log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["effusion_labels"].size(0), lr=scheduler.get_last_lr()[0])
 
                 # eval and save
@@ -656,7 +654,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
             STATUS_INFO.curr_batch_iter,
             STATUS_INFO.global_update_steps,
             avg_loss,
-            main_process_only=False,
+            main_process_only=True,
         )
         STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
 
@@ -996,7 +994,8 @@ def main(img_dataset, text_dataset):
     # Get dataloader for training and testing
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=True)
+    # TODO use_debug_subset?
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False)
 
     # Training
     model = init_model(model_name_or_path, model_base_cfg)
@@ -1029,6 +1028,11 @@ if __name__ == "__main__":
 
     check_memory()
     start0 = time.time()
-    main(img_dataset, text_dataset)
+    
+    # TODO cProfile?
+    import cProfile
+    cProfile.run('main(img_dataset, text_dataset)', filename=os.path.join(CONFIG["output_dir"]["result"], "time_eval.txt"))
+    # main(img_dataset, text_dataset)
+    
     end0 = time.time()
     LOGGER.info("Total time: %s ", seconds_to_time_str(end0 - start0))

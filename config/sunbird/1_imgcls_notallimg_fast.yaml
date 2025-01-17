@@ -30,7 +30,7 @@ model:
 train:
   seed: 42
   batch_size: 16
-  num_epochs: 60
+  num_epochs: 1
   grad_accum_steps: 1
   warmup_proportion: 0.1
   weight_decay: 0.0
@@ -43,4 +43,4 @@ train:
   eval_per_steps: 0 # 550395 / 32 = 17199, 170801 / 64 = 2669
 
 eval:
-  batch_size: 64
+  batch_size: 16
