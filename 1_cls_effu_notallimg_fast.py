@@ -149,6 +149,7 @@ class CustomModel(PreTrainedModel):
         pooled_features = torch.mean(img_features, dim=[1, 2])
 
         logits = self.classifier(pooled_features)
+        LOGGER.debug(logits.dtype)
 
         if return_loss:
             labels = input_dict["effusion_labels"]
@@ -568,7 +569,7 @@ def train(model, train_dataloader, valid_dataloader):
 
     # 2. Check and resume checkpoint if needed
     epoch_resumed, iter_resumed = check_status_and_resume_checkpoint()
-    
+
     # 3. Launch after resuming STATUS_INFO
     MLFLOW_TRACKER = MLflowTracker.launch_tracker()
 
@@ -609,7 +610,7 @@ def train(model, train_dataloader, valid_dataloader):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            
+
                 log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["effusion_labels"].size(0), lr=scheduler.get_last_lr()[0])
 
                 # eval and save
@@ -847,8 +848,9 @@ def get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False
 
 def init_model(model_name_or_path, model_base_cfg):
     LOGGER.info("Initializing model of %s", model_name_or_path)
+    # torch.set_default_dtype(torch.bfloat16)
     config = AutoConfig.from_pretrained(model_name_or_path)
-    model_config = CustomModelConfig(vision_config=config.vision_config, base_config=model_base_cfg)
+    model_config = CustomModelConfig(vision_config=config.vision_config, base_config=model_base_cfg, torch_dtype=torch.bfloat16)
     model = CustomModel(config=model_config)
     return model
 
@@ -989,7 +991,6 @@ def init_proj_config():
 def main(img_dataset, text_dataset):
     model_base_cfg = CONFIG["model"]
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
-    
 
     # Get dataloader for training and testing
     processor = AutoProcessor.from_pretrained(model_name_or_path)
@@ -1028,11 +1029,12 @@ if __name__ == "__main__":
 
     check_memory()
     start0 = time.time()
-    
+
     # TODO cProfile?
     import cProfile
-    cProfile.run('main(img_dataset, text_dataset)', filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
+
+    cProfile.run("main(img_dataset, text_dataset)", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
     # main(img_dataset, text_dataset)
-    
+
     end0 = time.time()
     LOGGER.info("Total time: %s ", seconds_to_time_str(end0 - start0))

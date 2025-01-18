@@ -38,7 +38,7 @@ train:
   lr: 0.00001
   mlc_lr: 0.00001
   clip_grad_norm: 1.0
-  mixed_precision: fp16 # ‘no’,‘fp16’,‘bf16’. bf16 recommended for A100, fp16 for V100
+  mixed_precision: bf16 # ‘no’,‘fp16’,‘bf16’. bf16 for A100 and cpu, fp16 for V100
 
   print_loss_per_n_steps: 1
   eval_per_steps: 5
