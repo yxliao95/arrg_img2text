@@ -167,7 +167,7 @@ class ImageTextDataset(Dataset):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
         self.src_path = os.path.dirname(img_dataset.cache_files[0]["filename"]) if img_dataset.cache_files else ""
         self.src_dataset = final_dataset
-        self.samples = src_dataset.select_column(["doc_key", "selected_pixel_values", "effusion_label"])
+        self.samples = self.src_dataset.select_column(["doc_key", "selected_pixel_values", "effusion_label"])
         self.label_counter = Counter([tuple(i) for i in samples["effusion_label"]])
 
     def print_label_distribution(self):
@@ -765,19 +765,29 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
     filtered_dataset = concatenate_datasets([filtered_img_ds, filtered_text_ds], axis=1)
     LOGGER.debug("Concatenated image-text dataset (aligning image_ds to text_ds): \n%s", filtered_dataset)
 
-    def map_func(example):
-        # 添加 effusion label 作为分类标签: onehot
-        example["effusion_label"] = get_effusion_label(col_cxrgraph_ent=example["cxrgraph_ent"], col_radlex=example["radlex"])  # [present, absent, uncertain]
+    def map_func(examples):
+        # 添加 effusion label 作为分类标签: onehot: [present, absent, uncertain]
+        examples["effusion_label"] = [get_effusion_label(col_cxrgraph_ent=cxrgraph_ent, col_radlex=radlex) for cxrgraph_ent, radlex in zip(examples["cxrgraph_ent"], zip(examples["radlex"]))]
 
         # Select images and get the pixel values in advance
-        images = example["images"]
-        selected_images, selected_image_indices = select_images(images)
-        piexl_values = processor(images=selected_images, return_tensors="pt").pixel_values
-        example["selected_pixel_values"] = piexl_values
-        example["selected_image_indices"] = selected_image_indices
-        return example
+        selected_images_list = []
+        image_to_exampleIdx_map = []
+        for example_idx, images_per_example in enumerate(examples["images"]):
+            selected_images, selected_indices = select_images(images_per_example)
+            selected_images_list.extend(selected_images)
+            image_to_exampleIdx_map.extend([example_idx]*len(selected_images))
+        
+        # Use batched images to speed up processing
+        piexl_values_tensor = processor(images=selected_images_list, return_tensors="pt").pixel_values
+        num_examples = len(examples["images"])
+        piexl_values_list = [[] for _ in range(num_examples)]
+        for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
+            piexl_values_list[example_idx].append(piexl_values_tensor[image_idx])
+        
+        examples["selected_pixel_values"] = piexl_values_list
+        return examples
 
-    new_dataset = filtered_dataset.map(map_func)
+    new_dataset = filtered_dataset.map(map_func, batched=True)
     return new_dataset
 
 

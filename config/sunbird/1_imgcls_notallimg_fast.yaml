@@ -37,7 +37,7 @@ train:
   lr: 0.0001
   mlc_lr: 0.0001
   clip_grad_norm: 1.0
-  mixed_precision: no # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
+  mixed_precision: "no" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
   print_loss_per_n_steps: 100 # logging loss on .log file
   eval_per_steps: 0 # 550395 / 32 = 17199, 170801 / 64 = 2669
