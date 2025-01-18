@@ -149,7 +149,6 @@ class CustomModel(PreTrainedModel):
         pooled_features = torch.mean(img_features, dim=[1, 2])
 
         logits = self.classifier(pooled_features)
-        LOGGER.debug(logits.dtype)
 
         if return_loss:
             labels = input_dict["effusion_labels"]
@@ -850,7 +849,7 @@ def init_model(model_name_or_path, model_base_cfg):
     LOGGER.info("Initializing model of %s", model_name_or_path)
     # torch.set_default_dtype(torch.bfloat16)
     config = AutoConfig.from_pretrained(model_name_or_path)
-    model_config = CustomModelConfig(vision_config=config.vision_config, base_config=model_base_cfg, torch_dtype=torch.bfloat16)
+    model_config = CustomModelConfig(vision_config=config.vision_config, base_config=model_base_cfg)
     model = CustomModel(config=model_config)
     return model
 
