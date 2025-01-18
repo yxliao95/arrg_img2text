@@ -163,149 +163,12 @@ class CustomModel(PreTrainedModel):
 
 
 class ImageTextDataset(Dataset):
-    def __init__(self, img_dataset, text_dataset, processor):
+    def __init__(self, final_dataset):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
         self.src_path = os.path.dirname(img_dataset.cache_files[0]["filename"]) if img_dataset.cache_files else ""
-        self.processor = processor
-        self.samples = self._process_data(img_dataset, text_dataset)
-        self.label_counter = None
-
-    def _process_data(self, img_dataset, text_dataset):
-        # filtered_dataset = self._align_img_text(img_dataset, text_dataset)
-        new_ds = self._concat_img_to_text(img_dataset, text_dataset)
-        self.label_counter = Counter([tuple(i) for i in new_ds["effusion_label"]])
-        self.print_label_distribution()
-
-        def _process_img(batch_samples):
-            batch_samples["selected_pixel_values"] = []
-            batch_samples["selected_image_indices"] = []
-
-            for images in batch_samples["images"]:
-                # Each sample may have multiple images
-                # 根据相似度选择2张图片：如果小于等于2张图片，就直接使用；否则，选择最不相似的两张图片
-                selected_images = []
-                selected_image_indices = []
-                if len(images) <= 2:
-                    selected_images = images
-                    selected_image_indices = list(range(len(images)))  # [0] / [0, 1]
-                else:
-
-                    n = len(images)
-                    max_hash_distance = -1
-                    for i in range(0, n):
-                        for j in range(i + 1, n):
-                            # phash值越小，表示两张图片越相似，
-                            # 默认的 hash_size=8 会生成一个 8x8=64 位的哈希值（位字符串）。
-                            # 更大的 hash_size 会提取图像中更多的细节，因此更能区分复杂图像，但对噪声和微小变化的鲁棒性会降低。
-                            # 较小的 hash_size 更关注图像整体的结构和轮廓信息，因此对噪声或轻微变化更鲁棒，但可能忽略细节差异。
-                            # 可能出现不同的 images 的 hash_distance=0 的情况。
-                            hash_distance = abs(imagehash.phash(images[i]) - imagehash.phash(images[j]))
-                            if hash_distance > max_hash_distance:
-                                max_hash_distance = hash_distance
-                                selected_images = [images[i], images[j]]
-                                selected_image_indices = [i, j]
-
-                piexl_values = self.processor(images=selected_images, return_tensors="pt").pixel_values
-                batch_samples["selected_pixel_values"].append(piexl_values)
-                batch_samples["selected_image_indices"].append(selected_image_indices)
-
-            # 这里的key是表示列; value是iterable (list,tensor都行)，最外层的每个元素都会被视为一行
-            return batch_samples
-
-        # The transform function is applied on-the-fly on batches when hf_dataset.__getitem__ is called.
-        new_ds.set_transform(transform=_process_img)
-
-        return new_ds
-
-    def _concat_text_to_img(self, img_dataset, text_dataset):
-        rowId_img2text_map = {}
-        for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
-            data_split, img_id, section_name = doc_key.split("#")
-            rowId_img2text_map[int(img_id)] = int(textDs_row_idx)
-
-        # 因为要添加了额外的分量任务，所以text中没有的数据，在img中也要保留
-        textDs_column_names = text_dataset.column_names
-
-        def map_func(example):
-            # 将 text_ds 的数据拼接到 img_ds 的数据中
-            # 由于可能在测试时使用裁剪后的 img_ds 数据集，所以使用 img_id 列的值来作为 key
-            img_id = example["img_id"]
-            if img_id in rowId_img2text_map:
-                textDs_row_idx = rowId_img2text_map[img_id]
-                textDS_row = text_dataset[textDs_row_idx]
-            else:
-                textDS_row = {col: None for col in textDs_column_names}
-            example.update(textDS_row)
-
-            example["effusion_label"] = self._get_effusion_label(col_cxrgraph_ent=textDS_row["cxrgraph_ent"], col_radlex=textDS_row["radlex"])  # [present, absent, uncertain]
-            return example
-
-        new_dataset = img_dataset.map(map_func)
-
-        return new_dataset
-
-    def _concat_img_to_text(self, img_dataset, text_dataset):
-        ds_textRowId_imgId = []
-        for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
-            data_split, img_id, section_name = doc_key.split("#")
-            ds_textRowId_imgId.append((int(textDs_row_idx), int(img_id)))
-
-        # 按照 img_id 排序
-        sorted_ds_textRowId_imgId = sorted(ds_textRowId_imgId, key=lambda x: x[1])
-
-        # 如果传入的是裁剪后的 img_ds 数据集，那么 img_id 与 img_row_id 不一定是一一对应的
-        ds_imgId_imgRowId = {img_id: img_row_id for img_row_id, img_id in enumerate(img_dataset["img_id"])}
-
-        # 按照 img_id 的顺序，将 img_ds 的数据拼接到 text_ds 的数据中
-        filtered_img_ds = img_dataset.select([ds_imgId_imgRowId[img_id] for _, img_id in sorted_ds_textRowId_imgId if img_id in ds_imgId_imgRowId])
-        filtered_text_ds = text_dataset.select([text_row_id for text_row_id, _ in sorted_ds_textRowId_imgId])
-
-        filtered_dataset = concatenate_datasets([filtered_img_ds, filtered_text_ds], axis=1)
-
-        def map_func(example):
-            example["effusion_label"] = self._get_effusion_label(col_cxrgraph_ent=example["cxrgraph_ent"], col_radlex=example["radlex"])  # [present, absent, uncertain]
-            return example
-
-        new_dataset = filtered_dataset.map(map_func)
-
-        return new_dataset
-
-    # effusion 的分类任务标签 one-hot: [present, absent, uncertain]
-    def _get_effusion_label(self, col_cxrgraph_ent, col_radlex):
-        is_effusion_uncertain = False
-        if not col_cxrgraph_ent:
-            return [0, 1, 0]  # 默认为absent
-
-        for sent_ents, sent_radlexes in zip(col_cxrgraph_ent, col_radlex):
-            # 获取radlex中的effusion和pleural effusion
-            candidate_nodes = []
-            for radlex in sent_radlexes:
-                if any([rid == radlex["radlex_id"] for rid in ["http://radlex.org/RID/RID4872", "http://radlex.org/RID/RID38588", "http://radlex.org/RID/RID34539"]]):
-                    candidate_nodes.append(radlex)
-
-            # 如果ent的start和end，被candidate_radlex覆盖，就返回True
-            def has_matched_candidate(tok_start, tok_end):
-                for start, end in [radlex["tok_indices"] for radlex in candidate_nodes]:
-                    if tok_start >= start and tok_end <= end:
-                        return True
-                return False
-
-            # 通过radlex来选择cxrgraph的ent
-            # 如果没有与radlex匹配的ent，那么就默认没有effusion；
-            # 如果有匹配的ent：
-            # 1. 只要有一个 effusion ent 被预测为 Present，就视为有effusion
-            # 2. 对于plueral，其 type 为 Anatomy，不会对默认值产生影响 （默认没有 effusion）
-            for ent in sent_ents:
-                tok_start, tok_end = ent["tok_indices"]
-                if has_matched_candidate(tok_start, tok_end):
-                    if ent["ent_type"] == "Observation-Present":
-                        # 只要有一个 effusion ent 被预测为 present, 就直接返回 present
-                        return [1, 0, 0]
-                    elif ent["ent_type"] == "Observation-Uncertain":
-                        # 如果有一个 effusion ent 被预测为 Uncertain，且没有其他被预测为 present 的 effusion ent，就视为 Uncertain
-                        is_effusion_uncertain = True
-
-        return [0, 0, 1] if is_effusion_uncertain else [0, 1, 0]
+        self.src_dataset = final_dataset
+        self.samples = src_dataset.select_column(["doc_key", "selected_pixel_values", "effusion_label"])
+        self.label_counter = Counter([tuple(i) for i in samples["effusion_label"]])
 
     def print_label_distribution(self):
         key_map = {(1, 0, 0): "present", (0, 1, 0): "absent", (0, 0, 1): "uncertain"}
@@ -820,31 +683,6 @@ def set_seed(seed):
 #############################################
 
 
-def get_dataloaders(final_dataset, use_debug_subset=False):
-    train_cfg = CONFIG["train"]
-    eval_cfg = CONFIG["eval"]
-    # select是dataset caching 操作，主进程优先或许能快一点
-    with ACCELERATOR.main_process_first():
-        if use_debug_subset:
-            # train_dataset = ImageTextDataset(img_dataset["train"].select(range(550295, 550395)), text_dataset["train"], processor=processor)
-            # vaild_dataset = ImageTextDataset(img_dataset["validation"].select(range(14011, 14111)), text_dataset["validation"], processor=processor)
-            # test_dataset = ImageTextDataset(img_dataset["test"].select(range(3577, 3677)), text_dataset["test"], processor=processor)
-
-            train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"].select(range(170701, 170801)), processor=processor)
-            vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"].select(range(4253, 4353)), processor=processor)
-            test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"].select(range(2036, 2136)), processor=processor)
-        else:
-            train_dataset = ImageTextDataset(img_dataset["train"], text_dataset["train"], processor=processor)
-            vaild_dataset = ImageTextDataset(img_dataset["validation"], text_dataset["validation"], processor=processor)
-            test_dataset = ImageTextDataset(img_dataset["test"], text_dataset["test"], processor=processor)
-
-    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
-    valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
-    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
-
-    return train_dataloader, valid_dataloader, test_dataloader
-
-
 def get_effusion_label(col_cxrgraph_ent, col_radlex):
     is_effusion_uncertain = False
     if not col_cxrgraph_ent:
@@ -904,7 +742,7 @@ def select_images(images):
                     max_hash_distance = hash_distance
                     selected_images = [images[i], images[j]]
                     selected_image_indices = [i, j]
-    
+
     return selected_images, selected_image_indices
 
 
@@ -930,17 +768,42 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
     def map_func(example):
         # 添加 effusion label 作为分类标签: onehot
         example["effusion_label"] = get_effusion_label(col_cxrgraph_ent=example["cxrgraph_ent"], col_radlex=example["radlex"])  # [present, absent, uncertain]
-        
+
         # Select images and get the pixel values in advance
         images = example["images"]
         selected_images, selected_image_indices = select_images(images)
         piexl_values = processor(images=selected_images, return_tensors="pt").pixel_values
-        example["selected_pixel_values"].append(piexl_values)
-        example["selected_image_indices"].append(selected_image_indices)
+        example["selected_pixel_values"] = piexl_values
+        example["selected_image_indices"] = selected_image_indices
         return example
 
     new_dataset = filtered_dataset.map(map_func)
     return new_dataset
+
+
+def get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False):
+    train_cfg = CONFIG["train"]
+    eval_cfg = CONFIG["eval"]
+    # select是dataset caching 操作，主进程优先或许能快一点
+    with ACCELERATOR.main_process_first():
+        ds_dict = {}
+        for split in ["train", "validation", "test"]:
+            ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split])
+
+        if use_debug_subset:
+            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 100, len(ds_dict["train"]))))
+            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 100, len(ds_dict["validation"]))))
+            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 100, len(ds_dict["test"]))))
+        else:
+            train_dataset = ImageTextDataset(ds_dict["train"])
+            vaild_dataset = ImageTextDataset(ds_dict["validation"])
+            test_dataset = ImageTextDataset(ds_dict["test"])
+
+    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
+    valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
+    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
+
+    return train_dataloader, valid_dataloader, test_dataloader
 
 
 def load_datasets(data_paths):
@@ -973,11 +836,8 @@ def load_datasets(data_paths):
         ds_img = ds_img.rename_column("impression", "section_text")
     else:
         raise ValueError(f"Invalid target_section from {config_file_name}, expected 'findings' or 'impression'")
-    
-    final_dataset = pre_process_dataset(processor, img_dataset, text_dataset)
-    LOGGER.debug("Final preprocessed dataset: \n%s", filtered_dataset)
 
-    return final_dataset
+    return ds_img, ds_text
 
 
 def init_model(model_name_or_path, model_base_cfg):
@@ -1088,7 +948,7 @@ def init_proj_config():
 #############################################
 
 
-def main(final_dataset):
+def main(img_dataset, text_dataset):
     model_base_cfg = CONFIG["model"]
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
 
@@ -1096,7 +956,7 @@ def main(final_dataset):
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
     # TODO use_debug_subset?
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(final_dataset, use_debug_subset=False)
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False)
 
     # Training
     model = init_model(model_name_or_path, model_base_cfg)
@@ -1125,7 +985,7 @@ if __name__ == "__main__":
     init_accelerator()
     LOGGER.debug(CONFIG)
     set_seed(CONFIG["train"]["seed"])
-    final_dataset = load_datasets(data_paths=CONFIG["data_path"])
+    img_dataset, text_dataset = load_datasets(data_paths=CONFIG["data_path"])
 
     check_memory()
     start0 = time.time()
@@ -1133,8 +993,8 @@ if __name__ == "__main__":
     # TODO cProfile?
     import cProfile
 
-    cProfile.run("main(final_dataset)", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
-    # main(final_dataset)
+    cProfile.run("main(img_dataset, text_dataset)", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
+    # main(img_dataset, text_dataset)
 
     end0 = time.time()
     LOGGER.info("Total time: %s ", seconds_to_time_str(end0 - start0))
