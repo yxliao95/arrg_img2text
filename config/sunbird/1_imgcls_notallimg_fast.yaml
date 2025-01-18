@@ -30,7 +30,7 @@ model:
 train:
   seed: 42
   batch_size: 16
-  num_epochs: 1
+  num_epochs: 5
   grad_accum_steps: 1
   warmup_proportion: 0.1
   weight_decay: 0.0

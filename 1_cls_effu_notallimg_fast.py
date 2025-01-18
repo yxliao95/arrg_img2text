@@ -1031,7 +1031,7 @@ if __name__ == "__main__":
     
     # TODO cProfile?
     import cProfile
-    cProfile.run('main(img_dataset, text_dataset)', filename=os.path.join(CONFIG["output_dir"]["result"], "time_eval.txt"))
+    cProfile.run('main(img_dataset, text_dataset)', filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
     # main(img_dataset, text_dataset)
     
     end0 = time.time()
