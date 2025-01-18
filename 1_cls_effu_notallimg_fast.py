@@ -165,9 +165,9 @@ class CustomModel(PreTrainedModel):
 class ImageTextDataset(Dataset):
     def __init__(self, final_dataset):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
-        self.src_path = os.path.dirname(img_dataset.cache_files[0]["filename"]) if img_dataset.cache_files else ""
+        self.src_path = os.path.dirname(final_dataset.cache_files[0]["filename"]) if final_dataset.cache_files else ""
         self.src_dataset = final_dataset
-        self.samples = self.src_dataset.select_column(["doc_key", "selected_pixel_values", "effusion_label"])
+        self.samples = final_dataset.select_column(["doc_key", "selected_pixel_values", "effusion_label"])
         self.label_counter = Counter([tuple(i) for i in samples["effusion_label"]])
 
     def print_label_distribution(self):
@@ -775,15 +775,15 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
         for example_idx, images_per_example in enumerate(examples["images"]):
             selected_images, selected_indices = select_images(images_per_example)
             selected_images_list.extend(selected_images)
-            image_to_exampleIdx_map.extend([example_idx]*len(selected_images))
-        
+            image_to_exampleIdx_map.extend([example_idx] * len(selected_images))
+
         # Use batched images to speed up processing
         piexl_values_tensor = processor(images=selected_images_list, return_tensors="pt").pixel_values
         num_examples = len(examples["images"])
         piexl_values_list = [[] for _ in range(num_examples)]
         for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
             piexl_values_list[example_idx].append(piexl_values_tensor[image_idx])
-        
+
         examples["selected_pixel_values"] = piexl_values_list
         return examples
 
