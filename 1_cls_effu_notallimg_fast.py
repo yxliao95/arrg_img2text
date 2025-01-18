@@ -767,7 +767,7 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
 
     def map_func(examples):
         # 添加 effusion label 作为分类标签: onehot: [present, absent, uncertain]
-        examples["effusion_label"] = [get_effusion_label(col_cxrgraph_ent=cxrgraph_ent, col_radlex=radlex) for cxrgraph_ent, radlex in zip(examples["cxrgraph_ent"], zip(examples["radlex"]))]
+        examples["effusion_label"] = [get_effusion_label(col_cxrgraph_ent=cxrgraph_ent, col_radlex=radlex) for cxrgraph_ent, radlex in zip(examples["cxrgraph_ent"], examples["radlex"])]
 
         # Select images and get the pixel values in advance
         selected_images_list = []
@@ -787,7 +787,7 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
         examples["selected_pixel_values"] = piexl_values_list
         return examples
 
-    new_dataset = filtered_dataset.map(map_func, batched=True)
+    new_dataset = filtered_dataset.map(map_func, batched=True, batch_size=64, num_proc=8)
     return new_dataset
 
 
