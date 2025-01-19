@@ -45,8 +45,6 @@ accelerate launch\
     # --resume_from_checkpoint
 echo "Script finished."
 
-python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Done: $SLURM_JOB_NAME"
-
 # 查找所有运行中的 MLflow 进程
 pids=$(ps aux | grep '[m]lflow' | awk '{print $2}')
 echo "Killing MLflow server processes: $pids" 
@@ -58,7 +56,8 @@ else
     echo "Stopped process with PID: $pid"
   done
 fi
-  
+
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Done: $SLURM_JOB_NAME"
 
 # sbatch /scratch/c.c21051562/workspace/arrg_img2text/run_sunbird.sh
 # scontrol show job JOBID

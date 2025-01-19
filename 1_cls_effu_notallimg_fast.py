@@ -163,12 +163,12 @@ class CustomModel(PreTrainedModel):
 
 
 class ImageTextDataset(Dataset):
-    def __init__(self, final_dataset):
+    def __init__(self, hf_dataset):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
-        self.src_path = os.path.dirname(final_dataset.cache_files[0]["filename"]) if final_dataset.cache_files else ""
-        self.src_dataset = final_dataset
-        self.samples = final_dataset.select_column(["doc_key", "selected_pixel_values", "effusion_label"])
-        self.label_counter = Counter([tuple(i) for i in samples["effusion_label"]])
+        self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
+        self.src_dataset = hf_dataset
+        self.samples = hf_dataset.select_columns(["doc_key", "selected_pixel_values", "effusion_label"])
+        self.label_counter = Counter([tuple(i) for i in self.samples["effusion_label"]])
 
     def print_label_distribution(self):
         key_map = {(1, 0, 0): "present", (0, 1, 0): "absent", (0, 0, 1): "uncertain"}
@@ -192,18 +192,21 @@ def collate_fn(batch_data):
     image_indices_map = []  # e.g. [[0], [1], [2, 3], ...]
     img_count = 0
     for item_idx, batch_item in enumerate(batch_data):
-        num_images = batch_item["selected_pixel_values"].size(0)
+        assert len(batch_item["selected_pixel_values"]) <= 2
+        num_images = len(batch_item["selected_pixel_values"])
+        LOGGER.debug("len %s, ele[0] %s", len(batch_item["selected_pixel_values"]), batch_item["selected_pixel_values"][0].shape)
         pixel_values.extend(batch_item["selected_pixel_values"])
         image_indices_map.append(list(range(img_count, img_count + num_images)))
         img_count += num_images
 
+    LOGGER.debug("pixel_values len %s, ele[0]", len(pixel_values), pixel_values[0].shape)
     pixel_val_tensors = torch.stack(pixel_values)
 
-    effusion_labels = torch.tensor([i["effusion_label"] for i in batch_data])
+    effusion_labels = torch.tensor([i["effusion_label"] for i in batch_data], dtype=torch.float32, device=DEVICE)
 
     return {
         "pixel_values": pixel_val_tensors.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
-        "effusion_labels": effusion_labels.float().to(DEVICE),  # [bsz, 3]
+        "effusion_labels": effusion_labels,  # [bsz, 3]
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
         "data_id_list": [i["doc_key"] for i in batch_data],
     }
@@ -763,7 +766,7 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
     filtered_img_ds = img_dataset.select([ds_imgId_imgRowId[img_id] for _, img_id in sorted_ds_textRowId_imgId if img_id in ds_imgId_imgRowId])
     filtered_text_ds = text_dataset.select([text_row_id for text_row_id, _ in sorted_ds_textRowId_imgId])
     filtered_dataset = concatenate_datasets([filtered_img_ds, filtered_text_ds], axis=1)
-    LOGGER.debug("Concatenated image-text dataset (aligning image_ds to text_ds): \n%s", filtered_dataset)
+    LOGGER.debug("Concatenated image-text dataset dict (aligning image_ds to text_ds): \n%s", filtered_dataset)
 
     def map_func(examples):
         # 添加 effusion label 作为分类标签: onehot: [present, absent, uncertain]
@@ -787,19 +790,17 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
         examples["selected_pixel_values"] = piexl_values_list
         return examples
 
-    new_dataset = filtered_dataset.map(map_func, batched=True, batch_size=64, num_proc=8)
+    preprocess_cfg = CONFIG["preprocess"]
+    new_dataset = filtered_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])
+    LOGGER.debug("Preprocessed final dataset dict: \n%s", new_dataset)
     return new_dataset
 
 
-def get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False):
+def get_dataloaders(ds_dict, use_debug_subset=False):
     train_cfg = CONFIG["train"]
     eval_cfg = CONFIG["eval"]
     # select是dataset caching 操作，主进程优先或许能快一点
     with ACCELERATOR.main_process_first():
-        ds_dict = {}
-        for split in ["train", "validation", "test"]:
-            ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split])
-
         if use_debug_subset:
             train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 100, len(ds_dict["train"]))))
             vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 100, len(ds_dict["validation"]))))
@@ -816,8 +817,13 @@ def get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False
     return train_dataloader, valid_dataloader, test_dataloader
 
 
-def load_datasets(data_paths):
+def load_preprocessed_dataset(ds_path):
+    ds_final = load_from_disk(ds_path)
+    LOGGER.info("Loaded pre_processed dataset dict: \n%s", ds_final)
+    return ds_final
 
+
+def load_src_datasets(data_paths):
     dataset_interpret = load_from_disk(data_paths["interpret"])
     LOGGER.debug("%s loaded from interpret_cxr", [f"{split}:{len(ds)}" for split, ds in dataset_interpret.items()])
     dataset_mimic = load_from_disk(data_paths["mimic"])
@@ -860,7 +866,7 @@ def init_model(model_name_or_path, model_base_cfg):
 
 
 def init_accelerator():
-    global ACCELERATOR, DEVICE
+    global ACCELERATOR, DEVICE, LOGGER
 
     dataloader_cfg = DataLoaderConfiguration(use_seedable_sampler=True)
     # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
@@ -877,6 +883,7 @@ def init_accelerator():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
+    LOGGER = MultiProcessAdapter(LOGGER, {})
     LOGGER.info("Available cuda: %d", torch.cuda.device_count())
     LOGGER.info("Accelerator state: %s", ACCELERATOR.state)
     LOGGER.info("Accelerator mixed_precision: %s", ACCELERATOR.mixed_precision)
@@ -909,8 +916,6 @@ def init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO):
     LOGGER.setLevel(log_level)  # This logger's level
     LOGGER.root.setLevel(root_log_level)  # Other libraries' loggers will inherit this level
 
-    LOGGER = MultiProcessAdapter(LOGGER, {})
-
 
 def init_proj_config():
     global CONFIG
@@ -922,6 +927,7 @@ def init_proj_config():
     parser.add_argument("--output_name", type=str)
     parser.add_argument("--jobid", type=int)
     parser.add_argument("--resume_from_checkpoint", action="store_true")
+    parser.add_argument("--preprocess_dataset", action="store_true")
 
     args = parser.parse_args()
 
@@ -937,8 +943,10 @@ def init_proj_config():
         CONFIG["output_name"] = args.output_name
         CONFIG["jobid"] = args.jobid
         CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
+        CONFIG["preprocess_dataset"] = args.preprocess_dataset
     else:
         CONFIG["jobid"] = "00000"
+        CONFIG["preprocess_dataset"] = False
 
     output_dirs = CONFIG["output_dir"]
     output_dirs["result"] = os.path.join(output_dirs["result"], CONFIG["output_name"])
@@ -958,20 +966,22 @@ def init_proj_config():
 #############################################
 
 
-def main(img_dataset, text_dataset):
+def main():
     model_base_cfg = CONFIG["model"]
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
 
-    # Get dataloader for training and testing
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    init_accelerator()
+    set_seed(CONFIG["train"]["seed"])
 
     # TODO use_debug_subset?
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(img_dataset, text_dataset, processor, use_debug_subset=False)
+    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, use_debug_subset=False)
 
     # Training
     model = init_model(model_name_or_path, model_base_cfg)
     model.to(DEVICE)
     model = ACCELERATOR.prepare(model)
+    check_memory()
 
     start = time.time()
     train(model, train_dataloader, valid_dataloader)
@@ -989,22 +999,38 @@ def main(img_dataset, text_dataset):
     LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
 
 
+def preprocess_dataset():
+    img_dataset, text_dataset = load_src_datasets(data_paths=CONFIG["data_path"])
+
+    # Get dataloader for training and testing
+    model_base_cfg = CONFIG["model"]
+    model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
+
+    ds_dict = {}
+    for split in ["train", "validation", "test"]:
+        ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split])
+
+    pre_processed_dataset_dict = DatasetDict(ds_dict)
+    pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
+    LOGGER.info("Preprocessed dataset dict saved to: %s", CONFIG["preprocess"]["cache_path"])
+
+
 if __name__ == "__main__":
     init_proj_config()
     init_logger()
-    init_accelerator()
     LOGGER.debug(CONFIG)
-    set_seed(CONFIG["train"]["seed"])
-    img_dataset, text_dataset = load_datasets(data_paths=CONFIG["data_path"])
 
-    check_memory()
     start0 = time.time()
 
-    # TODO cProfile?
-    import cProfile
+    if CONFIG["preprocess_dataset"]:
+        preprocess_dataset()
+    else:
+        # TODO cProfile?
+        import cProfile
 
-    cProfile.run("main(img_dataset, text_dataset)", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
-    # main(img_dataset, text_dataset)
+        cProfile.run("main()", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
+        # main()
 
     end0 = time.time()
     LOGGER.info("Total time: %s ", seconds_to_time_str(end0 - start0))

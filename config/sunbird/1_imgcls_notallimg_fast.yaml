@@ -23,6 +23,12 @@ model_name_or_path:
 mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
 max_checkpoints_to_keep: 5
 
+preprocess:
+  cache_path: /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/clipbase_resize224_effu_align2text
+  batched: True
+  batch_size: 64
+  num_proc: 16
+
 model:
   vision_backbone: clip
   num_classes: 3
@@ -44,3 +50,4 @@ train:
 
 eval:
   batch_size: 16
+

@@ -5,3 +5,4 @@ nohup.log
 __pycache__
 venv
 mlruns
+dataset_cache
