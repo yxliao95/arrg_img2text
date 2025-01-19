@@ -24,6 +24,13 @@ max_checkpoints_to_keep: 3
 model_name_or_path:
   clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
 
+preprocess_dataset: False
+preprocess:
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_resize224_effu_align2text
+  batched: True
+  batch_size: 64
+  num_proc: 16
+
 model:
   vision_backbone: clip
   num_classes: 3

@@ -185,27 +185,27 @@ class ImageTextDataset(Dataset):
 
 def collate_fn(batch_data):
 
-    # 1. 图像数据，转换为tensor。对于数量大于2的图像，只取前两个
-    # TODO 通过相似度判断，选择最不相似的两个图像
-    example_img = batch_data[0]["selected_pixel_values"][0]  # torch.Size([3, 224, 224])
     pixel_values = []
     image_indices_map = []  # e.g. [[0], [1], [2, 3], ...]
     img_count = 0
     for item_idx, batch_item in enumerate(batch_data):
         assert len(batch_item["selected_pixel_values"]) <= 2
         num_images = len(batch_item["selected_pixel_values"])
-        LOGGER.debug("len %s, ele[0] %s", len(batch_item["selected_pixel_values"]), batch_item["selected_pixel_values"][0].shape)
         pixel_values.extend(batch_item["selected_pixel_values"])
         image_indices_map.append(list(range(img_count, img_count + num_images)))
         img_count += num_images
 
-    LOGGER.debug("pixel_values len %s, ele[0]", len(pixel_values), pixel_values[0].shape)
-    pixel_val_tensors = torch.stack(pixel_values)
+    # 我们在预处理阶段提前获取了图像的pixel values tensor，并保存在hf dataset中。
+    # 然而重新读取时，该tensor会被转换为list，因此需要重新转换为tensor
+    if type(batch_data[0]["selected_pixel_values"][0]) == torch.Tensor:
+        pixel_val_tensors = torch.stack(pixel_values).float().to(DEVICE)
+    elif type(batch_data[0]["selected_pixel_values"][0]) == list:
+        pixel_val_tensors = torch.tensor(pixel_values, dtype=torch.float32, device=DEVICE)
 
     effusion_labels = torch.tensor([i["effusion_label"] for i in batch_data], dtype=torch.float32, device=DEVICE)
 
     return {
-        "pixel_values": pixel_val_tensors.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
+        "pixel_values": pixel_val_tensors,  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "effusion_labels": effusion_labels,  # [bsz, 3]
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
         "data_id_list": [i["doc_key"] for i in batch_data],
@@ -791,7 +791,7 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
         return examples
 
     preprocess_cfg = CONFIG["preprocess"]
-    new_dataset = filtered_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])
+    new_dataset = filtered_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"])  # , num_proc=preprocess_cfg["num_proc"]
     LOGGER.debug("Preprocessed final dataset dict: \n%s", new_dataset)
     return new_dataset
 
@@ -802,9 +802,9 @@ def get_dataloaders(ds_dict, use_debug_subset=False):
     # select是dataset caching 操作，主进程优先或许能快一点
     with ACCELERATOR.main_process_first():
         if use_debug_subset:
-            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 100, len(ds_dict["train"]))))
-            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 100, len(ds_dict["validation"]))))
-            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 100, len(ds_dict["test"]))))
+            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))))
+            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))))
+            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))))
         else:
             train_dataset = ImageTextDataset(ds_dict["train"])
             vaild_dataset = ImageTextDataset(ds_dict["validation"])
@@ -946,7 +946,6 @@ def init_proj_config():
         CONFIG["preprocess_dataset"] = args.preprocess_dataset
     else:
         CONFIG["jobid"] = "00000"
-        CONFIG["preprocess_dataset"] = False
 
     output_dirs = CONFIG["output_dir"]
     output_dirs["result"] = os.path.join(output_dirs["result"], CONFIG["output_name"])
@@ -1009,7 +1008,7 @@ def preprocess_dataset():
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split])
+        ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split].select(range(len(text_dataset[split]) - 200, len(text_dataset[split]))))
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
     pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
