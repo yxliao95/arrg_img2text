@@ -25,7 +25,7 @@ max_checkpoints_to_keep: 5
 
 preprocess_dataset: False
 preprocess:
-  cache_path: /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/clipbase_resize224_effu_align2text
+  cache_path: /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/clipbase_effu_align2text_resize224_only
   batched: True
   batch_size: 64
   num_proc: 16

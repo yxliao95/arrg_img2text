@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=1_fast_000test_preprocess_data_gpu_fp16
+#SBATCH --job-name=1_fast_000test_preprocess_data_resize_gpu_fp16
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name

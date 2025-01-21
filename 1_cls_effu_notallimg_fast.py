@@ -685,12 +685,21 @@ def set_seed(seed):
 
 
 #############################################
+def convert_label_str_to_int(label_str, label_type):
+    label_map = {"onehot": {"present": [1, 0, 0], "absent": [0, 1, 0], "uncertain": [0, 0, 1]}, "regression": {"present": 1, "absent": 0, "uncertain": 0.5}}
+    return label_map[label_type][label_str]
 
 
-def get_effusion_label(col_cxrgraph_ent, col_radlex):
+def get_effusion_label(col_cxrgraph_ent, col_radlex, label_type="onehot"):
+    """
+    label_type:
+        onehot: [present, absent, uncertain]
+        regression: 1=present, 0.5=uncertain, 0=absent
+    """
+
     is_effusion_uncertain = False
     if not col_cxrgraph_ent:
-        return [0, 1, 0]  # 默认为absent
+        return convert_label_str_to_int("absent", label_type)  # 默认为absent
 
     for sent_ents, sent_radlexes in zip(col_cxrgraph_ent, col_radlex):
         # 获取radlex中的effusion和pleural effusion
@@ -716,12 +725,15 @@ def get_effusion_label(col_cxrgraph_ent, col_radlex):
             if has_matched_candidate(tok_start, tok_end):
                 if ent["ent_type"] == "Observation-Present":
                     # 只要有一个 effusion ent 被预测为 present, 就直接返回 present
-                    return [1, 0, 0]
+                    return convert_label_str_to_int("present", label_type)
                 elif ent["ent_type"] == "Observation-Uncertain":
                     # 如果有一个 effusion ent 被预测为 Uncertain，且没有其他被预测为 present 的 effusion ent，就视为 Uncertain
                     is_effusion_uncertain = True
 
-    return [0, 0, 1] if is_effusion_uncertain else [0, 1, 0]
+    if is_effusion_uncertain:
+        return convert_label_str_to_int("uncertain", label_type)
+    else:
+        return convert_label_str_to_int("absent", label_type)
 
 
 def select_images(images):
@@ -771,29 +783,26 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
 
     def map_func(examples):
         # 添加 effusion label 作为分类标签: onehot: [present, absent, uncertain]
-        examples["effusion_label"] = [get_effusion_label(col_cxrgraph_ent=cxrgraph_ent, col_radlex=radlex) for cxrgraph_ent, radlex in zip(examples["cxrgraph_ent"], examples["radlex"])]
+        examples["effusion_label_onehot"] = [get_effusion_label(col_cxrgraph_ent=cxrgraph_ent, col_radlex=radlex, label_type="regression") for cxrgraph_ent, radlex in zip(examples["cxrgraph_ent"], examples["radlex"])]
 
-        # Select images and get the pixel values in advance
+        # Select images
+        # 保存图像的piexl_values会占用极大硬盘空间，且极大的减慢模型训练时的数据读取速度。
+        # 因此预处理只进行resize
+        img_edge = processor.image_processor.size["shortest_edge"]
         selected_images_list = []
-        image_to_exampleIdx_map = []
+        selected_indices_list = []
         for example_idx, images_per_example in enumerate(examples["images"]):
             selected_images, selected_indices = select_images(images_per_example)
-            # 图像统一存入selected_images_list，并以image_to_exampleIdx_map来找到所属的study id。目的是使processor可以批量处理数据
-            selected_images_list.extend(selected_images)
-            image_to_exampleIdx_map.extend([example_idx] * len(selected_images))
+            # 更适合处理含有精细细节的图像（如 X-ray 图像）。 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
+            selected_images_list.append([img.resize((img_edge, img_edge), resample=Image.Resampling.LANCZOS) for img in selected_images])
+            selected_indices_list.append(selected_indices)
 
-        # Use batched images to speed up processing
-        piexl_values = processor(images=selected_images_list, return_tensors="np").pixel_values.tolist()
-        num_examples = len(examples["images"])
-        piexl_values_list = [[] for _ in range(num_examples)]
-        for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
-            piexl_values_list[example_idx].append(piexl_values[image_idx])
-
-        examples["selected_pixel_values"] = piexl_values_list
+        examples["images"] = selected_images_list
+        examples["selected_indices_list"] = selected_images_list
         return examples
 
     preprocess_cfg = CONFIG["preprocess"]
-    new_dataset = filtered_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"])  # , num_proc=preprocess_cfg["num_proc"]
+    new_dataset = filtered_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])  #
     LOGGER.debug("Preprocessed final dataset dict: \n%s", new_dataset)
     return new_dataset
 
@@ -1010,7 +1019,8 @@ def preprocess_dataset():
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split].select(range(len(text_dataset[split]) - 200, len(text_dataset[split]))))
+        ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split])
+        # .select(range(len(text_dataset[split]) - 200, len(text_dataset[split])))
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
     pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
