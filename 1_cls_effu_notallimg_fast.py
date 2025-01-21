@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 from transformers import (
     AutoConfig,
+    AutoImageProcessor,
     AutoProcessor,
     CLIPModel,
     CLIPProcessor,
@@ -166,7 +167,7 @@ class ImageTextDataset(Dataset):
     def __init__(self, hf_dataset):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
-        self.src_dataset = hf_dataset
+        # self.samples = hf_dataset
         self.samples = hf_dataset.select_columns(["doc_key", "selected_pixel_values", "effusion_label"])
         self.label_counter = Counter([tuple(i) for i in self.samples["effusion_label"]])
 
@@ -777,15 +778,16 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
         image_to_exampleIdx_map = []
         for example_idx, images_per_example in enumerate(examples["images"]):
             selected_images, selected_indices = select_images(images_per_example)
+            # 图像统一存入selected_images_list，并以image_to_exampleIdx_map来找到所属的study id。目的是使processor可以批量处理数据
             selected_images_list.extend(selected_images)
             image_to_exampleIdx_map.extend([example_idx] * len(selected_images))
 
         # Use batched images to speed up processing
-        piexl_values_tensor = processor(images=selected_images_list, return_tensors="pt").pixel_values
+        piexl_values = processor(images=selected_images_list, return_tensors="np").pixel_values.tolist()
         num_examples = len(examples["images"])
         piexl_values_list = [[] for _ in range(num_examples)]
         for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
-            piexl_values_list[example_idx].append(piexl_values_tensor[image_idx])
+            piexl_values_list[example_idx].append(piexl_values[image_idx])
 
         examples["selected_pixel_values"] = piexl_values_list
         return examples

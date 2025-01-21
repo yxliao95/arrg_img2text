@@ -1,18 +1,13 @@
 #!/bin/bash
 
-#SBATCH --job-name=1_fast_000test_preprocess_data
+#SBATCH --job-name=1_fast_000test_preprocess_data_gpu_fp16
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
 #SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stdout/stdout_%J.log
 #SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
-# Number of GPUs to allocate (don't forget to select a partition with GPUs)
 #SBATCH --partition=compute
-### SBATCH --gres=gpu:2
-### SBATCH -t 0-00:00
-
-# Number of CPU cores per task to allocate, (maximun of 8 cpus for 2 gpus)
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 

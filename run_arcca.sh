@@ -76,6 +76,7 @@ fi
 # tensorboard --logdir=/home/yuxiang/liao/workspace/arrg_img2text/outputs/logs --port=6006
 
 # ssh -L 6007:localhost:6006 -J c.c21051562@hawklogin.cf.ac.uk c.c21051562@ccs2111
-# cd /scratch/c.c21051562/workspace/arrg_img2text/outputs/
+# module load anaconda/2024.0
+# source activate
 # conda activate arrg_img2text
-# mlflow server --host 127.0.0.1 --port 6006
+# mlflow server --host 127.0.0.1 --port 6006 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns
