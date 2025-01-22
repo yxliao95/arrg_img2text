@@ -167,10 +167,10 @@ class ImageTextDataset(Dataset):
     def __init__(self, hf_dataset, processor):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
+        self.label_counter = Counter([i for i in hf_dataset["effusion_label"]])
+        self.print_label_distribution()
         self.processor = processor
         self.samples = self._set_image_transform_to(hf_dataset)
-        self.label_counter = Counter([tuple(i) for i in self.samples["effusion_label"]])
-        self.print_label_distribution()
 
     def _set_image_transform_to(self, hf_dataset):
         def _process_img(batch_examples):
@@ -183,7 +183,7 @@ class ImageTextDataset(Dataset):
 
             # Use batched images to speed up processing
             piexl_values_tensor = self.processor(images=selected_images_list, return_tensors="pt").pixel_values
-            num_examples = len(examples["images"])
+            num_examples = len(batch_examples["images"])
             piexl_values_list = [[] for _ in range(num_examples)]
             for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
                 piexl_values_list[example_idx].append(piexl_values_tensor[image_idx])
@@ -195,7 +195,7 @@ class ImageTextDataset(Dataset):
         return hf_dataset
 
     def print_label_distribution(self):
-        key_map = {(1, 0, 0): "present", (0, 1, 0): "absent", (0, 0, 1): "uncertain"}
+        key_map = {1.0: "present", 0.5: "uncertain", 0.0: "absent"}
         LOGGER.info("Effusion label distribution: %s", {key_map[k]: v for k, v in sorted(self.label_counter.items(), key=lambda x: x[0])})
         LOGGER.info("  of dataset: %s", self.src_path)
 
@@ -382,8 +382,8 @@ def evaluate(model, target_dataloader):
             # Model inference
             logits = model(input_dict=input_tensors_dict)
 
-            _, predicted_labels = logits.max(dim=-1)
-            _, gold_labels = input_tensors_dict["effusion_labels"].max(dim=-1)
+            predicted_labels = logits.squeeze()  # -> (bsz,)
+            gold_labels = input_tensors_dict["effusion_labels"]  # -> (bsz,)
             preds = predicted_labels.cpu().numpy()  # (8,)
             golds = gold_labels.cpu().numpy()
 
@@ -398,13 +398,16 @@ def evaluate(model, target_dataloader):
     # LOGGER.debug("p=%s, len=%s, data_preds: %s", ACCELERATOR.process_index, len(data_preds), data_preds)
     # LOGGER.debug("p=%s, len=%s, data_golds: %s", ACCELERATOR.process_index, len(data_golds), data_golds)
 
-    key_map = {0: "present", 1: "absent", 2: "uncertain"}
+    interval_idx_map = {0: "absent", 1: "uncertain", 2: "present"}
+    label_value_map = {0.0: "absent", 0.5: "uncertain", 1.0: "present"}
     for gold, pred in zip(data_golds, data_preds):
-        eval_results[key_map[gold]]["num_gold_label"] += 1
-        eval_results[key_map[pred]]["num_pred_label"] += 1
+        pred_label = interval_idx_map[find_interval(pred, thresholds=[0.33, 0.66])]
+        gold_label = label_value_map[gold]
+        eval_results[gold_label]["num_gold_label"] += 1
+        eval_results[pred_label]["num_pred_label"] += 1
 
-        if gold == pred:
-            eval_results[key_map[gold]]["num_correct_label"] += 1
+        if pred_label == gold_label:
+            eval_results[gold_label]["num_correct_label"] += 1
 
     # Evaluate the results
     task_f1 = {}
@@ -426,6 +429,16 @@ def evaluate(model, target_dataloader):
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
     check_memory()
     return task_f1
+
+
+# 用于存储每个值的区间
+def find_interval(value, thresholds):
+    # e.g. thresholds = [0.33, 0.66]
+    # value = 0.5, return 1; value = 0.8, return 2; value = 0.66, return 1
+    for i, t in enumerate(thresholds):
+        if value <= t:
+            return i  # 返回所在区间的索引
+    return len(thresholds)  # 如果大于所有阈值，返回最后一个区间
 
 
 def train(model, train_dataloader, valid_dataloader):
@@ -830,19 +843,19 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
     return new_dataset
 
 
-def get_dataloaders(ds_dict, use_debug_subset=False):
+def get_dataloaders(ds_dict, processor, use_debug_subset=False):
     train_cfg = CONFIG["train"]
     eval_cfg = CONFIG["eval"]
     # select是dataset caching 操作，主进程优先或许能快一点
     with ACCELERATOR.main_process_first():
         if use_debug_subset:
-            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))))
-            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))))
-            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))))
+            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), processor=processor)
+            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), processor=processor)
+            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), processor=processor)
         else:
-            train_dataset = ImageTextDataset(ds_dict["train"])
-            vaild_dataset = ImageTextDataset(ds_dict["validation"])
-            test_dataset = ImageTextDataset(ds_dict["test"])
+            train_dataset = ImageTextDataset(ds_dict["train"], processor=processor)
+            vaild_dataset = ImageTextDataset(ds_dict["validation"], processor=processor)
+            test_dataset = ImageTextDataset(ds_dict["test"], processor=processor)
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -1007,8 +1020,9 @@ def main():
     set_seed(CONFIG["train"]["seed"])
 
     # TODO use_debug_subset?
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, use_debug_subset=False)
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, processor=processor, use_debug_subset=CONFIG["use_debug_subset"])
 
     # Training
     model = init_model(model_name_or_path, model_base_cfg)

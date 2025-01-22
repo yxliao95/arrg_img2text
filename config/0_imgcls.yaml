@@ -24,6 +24,8 @@ max_checkpoints_to_keep: 3
 model_name_or_path:
   clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
 
+use_debug_subset: True
+
 preprocess_dataset: False
 preprocess:
   cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_resize224_only
@@ -33,11 +35,11 @@ preprocess:
 
 model:
   vision_backbone: clip
-  num_classes: 3
+  num_classes: 1
 
 train:
   seed: 42
-  batch_size: 8
+  batch_size:
   num_epochs: 10
   grad_accum_steps: 2
   warmup_proportion: 0.1
@@ -48,7 +50,7 @@ train:
   mixed_precision: bf16 # ‘no’,‘fp16’,‘bf16’. bf16 for A100 and cpu, fp16 for V100
 
   print_loss_per_n_steps: 1
-  eval_per_steps: 5
+  eval_per_steps: 2
 
 eval:
-  batch_size: 16
+  batch_size: 32
