@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=1_fast_000test_preprocess_data_resize_gpu_fp16
+#SBATCH --job-name=2_fast_regression_gpu_100epoch_sigmoid
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
@@ -37,9 +37,9 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 accelerate launch\
     --multi_gpu \
     --main_process_port 29555 \
-    /scratch/c.c21051562/workspace/arrg_img2text/1_cls_effu_notallimg_fast.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/2_cls_effu_notallimg_fast_regression.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/1_imgcls_notallimg_fast.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/2_imgcls_notallimg_fast_regression.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     # --resume_from_checkpoint
@@ -74,7 +74,6 @@ python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbi
 # ssh -L 6007:localhost:6006 -J c.c21051562@sunbird.swansea.ac.uk c.c21051562@ccs2111
 
 # ssh -L 6007:localhost:6006 c.c21051562@sunbird.swansea.ac.uk
-# cd /scratch/c.c21051562/workspace/arrg_img2text/outputs/
 # conda activate arrg_img2text
-# mlflow server --host 127.0.0.1 --port 6006
+# mlflow server --host 127.0.0.1 --port 6006 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns
 

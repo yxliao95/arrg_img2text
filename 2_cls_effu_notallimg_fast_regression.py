@@ -152,11 +152,11 @@ class CustomModel(PreTrainedModel):
         logits = self.classifier(pooled_features)
 
         if return_loss:
+            probs = torch.sigmoid(logits)
             labels = input_dict["effusion_labels"]
             num_labels = labels.size(-1)
             loss_fct = nn.MSELoss()
-            loss = loss_fct(logits.view(-1, num_labels), labels.view(-1, num_labels))
-
+            loss = loss_fct(probs.view(-1, num_labels), labels.view(-1, num_labels))
             return logits, loss
 
         else:
@@ -164,8 +164,9 @@ class CustomModel(PreTrainedModel):
 
 
 class ImageTextDataset(Dataset):
-    def __init__(self, hf_dataset, processor):
+    def __init__(self, hf_dataset, processor, split):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
+        self.split = split
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
         self.label_counter = Counter([i for i in hf_dataset["effusion_label"]])
         self.print_label_distribution()
@@ -347,7 +348,7 @@ class MLflowTracker:
         return mlf_tracker
 
 
-def evaluate(model, target_dataloader):
+def evaluate(model, target_dataloader, output_result=False):
     data_ids = []
     data_preds = []
     data_golds = []
@@ -382,7 +383,8 @@ def evaluate(model, target_dataloader):
             # Model inference
             logits = model(input_dict=input_tensors_dict)
 
-            predicted_labels = logits.squeeze()  # -> (bsz,)
+            probs = torch.sigmoid(logits)
+            predicted_labels = probs.squeeze()  # -> (bsz,)
             gold_labels = input_tensors_dict["effusion_labels"]  # -> (bsz,)
             preds = predicted_labels.cpu().numpy()  # (8,)
             golds = gold_labels.cpu().numpy()
@@ -397,6 +399,9 @@ def evaluate(model, target_dataloader):
     # LOGGER.debug("p=%s, len=%s, data_ids: %s", ACCELERATOR.process_index, len(data_ids), data_ids)
     # LOGGER.debug("p=%s, len=%s, data_preds: %s", ACCELERATOR.process_index, len(data_preds), data_preds)
     # LOGGER.debug("p=%s, len=%s, data_golds: %s", ACCELERATOR.process_index, len(data_golds), data_golds)
+    if output_result:
+        with open(f"{CONFIG['output_dir']['result']}/{target_dataloader.dataset.split}_{ACCELERATOR.process_index}.json", "w") as f:
+            f.write(json.dumps({"gold": [i.tolist() for i in data_golds], "pred": [i.tolist() for i in data_preds]}))
 
     interval_idx_map = {0: "absent", 1: "uncertain", 2: "present"}
     label_value_map = {0.0: "absent", 0.5: "uncertain", 1.0: "present"}
@@ -849,13 +854,13 @@ def get_dataloaders(ds_dict, processor, use_debug_subset=False):
     # select是dataset caching 操作，主进程优先或许能快一点
     with ACCELERATOR.main_process_first():
         if use_debug_subset:
-            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), processor=processor)
-            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), processor=processor)
-            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), processor=processor)
+            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), processor=processor, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), processor=processor, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), processor=processor, split="test")
         else:
-            train_dataset = ImageTextDataset(ds_dict["train"], processor=processor)
-            vaild_dataset = ImageTextDataset(ds_dict["validation"], processor=processor)
-            test_dataset = ImageTextDataset(ds_dict["test"], processor=processor)
+            train_dataset = ImageTextDataset(ds_dict["train"], processor=processor, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"], processor=processor, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"], processor=processor, split="test")
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -1024,26 +1029,28 @@ def main():
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
     train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, processor=processor, use_debug_subset=CONFIG["use_debug_subset"])
 
-    # Training
-    model = init_model(model_name_or_path, model_base_cfg)
-    model.to(DEVICE)
-    model = ACCELERATOR.prepare(model)
-    check_memory()
+    if CONFIG["do_train"]:
+        # Training
+        model = init_model(model_name_or_path, model_base_cfg)
+        model.to(DEVICE)
+        model = ACCELERATOR.prepare(model)
+        check_memory()
 
-    start = time.time()
-    train(model, train_dataloader, valid_dataloader)
-    end = time.time()
-    LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
+        start = time.time()
+        train(model, train_dataloader, valid_dataloader)
+        end = time.time()
+        LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
-    # Testing
-    model = load_model(CONFIG["output_dir"]["model"])
-    model.to(DEVICE)
-    model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
+    if CONFIG["do_test"]:
+        # Testing
+        model = load_model(CONFIG["output_dir"]["model"])
+        model.to(DEVICE)
+        model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
 
-    start = time.time()
-    evaluate(model, test_dataloader)
-    end = time.time()
-    LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
+        start = time.time()
+        evaluate(model, test_dataloader, output_result=True)
+        end = time.time()
+        LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
 
 
 def preprocess_dataset():
