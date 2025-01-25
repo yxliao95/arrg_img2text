@@ -1089,11 +1089,13 @@ def init_proj_config():
 def main():
     model_base_cfg = CONFIG["model"]
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
+    image_processor_name = model_base_cfg["vision_backbone"]
 
     init_accelerator()
     set_seed(CONFIG["train"]["seed"])
 
     # TODO use_debug_subset?
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
     img_processor = None
     if image_processor_name == "clip":
         img_processor = processor.image_processor
