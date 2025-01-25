@@ -228,7 +228,7 @@ class ImageTextDataset(Dataset):
                 image_to_exampleIdx_map.extend([example_idx] * len(seleted_images_per_example))
 
             # Use batched images to speed up processing
-            piexl_values_tensor = self.processor(images=selected_images_list, return_tensors="pt").pixel_values
+            piexl_values_tensor = self.processor(images=selected_images_list, return_tensors="pt", do_convert_rgb=True).pixel_values
             num_examples = len(batch_examples["images"])
             piexl_values_list = [[] for _ in range(num_examples)]
             for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
