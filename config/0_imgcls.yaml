@@ -24,8 +24,8 @@ model_name_or_path:
 # The image processor depends on the model.vision_backbone
 preprocess_dataset: True
 preprocess:
-  image_processor: swinv2
-  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/swinbase_resize256 #clipbase_resize224
+  image_processor: clip
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_rbg224 #clipbase_rbg224
   batched: True
   batch_size: 64
   num_proc: 16
@@ -39,7 +39,7 @@ do_test: True
 use_debug_subset: True
 
 model:
-  vision_backbone: swinv2
+  vision_backbone: clip
   num_classes: 1
 
 train:
