@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=2_fast_regression
+#SBATCH --job-name=2_fast_regression_clip
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
