@@ -14,27 +14,30 @@ data_path:
 
 target_section: findings
 
-# path to checkpoint or, bool;
-# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
-resume_from_checkpoint: False
-
 mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
 max_checkpoints_to_keep: 3
 
 model_name_or_path:
   clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
+  swin: /home/yuxiang/liao/resources/downloaded_models/swinv2-base-patch4-window8-256
 
-use_debug_subset: True
-
-preprocess_dataset: False
+preprocess_dataset: True
 preprocess:
-  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_resize224_only
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/swinbase_resize256
   batched: True
   batch_size: 64
   num_proc: 16
 
+# path to checkpoint or, bool;
+# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
+resume_from_checkpoint: False
+do_train: True
+# if do_test=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
+do_test: True
+use_debug_subset: False
+
 model:
-  vision_backbone: clip
+  vision_backbone: swin
   num_classes: 1
 
 train:

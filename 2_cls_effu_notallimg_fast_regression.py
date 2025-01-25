@@ -803,7 +803,7 @@ def select_images(images):
     return selected_images, selected_image_indices
 
 
-def pre_process_dataset(processor, img_dataset, text_dataset):
+def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w):
     # align image_ds to text_ds
     ds_textRowId_imgId = []
     for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
@@ -829,13 +829,12 @@ def pre_process_dataset(processor, img_dataset, text_dataset):
         # Select images
         # 保存图像的piexl_values会占用极大硬盘空间，且极大的减慢模型训练时的数据读取速度。
         # 因此预处理只进行resize
-        img_edge = processor.image_processor.size["shortest_edge"]
         selected_images_list = []
         selected_indices_list = []
         for example_idx, images_per_example in enumerate(examples["images"]):
             selected_images, selected_indices = select_images(images_per_example)
             # 更适合处理含有精细细节的图像（如 X-ray 图像）。 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
-            selected_images_list.append([img.resize((img_edge, img_edge), resample=Image.Resampling.LANCZOS) for img in selected_images])
+            selected_images_list.append([img.resize(resize_h_w, resample=Image.Resampling.LANCZOS) for img in selected_images])
             selected_indices_list.append(selected_indices)
 
         examples["images"] = selected_images_list
@@ -1061,9 +1060,17 @@ def preprocess_dataset():
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
+    if model_base_cfg["vision_backbone"] == "clip":
+        img_processor = processor.image_processor
+        img_edge = img_processor.size["shortest_edge"]
+        resize_h_w = (img_edge, img_edge)
+    elif model_base_cfg["vision_backbone"] == "swin":
+        img_processor = processor
+        resize_h_w = (img_processor.size["height"], img_processor.size["width"])
+
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = pre_process_dataset(processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split])
+        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], resize_h_w=resize_h_w)
         # .select(range(len(text_dataset[split]) - 200, len(text_dataset[split])))
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
