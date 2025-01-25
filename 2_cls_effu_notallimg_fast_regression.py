@@ -209,13 +209,13 @@ class CustomModel(PreTrainedModel):
 
 
 class ImageTextDataset(Dataset):
-    def __init__(self, hf_dataset, processor, split):
+    def __init__(self, hf_dataset, img_processor, split):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
         self.split = split
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
         self.label_counter = Counter([i for i in hf_dataset["effusion_label"]])
         self.print_label_distribution()
-        self.processor = processor
+        self.img_processor = img_processor
         self.samples = self._set_image_transform_to(hf_dataset)
 
     def _set_image_transform_to(self, hf_dataset):
@@ -228,7 +228,7 @@ class ImageTextDataset(Dataset):
                 image_to_exampleIdx_map.extend([example_idx] * len(seleted_images_per_example))
 
             # Use batched images to speed up processing
-            piexl_values_tensor = self.processor(images=selected_images_list, return_tensors="pt", do_convert_rgb=True).pixel_values
+            piexl_values_tensor = self.img_processor(images=selected_images_list, return_tensors="pt", do_convert_rgb=True).pixel_values
             num_examples = len(batch_examples["images"])
             piexl_values_list = [[] for _ in range(num_examples)]
             for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
@@ -885,8 +885,6 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, co
             selected_images, selected_indices = select_images(images_per_example)
             # 更适合处理含有精细细节的图像（如 X-ray 图像）。 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
             selected_images = [img.resize(resize_h_w, resample=Image.Resampling.LANCZOS) for img in selected_images]
-            if convert_to_rgb:
-                selected_images = [img.convert("RGB") for img in selected_images]
             selected_images_list.append(selected_images)
             selected_indices_list.append(selected_indices)
 
@@ -900,19 +898,19 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, co
     return new_dataset
 
 
-def get_dataloaders(ds_dict, processor, use_debug_subset=False):
+def get_dataloaders(ds_dict, img_processor, use_debug_subset=False):
     train_cfg = CONFIG["train"]
     eval_cfg = CONFIG["eval"]
     # select是dataset caching 操作，主进程优先或许能快一点
     with ACCELERATOR.main_process_first():
         if use_debug_subset:
-            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), processor=processor, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), processor=processor, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), processor=processor, split="test")
+            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), img_processor=img_processor, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), img_processor=img_processor, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), img_processor=img_processor, split="test")
         else:
-            train_dataset = ImageTextDataset(ds_dict["train"], processor=processor, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"], processor=processor, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"], processor=processor, split="test")
+            train_dataset = ImageTextDataset(ds_dict["train"], img_processor=img_processor, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"], img_processor=img_processor, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"], img_processor=img_processor, split="test")
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -1096,9 +1094,14 @@ def main():
     set_seed(CONFIG["train"]["seed"])
 
     # TODO use_debug_subset?
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    img_processor = None
+    if image_processor_name == "clip":
+        img_processor = processor.image_processor
+    elif image_processor_name == "swinv2":
+        img_processor = processor
+
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, processor=processor, use_debug_subset=CONFIG["use_debug_subset"])
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, img_processor=img_processor, use_debug_subset=CONFIG["use_debug_subset"])
 
     if CONFIG["do_train"]:
         # Training
