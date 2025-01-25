@@ -955,7 +955,7 @@ def load_src_datasets(data_paths):
         ds_img = ds_img.remove_columns("findings")
         ds_img = ds_img.rename_column("impression", "section_text")
     else:
-        raise ValueError(f"Invalid target_section from {config_file_name}, expected 'findings' or 'impression'")
+        raise ValueError(f"Invalid target_section {CONFIG['target_section']}, expected 'findings' or 'impression'")
 
     return ds_img, ds_text
 
