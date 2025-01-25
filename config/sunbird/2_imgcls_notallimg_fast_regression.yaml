@@ -24,7 +24,7 @@ max_checkpoints_to_keep: 3
 preprocess_dataset: False
 preprocess:
   image_processor: clip
-  cache_path: /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/clip_base_resize224
+  cache_path: /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/swinv2_base_resize256
   batched: True
   batch_size: 64
   num_proc: 16
@@ -36,14 +36,15 @@ do_train: True
 # if do_test=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 do_test: True
 use_debug_subset: False
+
 model:
-  vision_backbone: swinv2
+  vision_backbone: clip
   num_classes: 1
 
 train:
   seed: 42
   batch_size: 64
-  num_epochs: 100
+  num_epochs: 2
   grad_accum_steps: 1
   warmup_proportion: 0.1
   weight_decay: 0.0

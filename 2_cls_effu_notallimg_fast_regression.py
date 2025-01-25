@@ -497,11 +497,12 @@ def train(model, train_dataloader, valid_dataloader):
     train_cfg = CONFIG["train"]
 
     # hyperparameters
-    model_params = list(ACCELERATOR.unwrap_model(model).named_parameters())
-    if model.config.base_config["vision_backbone"] == "clip":
+    unwrapped_model = get_unwrapped_model(model)
+    model_params = list(unwrapped_model.named_parameters())
+    if unwrapped_model.config.base_config["vision_backbone"] == "clip":
         assert model_params[0][0].startswith("vision_encoder")  # check the layer name
         assert model_params[197][0].startswith("classifier")
-    elif model.config.base_config["vision_backbone"] == "swinv2":
+    elif unwrapped_model.config.base_config["vision_backbone"] == "swinv2":
         assert model_params[0][0].startswith("vision_encoder")
         assert model_params[472][0].startswith("classifier")
 
@@ -689,13 +690,12 @@ def check_status_and_resume_checkpoint():
 #############################################
 
 
-def get_model_accessor(model):
+def get_unwrapped_model(model):
     """使用Accelerator后，model 会作为 DistributedDataParallel 的一个attribute（名为module的变量）"""
     if isinstance(model, DistributedDataParallel):
-        model_accessor = model.module
+        return ACCELERATOR.unwrap_model(model)
     else:
-        model_accessor = model
-    return model_accessor
+        return model
 
 
 def check_memory():
@@ -970,7 +970,8 @@ def init_model(model_name_or_path, model_base_cfg):
         from transformers import Swinv2Config
 
     if model_base_cfg["vision_backbone"] == "clip":
-        vision_config = CLIPVisionConfig(**config.vision_config)
+        assert isinstance(config.vision_config, CLIPVisionConfig)
+        vision_config = config.vision_config
     elif model_base_cfg["vision_backbone"] == "swinv2":
         assert isinstance(config, Swinv2Config)
         vision_config = config
