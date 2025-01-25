@@ -1044,7 +1044,10 @@ def init_proj_config():
     parser.add_argument("--output_name", type=str)
     parser.add_argument("--jobid", type=int)
     parser.add_argument("--resume_from_checkpoint", action="store_true")
+
     parser.add_argument("--preprocess_dataset", action="store_true")
+    parser.add_argument("--image_processor", type=str, default=None)
+    parser.add_argument("--cache_path", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -1061,6 +1064,9 @@ def init_proj_config():
         CONFIG["jobid"] = args.jobid
         CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
         CONFIG["preprocess_dataset"] = args.preprocess_dataset
+        if args.preprocess_dataset:
+            CONFIG["preprocess"]["image_processor"] = args.image_processor
+            CONFIG["preprocess"]["cache_path"] = args.cache_path
     else:
         CONFIG["jobid"] = "00000"
 
