@@ -40,14 +40,13 @@ from transformers import (
     AutoConfig,
     AutoImageProcessor,
     AutoProcessor,
-    CLIPModel,
-    CLIPProcessor,
     CLIPVisionModel,
     PretrainedConfig,
     PreTrainedModel,
+    Swinv2Model,
     get_linear_schedule_with_warmup,
 )
-from transformers.modeling_outputs import BaseModelOutput
+from transformers.modeling_outputs import ModelOutput
 
 CONFIG = None
 LOGGER = None
@@ -69,16 +68,17 @@ class CustomModelConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.base_config = base_config
-
-        # 当从检查点恢复模型时，需要主动选择 PretrainedConfig 的实现类
-        if vision_config and not isinstance(vision_config, PretrainedConfig):
-            if self.base_config["vision_backbone"] == "clip":
-                from transformers import CLIPVisionConfig
-
-                vision_config = CLIPVisionConfig(**vision_config)
-
         self.vision_config = vision_config
         self.num_labels = self.base_config["num_classes"] if self.base_config else 2
+
+
+@dataclass
+class CustomModelOutput(ModelOutput):
+    last_hidden_state: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    reshaped_hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    pooler_output: Optional[Tuple[torch.FloatTensor, ...]] = None
 
 
 class CustomCLIPVisionModel(CLIPVisionModel):
@@ -94,7 +94,7 @@ class CustomCLIPVisionModel(CLIPVisionModel):
         output_hidden_states: Optional[bool] = True,
         interpolate_pos_encoding: bool = False,
         return_dict: Optional[bool] = True,
-    ) -> Union[Tuple, BaseModelOutput]:
+    ) -> Union[Tuple, CustomModelOutput]:
 
         hidden_states = self.vision_model.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
         hidden_states = self.vision_model.pre_layrnorm(hidden_states)
@@ -108,10 +108,51 @@ class CustomCLIPVisionModel(CLIPVisionModel):
 
         last_hidden_state = encoder_outputs[0]
 
-        return BaseModelOutput(
+        return CustomModelOutput(
             last_hidden_state=last_hidden_state,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
+        )
+
+
+class CustomSwinv2VisionModel(Swinv2Model):
+    def __init__(self, config):
+        super().__init__(config)
+        # Unused parameters will cause errors when using Accelerate, need to be removed
+        self.pooler = None
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        bool_masked_pos: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = True,
+        output_hidden_states: Optional[bool] = True,
+        interpolate_pos_encoding: bool = False,
+        return_dict: Optional[bool] = True,
+    ) -> Union[Tuple, CustomModelOutput]:
+
+        head_mask = self.get_head_mask(head_mask, len(self.config.depths))
+        embedding_output, input_dimensions = self.embeddings(pixel_values, bool_masked_pos=bool_masked_pos, interpolate_pos_encoding=interpolate_pos_encoding)
+
+        encoder_outputs = self.encoder(
+            embedding_output,
+            input_dimensions,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = encoder_outputs[0]
+        sequence_output = self.layernorm(sequence_output)
+
+        return CustomModelOutput(
+            last_hidden_state=sequence_output,
+            pooler_output=None,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+            reshaped_hidden_states=encoder_outputs.reshaped_hidden_states,
         )
 
 
@@ -121,8 +162,12 @@ class CustomModel(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.vision_encoder = CustomCLIPVisionModel(config.vision_config)
-        self.classifier = torch.nn.Linear(self.config.vision_config.hidden_size, config.num_labels)
+        if self.config.base_config["vision_backbone"] == "clip":
+            self.vision_encoder = CustomCLIPVisionModel(self.config.vision_config)
+        elif self.config.base_config["vision_backbone"] == "swinv2":
+            self.vision_encoder = CustomSwinv2VisionModel(self.config.vision_config)
+
+        self.classifier = torch.nn.Linear(self.config.vision_config.hidden_size, self.config.num_labels)
 
     def reshape_img_features(self, last_hidden_state, image_indices_map):
         # image_indices_map 是一个嵌套list，每个样本对应一个list，list中的元素是图像在 last_hidden_state 中的索引
@@ -453,8 +498,13 @@ def train(model, train_dataloader, valid_dataloader):
 
     # hyperparameters
     model_params = list(ACCELERATOR.unwrap_model(model).named_parameters())
-    assert model_params[0][0].startswith("vision_encoder")  # check the layer name
-    assert model_params[197][0].startswith("classifier")
+    if model.config.base_config["vision_backbone"] == "clip":
+        assert model_params[0][0].startswith("vision_encoder")  # check the layer name
+        assert model_params[197][0].startswith("classifier")
+    elif model.config.base_config["vision_backbone"] == "swinv2":
+        assert model_params[0][0].startswith("vision_encoder")
+        assert model_params[472][0].startswith("classifier")
+
     vis_enc_params = [(n, p) for n, p in model_params if n.startswith("vision_encoder") and "post_layernorm" not in n]
     classifier_params = [(n, p) for n, p in model_params if n.startswith("classifier")]
 
@@ -803,7 +853,7 @@ def select_images(images):
     return selected_images, selected_image_indices
 
 
-def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w):
+def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, convert_to_rgb=True):
     # align image_ds to text_ds
     ds_textRowId_imgId = []
     for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
@@ -834,7 +884,10 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w):
         for example_idx, images_per_example in enumerate(examples["images"]):
             selected_images, selected_indices = select_images(images_per_example)
             # 更适合处理含有精细细节的图像（如 X-ray 图像）。 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
-            selected_images_list.append([img.resize(resize_h_w, resample=Image.Resampling.LANCZOS) for img in selected_images])
+            selected_images = [img.resize(resize_h_w, resample=Image.Resampling.LANCZOS) for img in selected_images]
+            if convert_to_rgb:
+                selected_images = [img.convert("RGB") for img in selected_images]
+            selected_images_list.append(selected_images)
             selected_indices_list.append(selected_indices)
 
         examples["images"] = selected_images_list
@@ -909,9 +962,21 @@ def load_src_datasets(data_paths):
 
 def init_model(model_name_or_path, model_base_cfg):
     LOGGER.info("Initializing model of %s", model_name_or_path)
-    # torch.set_default_dtype(torch.bfloat16)
     config = AutoConfig.from_pretrained(model_name_or_path)
-    model_config = CustomModelConfig(vision_config=config.vision_config, base_config=model_base_cfg)
+
+    if model_base_cfg["vision_backbone"] == "clip":
+        from transformers import CLIPVisionConfig
+    elif model_base_cfg["vision_backbone"] == "swinv2":
+        from transformers import Swinv2Config
+
+    if model_base_cfg["vision_backbone"] == "clip":
+        vision_config = CLIPVisionConfig(**config.vision_config)
+    elif model_base_cfg["vision_backbone"] == "swinv2":
+        assert isinstance(config, Swinv2Config)
+        vision_config = config
+
+    # torch.set_default_dtype(torch.bfloat16)
+    model_config = CustomModelConfig(vision_config=vision_config, base_config=model_base_cfg)
     model = CustomModel(config=model_config)
     return model
 
@@ -1056,21 +1121,20 @@ def preprocess_dataset():
     img_dataset, text_dataset = load_src_datasets(data_paths=CONFIG["data_path"])
 
     # Get dataloader for training and testing
-    model_base_cfg = CONFIG["model"]
-    model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
+    image_processor_name = CONFIG["preprocess"]["image_processor"]
+    model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    if model_base_cfg["vision_backbone"] == "clip":
+    if image_processor_name == "clip":
         img_processor = processor.image_processor
-        img_edge = img_processor.size["shortest_edge"]
-        resize_h_w = (img_edge, img_edge)
-    elif model_base_cfg["vision_backbone"] == "swin":
+        resize_h_w = (img_processor.size["shortest_edge"], img_processor.size["shortest_edge"])
+    elif image_processor_name == "swinv2":
         img_processor = processor
         resize_h_w = (img_processor.size["height"], img_processor.size["width"])
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], resize_h_w=resize_h_w)
+        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], resize_h_w=resize_h_w, convert_to_rgb=True)
         # .select(range(len(text_dataset[split]) - 200, len(text_dataset[split])))
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)

@@ -19,11 +19,13 @@ max_checkpoints_to_keep: 3
 
 model_name_or_path:
   clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
-  swin: /home/yuxiang/liao/resources/downloaded_models/swinv2-base-patch4-window8-256
+  swinv2: /home/yuxiang/liao/resources/downloaded_models/swinv2-base-patch4-window8-256
 
+# The image processor depends on the model.vision_backbone
 preprocess_dataset: True
 preprocess:
-  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/swinbase_resize256
+  image_processor: swinv2
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/swinbase_resize256 #clipbase_resize224
   batched: True
   batch_size: 64
   num_proc: 16
@@ -34,15 +36,15 @@ resume_from_checkpoint: False
 do_train: True
 # if do_test=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 do_test: True
-use_debug_subset: False
+use_debug_subset: True
 
 model:
-  vision_backbone: swin
+  vision_backbone: swinv2
   num_classes: 1
 
 train:
   seed: 42
-  batch_size:
+  batch_size: 8
   num_epochs: 10
   grad_accum_steps: 2
   warmup_proportion: 0.1
