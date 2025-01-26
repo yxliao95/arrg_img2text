@@ -209,13 +209,13 @@ class CustomModel(PreTrainedModel):
 
 
 class ImageTextDataset(Dataset):
-    def __init__(self, hf_dataset, processor, split):
+    def __init__(self, hf_dataset, img_processor, split):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
         self.split = split
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
         self.label_counter = Counter([i for i in hf_dataset["effusion_label"]])
         self.print_label_distribution()
-        self.processor = processor
+        self.img_processor = img_processor
         self.samples = self._set_image_transform_to(hf_dataset)
 
     def _set_image_transform_to(self, hf_dataset):
@@ -228,7 +228,7 @@ class ImageTextDataset(Dataset):
                 image_to_exampleIdx_map.extend([example_idx] * len(seleted_images_per_example))
 
             # Use batched images to speed up processing
-            piexl_values_tensor = self.processor(images=selected_images_list, return_tensors="pt").pixel_values
+            piexl_values_tensor = self.img_processor(images=selected_images_list, return_tensors="pt", do_convert_rgb=True).pixel_values
             num_examples = len(batch_examples["images"])
             piexl_values_list = [[] for _ in range(num_examples)]
             for image_idx, example_idx in enumerate(image_to_exampleIdx_map):
@@ -497,11 +497,12 @@ def train(model, train_dataloader, valid_dataloader):
     train_cfg = CONFIG["train"]
 
     # hyperparameters
-    model_params = list(ACCELERATOR.unwrap_model(model).named_parameters())
-    if model.config.base_config["vision_backbone"] == "clip":
+    unwrapped_model = get_unwrapped_model(model)
+    model_params = list(unwrapped_model.named_parameters())
+    if unwrapped_model.config.base_config["vision_backbone"] == "clip":
         assert model_params[0][0].startswith("vision_encoder")  # check the layer name
         assert model_params[197][0].startswith("classifier")
-    elif model.config.base_config["vision_backbone"] == "swinv2":
+    elif unwrapped_model.config.base_config["vision_backbone"] == "swinv2":
         assert model_params[0][0].startswith("vision_encoder")
         assert model_params[472][0].startswith("classifier")
 
@@ -689,13 +690,12 @@ def check_status_and_resume_checkpoint():
 #############################################
 
 
-def get_model_accessor(model):
+def get_unwrapped_model(model):
     """使用Accelerator后，model 会作为 DistributedDataParallel 的一个attribute（名为module的变量）"""
     if isinstance(model, DistributedDataParallel):
-        model_accessor = model.module
+        return ACCELERATOR.unwrap_model(model)
     else:
-        model_accessor = model
-    return model_accessor
+        return model
 
 
 def check_memory():
@@ -885,8 +885,6 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, co
             selected_images, selected_indices = select_images(images_per_example)
             # 更适合处理含有精细细节的图像（如 X-ray 图像）。 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
             selected_images = [img.resize(resize_h_w, resample=Image.Resampling.LANCZOS) for img in selected_images]
-            if convert_to_rgb:
-                selected_images = [img.convert("RGB") for img in selected_images]
             selected_images_list.append(selected_images)
             selected_indices_list.append(selected_indices)
 
@@ -900,19 +898,19 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, co
     return new_dataset
 
 
-def get_dataloaders(ds_dict, processor, use_debug_subset=False):
+def get_dataloaders(ds_dict, img_processor, use_debug_subset=False):
     train_cfg = CONFIG["train"]
     eval_cfg = CONFIG["eval"]
     # select是dataset caching 操作，主进程优先或许能快一点
     with ACCELERATOR.main_process_first():
         if use_debug_subset:
-            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), processor=processor, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), processor=processor, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), processor=processor, split="test")
+            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), img_processor=img_processor, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), img_processor=img_processor, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), img_processor=img_processor, split="test")
         else:
-            train_dataset = ImageTextDataset(ds_dict["train"], processor=processor, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"], processor=processor, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"], processor=processor, split="test")
+            train_dataset = ImageTextDataset(ds_dict["train"], img_processor=img_processor, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"], img_processor=img_processor, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"], img_processor=img_processor, split="test")
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -955,7 +953,7 @@ def load_src_datasets(data_paths):
         ds_img = ds_img.remove_columns("findings")
         ds_img = ds_img.rename_column("impression", "section_text")
     else:
-        raise ValueError(f"Invalid target_section from {config_file_name}, expected 'findings' or 'impression'")
+        raise ValueError(f"Invalid target_section {CONFIG['target_section']}, expected 'findings' or 'impression'")
 
     return ds_img, ds_text
 
@@ -970,7 +968,8 @@ def init_model(model_name_or_path, model_base_cfg):
         from transformers import Swinv2Config
 
     if model_base_cfg["vision_backbone"] == "clip":
-        vision_config = CLIPVisionConfig(**config.vision_config)
+        assert isinstance(config.vision_config, CLIPVisionConfig)
+        vision_config = config.vision_config
     elif model_base_cfg["vision_backbone"] == "swinv2":
         assert isinstance(config, Swinv2Config)
         vision_config = config
@@ -1043,7 +1042,10 @@ def init_proj_config():
     parser.add_argument("--output_name", type=str)
     parser.add_argument("--jobid", type=int)
     parser.add_argument("--resume_from_checkpoint", action="store_true")
+
     parser.add_argument("--preprocess_dataset", action="store_true")
+    parser.add_argument("--image_processor", type=str, default=None)
+    parser.add_argument("--cache_path", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -1060,6 +1062,9 @@ def init_proj_config():
         CONFIG["jobid"] = args.jobid
         CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
         CONFIG["preprocess_dataset"] = args.preprocess_dataset
+        if args.preprocess_dataset:
+            CONFIG["preprocess"]["image_processor"] = args.image_processor
+            CONFIG["preprocess"]["cache_path"] = args.cache_path
     else:
         CONFIG["jobid"] = "00000"
 
@@ -1084,14 +1089,21 @@ def init_proj_config():
 def main():
     model_base_cfg = CONFIG["model"]
     model_name_or_path = CONFIG["model_name_or_path"][model_base_cfg["vision_backbone"]]
+    image_processor_name = model_base_cfg["vision_backbone"]
 
     init_accelerator()
     set_seed(CONFIG["train"]["seed"])
 
     # TODO use_debug_subset?
     processor = AutoProcessor.from_pretrained(model_name_or_path)
+    img_processor = None
+    if image_processor_name == "clip":
+        img_processor = processor.image_processor
+    elif image_processor_name == "swinv2":
+        img_processor = processor
+
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, processor=processor, use_debug_subset=CONFIG["use_debug_subset"])
+    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, img_processor=img_processor, use_debug_subset=CONFIG["use_debug_subset"])
 
     if CONFIG["do_train"]:
         # Training

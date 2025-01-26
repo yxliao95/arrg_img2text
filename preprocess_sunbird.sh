@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=2_fast_regression_clip
+#SBATCH --job-name=2_fast_regression_preprocess
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
@@ -30,7 +30,19 @@ python /scratch/c.c21051562/workspace/arrg_img2text/2_cls_effu_notallimg_fast_re
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/2_imgcls_notallimg_fast_regression.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
-    --preprocess_dataset
+    --preprocess_dataset \
+    --image_processor swinv2 \
+    --cache_path /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/swinv2_base_resize256
+
+python /scratch/c.c21051562/workspace/arrg_img2text/2_cls_effu_notallimg_fast_regression.py \
+    --from_bash \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/2_imgcls_notallimg_fast_regression.yaml \
+    --output_name $SLURM_JOB_NAME \
+    --jobid $SLURM_JOB_ID \
+    --preprocess_dataset \
+    --image_processor clip \
+    --cache_path /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/clip_base_resize224
+
 echo "Script finished."
 
 
