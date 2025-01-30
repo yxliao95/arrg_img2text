@@ -11,7 +11,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 
-cuda=CUDA/12.4
+cuda=CUDA/11.7
 conda=anaconda/2024.06
 env=arrg_img2text
 
