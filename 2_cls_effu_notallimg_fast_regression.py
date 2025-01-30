@@ -1,8 +1,7 @@
 #############################################
-# 基于 0_img_cls_effusion_notallimg.py
+# 基于 1_cls_effu_notallimg_fast.py
 # 改进：
-# 使用A100时比V100慢，考虑动态调整图像数量时的遍历导致的性能问题，改用torch的批处理操作
-# 使用Accelerate；使用Mix-precision；改用MLFlow代替Tensorboard
+# 使用回归损失函数，不再使用分类损失函数，0.0, 0.5, 1.0 三个类别，分别表示absent、uncertain、present
 #############################################
 import argparse
 import datetime

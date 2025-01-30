@@ -1,8 +1,7 @@
 #############################################
-# 基于 0_img_cls_effusion_notallimg.py
+# 基于 2_cls_effu_notallimg_fast_regression.py
 # 改进：
-# 使用A100时比V100慢，考虑动态调整图像数量时的遍历导致的性能问题，改用torch的批处理操作
-# 使用Accelerate；使用Mix-precision；改用MLFlow代替Tensorboard
+# 使用权重计算loss，权重按照标签分布计算
 #############################################
 import argparse
 import datetime
@@ -40,9 +39,11 @@ from transformers import (
     AutoConfig,
     AutoImageProcessor,
     AutoProcessor,
+    CLIPVisionConfig,
     CLIPVisionModel,
     PretrainedConfig,
     PreTrainedModel,
+    Swinv2Config,
     Swinv2Model,
     get_linear_schedule_with_warmup,
 )
@@ -68,8 +69,15 @@ class CustomModelConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.base_config = base_config
-        self.vision_config = vision_config
         self.num_labels = self.base_config["num_classes"] if self.base_config else 2
+        self.vision_config = vision_config
+
+        # If loaded from checkpoint, the vision_config will be a dict and need to be converted to a PretrainedConfig object
+        if isinstance(vision_config, dict):
+            if base_config["vision_backbone"] == "clip":
+                self.vision_config = CLIPVisionConfig(**vision_config)
+            elif base_config["vision_backbone"] == "swinv2":
+                self.vision_config = Swinv2Config(**vision_config)
 
 
 @dataclass
@@ -117,6 +125,7 @@ class CustomCLIPVisionModel(CLIPVisionModel):
 
 class CustomSwinv2VisionModel(Swinv2Model):
     def __init__(self, config):
+
         super().__init__(config)
         # Unused parameters will cause errors when using Accelerate, need to be removed
         self.pooler = None
@@ -199,10 +208,16 @@ class CustomModel(PreTrainedModel):
         if return_loss:
             probs = torch.sigmoid(logits)
             labels = input_dict["effusion_labels"]
+            weights = input_dict["weights"]
             num_labels = labels.size(-1)
-            loss_fct = nn.MSELoss()
+
+            loss_fct = nn.MSELoss(reduction="none")
             loss = loss_fct(probs.view(-1, num_labels), labels.view(-1, num_labels))
-            return logits, loss
+
+            weighted_loss = loss * weights.view(-1, num_labels)
+            weighted_loss = weighted_loss.mean()
+
+            return logits, weighted_loss
 
         else:
             return logits
@@ -215,6 +230,7 @@ class ImageTextDataset(Dataset):
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
         self.label_counter = Counter([i for i in hf_dataset["effusion_label"]])
         self.print_label_distribution()
+        self.weights_dict = self.get_label_weights_by_label_distribution()
         self.img_processor = img_processor
         self.samples = self._set_image_transform_to(hf_dataset)
 
@@ -240,6 +256,15 @@ class ImageTextDataset(Dataset):
         hf_dataset.set_transform(transform=_process_img)
         return hf_dataset
 
+    def get_label_weights_by_label_distribution(self):
+        label_distribution_dict = {k: v for k, v in self.label_counter.items()}
+        labels = list(label_distribution_dict.keys())
+        label_counts = list(label_distribution_dict.values())
+        epsilon = 1e-6
+        weights = 1.0 / (np.array(label_counts, dtype=np.float16) + epsilon)
+        weights = weights / weights.sum()  # 归一化权重，使总和为 1
+        return {k: v for k, v in zip(labels, weights)}
+
     def print_label_distribution(self):
         key_map = {1.0: "present", 0.5: "uncertain", 0.0: "absent"}
         LOGGER.info("Effusion label distribution: %s", {key_map[k]: v for k, v in sorted(self.label_counter.items(), key=lambda x: x[0])})
@@ -253,7 +278,7 @@ class ImageTextDataset(Dataset):
         return self.samples[index]
 
 
-def collate_fn(batch_data):
+def collate_fn(batch_data, weights_dict=None):
 
     pixel_values = []
     image_indices_map = []  # e.g. [[0], [1], [2, 3], ...]
@@ -272,11 +297,17 @@ def collate_fn(batch_data):
     elif type(batch_data[0]["selected_pixel_values"][0]) == list:
         pixel_val_tensors = torch.tensor(pixel_values, dtype=torch.float32, device=DEVICE)
 
-    effusion_labels = torch.tensor([i["effusion_label"] for i in batch_data], dtype=torch.float32, device=DEVICE)
+    effu_label_list = [i["effusion_label"] for i in batch_data]
+    effusion_labels = torch.tensor(effu_label_list, dtype=torch.float32, device=DEVICE)
+
+    weights = None
+    if weights_dict:
+        weights = torch.tensor([weights_dict[i] for i in effu_label_list], dtype=torch.float32, device=DEVICE)
 
     return {
         "pixel_values": pixel_val_tensors,  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "effusion_labels": effusion_labels,  # tensor(bsz,)
+        "weights": weights,  # tensor(bsz,) only available in train set
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
         "data_id_list": [i["doc_key"] for i in batch_data],
     }
@@ -912,7 +943,7 @@ def get_dataloaders(ds_dict, img_processor, use_debug_subset=False):
             vaild_dataset = ImageTextDataset(ds_dict["validation"], img_processor=img_processor, split="validation")
             test_dataset = ImageTextDataset(ds_dict["test"], img_processor=img_processor, split="test")
 
-    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch), batch_size=train_cfg["batch_size"], drop_last=True)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, train_dataset.weights_dict), batch_size=train_cfg["batch_size"], drop_last=True)
     valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
     test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch), batch_size=eval_cfg["batch_size"], drop_last=False)
 
@@ -961,11 +992,6 @@ def load_src_datasets(data_paths):
 def init_model(model_name_or_path, model_base_cfg):
     LOGGER.info("Initializing model of %s", model_name_or_path)
     config = AutoConfig.from_pretrained(model_name_or_path)
-
-    if model_base_cfg["vision_backbone"] == "clip":
-        from transformers import CLIPVisionConfig
-    elif model_base_cfg["vision_backbone"] == "swinv2":
-        from transformers import Swinv2Config
 
     if model_base_cfg["vision_backbone"] == "clip":
         assert isinstance(config.vision_config, CLIPVisionConfig)

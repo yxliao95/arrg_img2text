@@ -39,7 +39,7 @@ do_test: True
 use_debug_subset: True
 
 model:
-  vision_backbone: swinv2
+  vision_backbone: clip
   num_classes: 1
 
 train:
