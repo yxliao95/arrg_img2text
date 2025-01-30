@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=1_imgcls_notallimg_fast_try2
+#SBATCH --job-name=3_cls_effu_regression_weighted_loss_v100_100epoch
 #SBATCH --account=scw1991
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
@@ -37,9 +37,9 @@ echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
 accelerate launch \
     --multi_gpu \
     --main_process_port 29555 \
-    /scratch/c.c21051562/workspace/arrg_img2text/1_cls_effu_notallimg_fast.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/3_cls_effu_regression_weighted_loss.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/arcca/1_imgcls_notallimg_fast.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/3_cls_fast_regression_weighted_loss.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     # --resume_from_checkpoint
