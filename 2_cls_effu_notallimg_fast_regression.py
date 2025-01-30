@@ -40,9 +40,11 @@ from transformers import (
     AutoConfig,
     AutoImageProcessor,
     AutoProcessor,
+    CLIPVisionConfig,
     CLIPVisionModel,
     PretrainedConfig,
     PreTrainedModel,
+    Swinv2Config,
     Swinv2Model,
     get_linear_schedule_with_warmup,
 )
@@ -68,8 +70,15 @@ class CustomModelConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.base_config = base_config
-        self.vision_config = vision_config
         self.num_labels = self.base_config["num_classes"] if self.base_config else 2
+        self.vision_config = vision_config
+
+        # If loaded from checkpoint, the vision_config will be a dict and need to be converted to a PretrainedConfig object
+        if isinstance(vision_config, dict):
+            if base_config["vision_backbone"] == "clip":
+                self.vision_config = CLIPVisionConfig(**vision_config)
+            elif base_config["vision_backbone"] == "swinv2":
+                self.vision_config = Swinv2Config(**vision_config)
 
 
 @dataclass
@@ -117,6 +126,7 @@ class CustomCLIPVisionModel(CLIPVisionModel):
 
 class CustomSwinv2VisionModel(Swinv2Model):
     def __init__(self, config):
+
         super().__init__(config)
         # Unused parameters will cause errors when using Accelerate, need to be removed
         self.pooler = None
@@ -961,11 +971,6 @@ def load_src_datasets(data_paths):
 def init_model(model_name_or_path, model_base_cfg):
     LOGGER.info("Initializing model of %s", model_name_or_path)
     config = AutoConfig.from_pretrained(model_name_or_path)
-
-    if model_base_cfg["vision_backbone"] == "clip":
-        from transformers import CLIPVisionConfig
-    elif model_base_cfg["vision_backbone"] == "swinv2":
-        from transformers import Swinv2Config
 
     if model_base_cfg["vision_backbone"] == "clip":
         assert isinstance(config.vision_config, CLIPVisionConfig)
