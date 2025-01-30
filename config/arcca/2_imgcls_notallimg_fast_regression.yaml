@@ -1,7 +1,4 @@
 output_name: 00_test
-# path to checkpoint or, bool;
-# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
-resume_from_checkpoint: False
 
 output_dir:
   result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
@@ -9,6 +6,8 @@ output_dir:
   checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs/checkpoints
   # log: /scratch/c.c21051562/workspace/arrg_img2text/outputs/logs
 
+# For preprocess, we will load data from data_path
+# For training, we will load dataset from preprocess.cache_path
 data_path:
   mimic: /scratch/c.c21051562/resources/datasets/mimic-cxr
   interpret: /scratch/c.c21051562/resources/datasets/interpret-cxr
@@ -19,10 +18,18 @@ target_section: findings
 
 model_name_or_path:
   clip: /scratch/c.c21051562/resources/downloaded_models/clip-vit-base-patch32
-  swin: /scratch/c.c21051562/resources/downloaded_models/swinv2-base-patch4-window8-256
+  swinv2: /scratch/c.c21051562/resources/downloaded_models/swinv2-base-patch4-window8-256
 
 mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
-max_checkpoints_to_keep: 5
+max_checkpoints_to_keep: 3
+
+preprocess_dataset: False
+preprocess:
+  image_processor: swinv2
+  cache_path: /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/swinv2_base_resize256
+  batched: True
+  batch_size: 64
+  num_proc: 16
 
 # path to checkpoint or, bool;
 # if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
@@ -32,16 +39,8 @@ do_train: True
 do_test: True
 use_debug_subset: False
 
-preprocess_dataset: True
-preprocess:
-  image_processor: swinv2
-  cache_path: /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/swinv2_base_resize256
-  batched: True
-  batch_size: 64
-  num_proc: 16
-
 model:
-  vision_backbone: clip
+  vision_backbone: swinv2
   num_classes: 1
 
 train:
