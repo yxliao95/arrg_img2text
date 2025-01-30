@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=2_fast_regression_gpu_2epoch_sigmoid_clip
+#SBATCH --job-name=2_fast_regression_a100_100epoch_sigmoid_swinv2
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
@@ -8,7 +8,7 @@
 #SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
-#SBATCH --partition=gpu
+#SBATCH --partition=accel_ai
 #SBATCH --gres=gpu:2
 ### SBATCH -t 0-00:00
 
@@ -42,7 +42,7 @@ accelerate launch\
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/2_imgcls_notallimg_fast_regression.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
-    # --resume_from_checkpoint
+    --resume_from_checkpoint
 echo "Script finished."
 
 # 查找所有运行中的 MLflow 进程

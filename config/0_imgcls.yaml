@@ -1,4 +1,4 @@
-output_name: imgcls_exp1
+output_name: test_000
 
 output_dir:
   result: /home/yuxiang/liao/workspace/arrg_img2text/outputs/results
@@ -24,7 +24,7 @@ model_name_or_path:
 # The image processor depends on the model.vision_backbone
 preprocess_dataset: False
 preprocess:
-  image_processor: clip
+  image_processor: swinv2
   cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/swinv2base_rbg256 #clipbase_rbg224
   batched: True
   batch_size: 64
