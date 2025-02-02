@@ -45,7 +45,7 @@ accelerate launch \
     # --resume_from_checkpoint
 echo "Script finished."
 
-python /scratch/c.c21051562/workspace/test_emal.py --from_bash --subject "ARCCA Done: $SLURM_JOB_NAME"
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "ARCCA Done: $SLURM_JOB_NAME"
 
 # 查找所有运行中的 MLflow 进程
 pids=$(ps aux | grep '[m]lflow' | awk '{print $2}')

@@ -208,16 +208,15 @@ class CustomModel(PreTrainedModel):
         if return_loss:
             probs = torch.sigmoid(logits)
             labels = input_dict["effusion_labels"]
-            weights = input_dict["weights"]
             num_labels = labels.size(-1)
-
-            loss_fct = nn.MSELoss(reduction="none")
+            loss_fct = nn.MSELoss()
             loss = loss_fct(probs.view(-1, num_labels), labels.view(-1, num_labels))
 
-            weighted_loss = loss * weights.view(-1, num_labels)
-            weighted_loss = weighted_loss.mean()
+            # weights = input_dict["weights"]
+            # weighted_loss = loss * weights.view(-1, num_labels)
+            # weighted_loss = weighted_loss.mean()
 
-            return logits, weighted_loss
+            return logits, loss
 
         else:
             return logits

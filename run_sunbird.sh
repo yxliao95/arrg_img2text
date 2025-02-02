@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=3_cls_effu_regression_weighted_loss_v100_100epoch
+#SBATCH --job-name=3_cls_mse_loss_rm_uncertain_v100_100epoch
 #SBATCH --account=scw2258
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
@@ -37,9 +37,9 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 accelerate launch\
     --multi_gpu \
     --main_process_port 29555 \
-    /scratch/c.c21051562/workspace/arrg_img2text/3_cls_effu_regression_weighted_loss.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/3_cls_mse_loss_rm_uncertain.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/3_cls_fast_regression_weighted_loss.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/3_cls_mse_loss_rm_uncertain.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     # --resume_from_checkpoint
