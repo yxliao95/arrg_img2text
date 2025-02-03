@@ -230,7 +230,7 @@ class ImageTextDataset(Dataset):
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
         self.label_counter = Counter([i for i in hf_dataset["effusion_label"]])
         self.print_label_distribution()
-        self.weights_dict = self.get_label_weights_by_label_distribution(a=1, b=10)
+        self.weights_dict = self.get_label_weights_by_label_distribution()
         self.img_processor = img_processor
         self.samples = self._set_image_transform_to(hf_dataset)
 
@@ -256,22 +256,22 @@ class ImageTextDataset(Dataset):
         hf_dataset.set_transform(transform=_process_img)
         return hf_dataset
 
-    def get_label_weights_by_label_distribution(self, a, b):
+    def get_label_weights_by_label_distribution(self):
         # 将权重的倒数映射到[a,b]区间
         label_distribution_dict = {k: v for k, v in self.label_counter.items()}
         labels = list(label_distribution_dict.keys())
-        label_counts = list(label_distribution_dict.values())
-        epsilon = 1e-6
-        weights = 1.0 / (np.array(label_counts, dtype=np.float16) + epsilon)
+        label_counts = np.array(list(label_distribution_dict.values()))
+        normalized_label_counts = label_counts / label_counts.max()
+        weights = 1.0 / normalized_label_counts
         # weights = weights / weights.sum()  # 归一化权重，使总和为 1
 
-        w_min = weights.min()
-        w_max = weights.max()
-        if w_max == w_min:
-            scaled_weights = np.full_like(weights, b, dtype=np.float32)
-        else:
-            # 线性映射到 [a, b] 区间
-            scaled_weights = a + (weights - w_min) * (b - a) / (w_max - w_min)
+        # w_min = weights.min()
+        # w_max = weights.max()
+        # if w_max == w_min:
+        #     scaled_weights = np.full_like(weights, b, dtype=np.float32)
+        # else:
+        #     # 线性映射到 [a, b] 区间
+        #     scaled_weights = a + (weights - w_min) * (b - a) / (w_max - w_min)
 
         return {k: v for k, v in zip(labels, weights)}
 
