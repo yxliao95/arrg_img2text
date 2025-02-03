@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=3_cls_effu_regression_weighted_loss_v100_100epoch
+#SBATCH --job-name=3_cls_effu_regression_weighted_1x10_loss_v100_100epoch
 #SBATCH --account=scw1991
 
 # job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
