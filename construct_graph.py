@@ -66,6 +66,31 @@ class Relation:
         return self.__repr__()
 
 
+class LinkedGraph:
+    def __init__(self, ents):
+        self.id = None
+        self.ents = sorted(ents, key=lambda x: x.tok_indices[0])
+        self.rels = []
+        self.sent_id = ents[0].sent_id
+
+        assert len(set([i.sent_id for i in ents])) == 1
+
+    def get_involved_rels(self, rel_list):
+        target_rels = []
+        in_used_ents = set()
+        for rel in rel_list:
+            if rel.subj_ent in self.ents and rel.obj_ent in self.ents:
+                target_rels.append(rel)
+                in_used_ents.update([rel.subj_ent, rel.obj_ent])
+        self.rels = target_rels
+
+    def __repr__(self) -> str:
+        return f"{[i.tok_str for i in self.ents]}"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
 class SentenceGraph:
     def __init__(self, ents):
         self.id = None
@@ -465,59 +490,48 @@ def flatten_list(nested_list):
     return flattened
 
 
+class SentenceRepresentation:
+    def __init__(self, doc_key, sent_id, sent_text):
+        self.doc_key = doc_key
+        self.sent_id = sent_id
+        self.sent_text = sent_text
+        self.ent_tuples = []
+        self.rel_tuples = []
+
+    def set_sent_repr(self, linked_graphs):
+        for linked_graph in linked_graphs:
+            for ent in linked_graph.ents:
+                self.ent_tuples.append((ent.tok_str, ent.label, ent.attr_normal, ent.attr_action, ent.attr_change))
+
+            for rel in linked_graph.rels:
+                self.rel_tuples.append((rel.subj_ent.tok_str, rel.label, rel.obj_ent.tok_str))
+
+    def __repr__(self) -> str:
+        return f"{self.sent_text}"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
 if __name__ == "__main__":
     ds_final = load_from_disk("/home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_rbg224")
+    sent_graph_repr = []
     for doc in tqdm(ds_final["test"]):
         for split_sent_idx, (cxrgraph_ent, cxrgraph_rel, cxrgraph_attr, radlex) in enumerate(zip(doc["cxrgraph_ent"], doc["cxrgraph_rel"], doc["cxrgraph_attr"], doc["radlex"])):
+
+            sent_repr = SentenceRepresentation(doc_key=doc["doc_key"], sent_id=split_sent_idx, sent_text=doc["split_sents"])
 
             # resolve ent and rel from json
             ent_list, rel_list = resolve_ent_rel(split_sent_idx, cxrgraph_ent, cxrgraph_rel, cxrgraph_attr, radlex)
 
-            sentence_graphs = []
+            linked_graphs = []
             visited_ents = set()
             for ent in ent_list:
                 if ent not in visited_ents:
                     sent_ents = []
                     search_linked_ents(ent, visited_ents, sent_ents)
-                    sentence_graphs.append(SentenceGraph(sent_ents))
+                    sent_graph = LinkedGraph(sent_ents)
+                    sent_graph.get_involved_rels(rel_list)
+                    linked_graphs.append(sent_graph)
 
-            # # 构建sent_graph；有 loc_at和sugg_of的是paired_group，没有的是unpaired_group
-            # sentence_graphs = resolve_sentence_graphs(ent_list, rel_list)
-
-            # sent_graph_repr = []
-            # involved_ents = []
-            # for sent_graph in sentence_graphs:
-            #     for group in sent_graph.paired_groups:
-            #         for subjs in group.expanded_subj_branches:
-            #             adjacent_modifiers_subj = [j for i in subjs for j in i.chain_info["modify"]["from"]]
-            #             subj_modifiers = sorted(find_modify_from_entities(adjacent_modifiers_subj, keys=[("modify", "from")], limited_types=[group.subj.label_type]), key=lambda x: x.tok_indices[0]) if adjacent_modifiers_subj else []
-
-            #             for objs in group.expanded_obj_branches:
-            #                 adjacent_modifiers_obj = [j for i in objs for j in i.chain_info["modify"]["from"]]
-            #                 obj_modifiers = sorted(find_modify_from_entities(adjacent_modifiers_obj, keys=[("modify", "from")], limited_types=[group.obj.label_type]), key=lambda x: x.tok_indices[0]) if adjacent_modifiers_obj else []
-
-            #                 unit = {
-            #                     "type": "paired_core",
-            #                     "subj": (subjs, group.subj.label),
-            #                     "subj_modifiers": subj_modifiers,
-            #                     "obj": (objs, group.obj.label),
-            #                     "obj_modifiers": obj_modifiers,
-            #                     "rel": group.rel,
-            #                     "loc_atts": group.loc_atts,
-            #                 }
-            #                 sent_graph_repr.append(unit)
-            #                 involved_ents.extend(flatten_list([subjs, subj_modifiers, objs, obj_modifiers, group.loc_atts]))
-
-            #     for group in sent_graph.unpaired_groups:
-            #         for singleton_branch in group.expanded_root_branches:
-            #             adjacent_modifiers = [j for i in singleton_branch for j in i.chain_info["modify"]["from"]]
-            #             unit = {
-            #                 "type": "single_core",
-            #                 "singleton": (singleton_branch, group.root.label),
-            #                 "modifier": sorted(find_modify_from_entities(adjacent_modifiers, keys=[("modify", "from")], limited_types=[group.root.label_type]), key=lambda x: x.tok_indices[0]) if adjacent_modifiers else [],
-            #             }
-            #             sent_graph_repr.append(unit)
-            #             involved_ents.extend(flatten_list([singleton_branch, unit["modifier"]]))
-
-            # assert len(set(involved_ents)) == len(ent_list)
-            # sent_graph_repr
+            sent_repr.set_sent_repr(linked_graphs)
