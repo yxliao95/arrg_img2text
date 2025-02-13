@@ -91,63 +91,24 @@ class LinkedGraph:
         return self.__repr__()
 
 
-class SentenceGraph:
-    def __init__(self, ents):
-        self.id = None
-        self.ents = sorted(ents, key=lambda x: x.tok_indices[0])
-        self.sent_id = ents[0].sent_id
-        self.paired_groups = []
-        self.unpaired_groups = []
+class SentenceRepresentation:
+    def __init__(self, doc_key, sent_id, sent_text):
+        self.doc_key = doc_key
+        self.sent_id = sent_id
+        self.sent_text = sent_text
+        self.ent_tuples = []
+        self.rel_tuples = []
 
-        assert len(set([i.sent_id for i in ents])) == 1
+    def set_sent_repr(self, linked_graphs):
+        for linked_graph in linked_graphs:
+            for ent in linked_graph.ents:
+                self.ent_tuples.append((ent.tok_str, ent.label, ent.attr_normal, ent.attr_action, ent.attr_change))
 
-    def __repr__(self) -> str:
-        return f"{[i.tok_str for i in self.ents]}"
-
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-class PairedGroup:
-    def __init__(self, subj, obj, rel, loc_atts=[]):
-        self.id = None
-        self.subj = subj
-        self.obj = obj
-        self.rel = rel
-        self.loc_atts = loc_atts
-
-        # 引入了part_of to关系的所有分支组合
-        self.expanded_subj_branches = self._resolve_core_branches(subj)
-        self.expanded_obj_branches = self._resolve_core_branches(obj)
-
-    def _resolve_core_branches(self, target_ent):
-        partof_branches = find_branches(curr_ent=target_ent, keys=[("part_of", "to")], types=[target_ent.label_type])
-        return [sorted(branch, key=lambda x: x.tok_indices[0]) for branch in partof_branches]
-
-    def get_in_used_ents(self):
-        return [ent for branch in self.expanded_subj_branches for ent in branch] + [ent for branch in self.expanded_obj_branches for ent in branch] + self.loc_atts
+            for rel in linked_graph.rels:
+                self.rel_tuples.append((rel.subj_ent.tok_str, rel.label, rel.obj_ent.tok_str))
 
     def __repr__(self) -> str:
-        return f"{self.subj} {self.rel} {self.obj}"
-
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-class UnpairedGroup:
-    def __init__(self, root):
-        self.id = None
-        self.root = root
-
-        self.expanded_root_branches = self._resolve_core_branches(root)
-
-    def _resolve_core_branches(self, target_ent):
-        # 限制类型之后，如果type预测错误，那么就会导致无法找到part_of to关系
-        partof_branches = find_branches(curr_ent=target_ent, keys=[("part_of", "from")])  # types=[target_ent.label_type]
-        return [sorted(branch, key=lambda x: x.tok_indices[0]) for branch in partof_branches]
-
-    def __repr__(self) -> str:
-        return f"{self.root}"
+        return f"{self.sent_text}"
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -160,47 +121,6 @@ def search_linked_ents(curr_ent, visited, group):
     for next_ent in neighbors:
         if next_ent not in visited:
             search_linked_ents(next_ent, visited, group)
-
-
-def find_modify_from_entities(ent_list, visited=None, keys=[("modify", "from")], limited_types=["LOCATT", "ANAT", "OBS"]):
-    if visited is None:
-        visited = set()
-
-    for curr_ent in ent_list:
-        # 如果当前 Entity 已经被访问过，跳过
-        if curr_ent in visited:
-            continue
-
-        # 将当前实体添加到已访问集合中
-        visited.add(curr_ent)
-
-        candidate_entities = [_ent for k1, k2 in keys for _ent in curr_ent.chain_info[k1][k2] if _ent.label_type in limited_types]
-        # 递归查找当前 Entity 的 modify from 所涉及的 Entity
-        find_modify_from_entities(candidate_entities, visited, keys, limited_types)
-
-    return visited
-
-
-def find_branches(curr_ent=None, branches=None, keys=[("located_at", "to")], types=["LOCATT", "ANAT", "OBS"], curr_branch_idx=0):
-    if branches is None:
-        branches = [[]]
-
-    # 如果当前ent不在分支中，就加入分支。然后按照目标key，获取下一批候选ents
-    if curr_ent not in branches[curr_branch_idx]:
-        branches[curr_branch_idx].append(curr_ent)
-    candidate_entities = [ent for k1, k2 in keys for ent in curr_ent.chain_info[k1][k2] if ent.label_type in types]
-
-    # 如果节点数量大于1，那么就要增加一个新的分支
-    for new_branch_idx in range(len(candidate_entities)):
-        next_branch_idx = curr_branch_idx + new_branch_idx
-        if next_branch_idx >= len(branches):
-            branches.append(list(branches[curr_branch_idx]))
-
-    for new_branch_idx, next_ent in enumerate(candidate_entities):
-        next_branch_idx = curr_branch_idx + new_branch_idx
-        find_branches(curr_ent=next_ent, branches=branches, keys=keys, types=types, curr_branch_idx=next_branch_idx)
-
-    return branches
 
 
 def max_coverage_spans(spans):
@@ -399,118 +319,6 @@ def check_span_relation(ent_a_indices, ent_b_indices):
         return "inside"
     else:
         return "overlap"
-
-
-def resolve_sentence_graphs(ent_list, rel_list):
-    sentence_graphs = []
-    visited_ents = set()
-    for ent in ent_list:
-        if ent not in visited_ents:
-            sent_ents = []
-            search_linked_ents(ent, visited_ents, sent_ents)
-            sentence_graphs.append(SentenceGraph(sent_ents))
-
-    assert len(ent_list) == len(visited_ents)
-    assert len(ent_list) == len([i for g in sentence_graphs for i in g.ents])
-
-    # 从sent_graph提取rel_nodes
-    groups = []
-    in_used_ents = set()
-    for sent_graph in sentence_graphs:
-        for curr_ent in sent_graph.ents:
-            if curr_ent.label_type == "LOCATT":
-                continue
-
-            # curr_ent -> located_at -> next_ent
-            for next_ent in curr_ent.chain_info["located_at"]["to"]:
-                next_ent  # It should be OBS, however, it could be others when the inference is wrong
-                if next_ent.label_type == "LOCATT":
-                    locatt_branches = find_branches(curr_ent=next_ent, keys=[("located_at", "to")], types=["LOCATT"])  # incorrect, may have multiple LOCATTs in a chain
-                    for locatt_chain in locatt_branches:
-                        locatt_ent = locatt_chain[-1]  # last locatt ent
-
-                        # the last locatt ent should have located_at_to node
-                        # but in a wrong inference, the last LOCATT may not have located_at_to node
-                        # ? -> located_at -> LOCATT -> located_at -> LOCATT -> not located_at -> ?
-                        if locatt_ent.chain_info["located_at"]["to"]:
-                            obj_ents = locatt_ent.chain_info["located_at"]["to"]
-                        elif locatt_ent.chain_info["part_of"]["to"]:
-                            obj_ents = locatt_ent.chain_info["part_of"]["to"]
-                        elif locatt_ent.chain_info["modify"]["to"]:
-                            obj_ents = locatt_ent.chain_info["modify"]["to"]
-                        else:
-                            obj_ents = None
-
-                        if obj_ents:
-                            for obj_ent in obj_ents:
-                                # curr_ent -> located_at -> LOCATT ... -> located_at -> obj_ent
-                                p_group = PairedGroup(subj=curr_ent, obj=obj_ent, rel="located_at", loc_atts=locatt_chain)
-                                sent_graph.paired_groups.append(p_group)
-                                in_used_ents.update(p_group.get_in_used_ents())
-                        else:
-                            p_group = PairedGroup(subj=curr_ent, obj=locatt_ent, rel="located_at")
-                            sent_graph.paired_groups.append(p_group)
-                            in_used_ents.update(p_group.get_in_used_ents())
-                else:
-                    # ANAT/OBS -> located_at -> ANAT/OBS
-                    p_group = PairedGroup(subj=curr_ent, obj=next_ent, rel="located_at")
-                    sent_graph.paired_groups.append(p_group)
-                    in_used_ents.update(p_group.get_in_used_ents())
-            # curr_ent -> suggestive_of -> next_ent
-            for next_ent in curr_ent.chain_info["suggestive_of"]["to"]:
-                p_group = PairedGroup(subj=curr_ent, obj=next_ent, rel="suggestive_of")
-                sent_graph.paired_groups.append(p_group)
-                in_used_ents.update(p_group.get_in_used_ents())
-
-    # not in-used root nodes (no loc_at, sugg_of)
-    for sent_graph in sentence_graphs:
-        root_ents = []  # a > modify > b, a > modify > c, root=[b, c]
-        for ent in sent_graph.ents:
-            if ent in in_used_ents:
-                continue
-            to_neighbors = ent.chain_info["part_of"]["to"] + ent.chain_info["modify"]["to"]
-            if not to_neighbors:
-                root_ents.append(ent)  # 有向图的最后一个节点为root node
-                in_used_ents.add(ent)
-
-        for root in root_ents:
-            group = UnpairedGroup(root)
-            sent_graph.unpaired_groups.append(group)
-
-    return sentence_graphs
-
-
-def flatten_list(nested_list):
-    flattened = []
-    for item in nested_list:
-        if isinstance(item, list):  # 如果当前元素是列表，递归展开
-            flattened.extend(flatten_list(item))
-        else:
-            flattened.append(item)
-    return flattened
-
-
-class SentenceRepresentation:
-    def __init__(self, doc_key, sent_id, sent_text):
-        self.doc_key = doc_key
-        self.sent_id = sent_id
-        self.sent_text = sent_text
-        self.ent_tuples = []
-        self.rel_tuples = []
-
-    def set_sent_repr(self, linked_graphs):
-        for linked_graph in linked_graphs:
-            for ent in linked_graph.ents:
-                self.ent_tuples.append((ent.tok_str, ent.label, ent.attr_normal, ent.attr_action, ent.attr_change))
-
-            for rel in linked_graph.rels:
-                self.rel_tuples.append((rel.subj_ent.tok_str, rel.label, rel.obj_ent.tok_str))
-
-    def __repr__(self) -> str:
-        return f"{self.sent_text}"
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 if __name__ == "__main__":
