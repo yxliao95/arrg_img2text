@@ -14,6 +14,7 @@ We are using CUDA/12.4
 - `pip install tensorboard` (==2.18.0)
 - `pip install accelerate` (==1.2.1)
 - `pip install mlflow` (==2.19.0)
+- `pip install sentencepiece` (==0.2.0)
 
 If CPU only
 
