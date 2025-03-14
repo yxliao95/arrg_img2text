@@ -8,6 +8,7 @@ import datetime
 import glob
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -52,7 +53,7 @@ from transformers import (
     VisionEncoderDecoderModel,
     get_linear_schedule_with_warmup,
 )
-from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_outputs import BaseModelOutput, ModelOutput
 
 CONFIG = None
 LOGGER = None
@@ -71,6 +72,16 @@ SPECIAL_TOKENS_MAP = {
 #############################################
 # Model Design
 #############################################
+
+
+@dataclass
+class Vision2LanguageOutputWithPast(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[List[torch.FloatTensor]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    image_hidden_states: Optional[torch.FloatTensor] = None
 
 
 class VisionLanguageAdaptor(nn.Module):
@@ -100,21 +111,21 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         if hasattr(self, "enc_to_dec_proj"):
             del self.enc_to_dec_proj  # 移除投影层
 
-    def _inject_image_features(self, input_ids, input_embeds, image_features):
+    def _inject_image_features(self, input_ids, inputs_embeds, image_features):
         # image_indices_map 是一个嵌套list，每个样本对应一个list，list中的元素是图像在 last_hidden_state 中的索引
         # e.g. [[0], [1], [2, 3], ...]
 
         # replace img features with the <|image_token|> placeholder token in the input text
         special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
-        special_image_mask = special_image_mask.expand_as(input_embeds).to(input_embeds.device)
+        special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
 
-        # 保证所有 image_features 都能够被复制到 input_embeds 中
-        assert special_image_mask.sum() == image_features.numel(), f"special_image_mask.sum()={special_image_mask.sum()}, image_features.numel()={image_features.numel()}, should be equal to guarantee that all image features are copied to input_embeds"
+        # 保证所有 image_features 都能够被复制到 inputs_embeds 中
+        assert special_image_mask.sum() == image_features.numel(), f"special_image_mask.sum()={special_image_mask.sum()}, image_features.numel()={image_features.numel()}, should be equal to guarantee that all image features are copied to inputs_embeds"
 
-        image_features = image_features.to(input_embeds.device, input_embeds.dtype)
-        input_embeds = input_embeds.masked_scatter(special_image_mask, image_features)
+        image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
-        return input_embeds
+        return inputs_embeds
 
     def forward(
         self,
@@ -128,250 +139,178 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        image_sizes: torch.Tensor = None,
+        output_loss: Optional[bool] = False,
+        assistant_masks: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[ModelOutput] = None,
         **kwargs,
-    ):
-        # get img features
-        encoder_outputs = self.encoder(pixel_values=input_dict["pixel_values"], return_dict=True)
-        image_features = encoder_outputs.last_hidden_state  # torch.Size([4, 1370, enc_dim])
+    ) -> Union[Tuple, Vision2LanguageOutputWithPast]:
+        """Additional args:
+        `inputs_embeds`: should represent the text embeddings with image features injected.
+        `encoder_outputs`: in inference statge, we encode `pixel_values` and get `encoder_outputs` outside this forward method. This is because the `pixel_values` and `input_ids` have different batch sizes, which cause error in generate().
 
-        # project image features
-        image_features = self.adaptor(image_features)
+        If `output_loss` is True, by default we use `input_ids` as `labels`.
+        And the `assistant_masks` should be provided to compute the loss.
+        `assistant_masks` is provided by `tokenizer.apply_chat_template`.
+        `assistant_masks` is a tensor with the same shape as input_ids, and the value is 0 or 1. 0: system/user tokens, 1: assistant tokens, which is the tokens that need to be generated.
+        """
 
-        # get text embeddings
-        input_ids = input_dict["input_ids"]
-        input_embeds = self.decoder.get_input_embeddings()(input_ids)
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
 
-        # inject image features into text embeddings
-        input_embeds = self._inject_image_features(input_ids, input_embeds, image_features)
+        if (pixel_values is not None) and (encoder_outputs is not None):
+            # train时，传入 pixel_values
+            # inference时，第一轮生成，encoder_outputs 由 do_generate 传入；后续生成则都不需要
+            raise ValueError("You must not specify both pixel_values and encoder_outputs, choose one of them or leave them None (for cache generation).")
 
-        # text generation
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if (pixel_values is not None or encoder_outputs is not None) and inputs_embeds is not None:
+            raise ValueError("You cannot specify both `pixel_values`/`encoder_outputs` and `inputs_embeds` at the same time, and must specify either one")
+
+        if inputs_embeds is None:
+            # get text embeddings
+            inputs_embeds = self.decoder.get_input_embeddings()(input_ids)
+
+        # 如果有encoder_outputs，就不需要再次 encode pixel_values
+        if (pixel_values is not None) and (encoder_outputs is None):
+            # get img features
+            encoder_outputs = self.encoder(pixel_values=pixel_values, return_dict=True)
+
+        if encoder_outputs is not None:
+            image_features = encoder_outputs.last_hidden_state  # torch.Size([4, 1370, enc_dim])
+            # project image features
+            image_features = self.adaptor(image_features)
+            # inject image features into text embeddings
+            inputs_embeds = self._inject_image_features(input_ids, inputs_embeds, image_features)
+
+        # Text generation. inputs_embeds is used in replace of input_ids on decoder in all cases.
+        # In train statge, input_ids is encoded into inputs_embeds and then merged with image features.
+        # In inference stage, inputs_embeds is passed from generate(), where the encoding and merging are done in model.do_generate(). We do this in do_generate() as the image_features and input_ids have different batch sizes.
         decoder_outputs = self.decoder(
-            inputs_embeds=input_embeds,
-            attention_mask=input_dict["attention_mask"],
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
         )
 
-        # text loss
         logits = decoder_outputs.logits
-        label_mask = input_dict["assistant_masks"]  # 0: system/user tokens, 1: assistant tokens, which is the tokens that need to be generated
 
-        shift_logits = logits[:, :-1, :]  # torch.Size([bsz, seq_len - 1, vocab_size])
-        shift_labels = input_ids[:, 1:]  # torch.Size([bsz, seq_len - 1])
-        shift_label_mask = label_mask[:, 1:]  # torch.Size([bsz, seq_len - 1])
+        # text loss
+        loss = None
+        if output_loss:
+            labels = labels if labels is not None else input_ids
 
-        active_shift_logits = shift_logits[shift_label_mask != 0].contiguous()  # torch.Size([num_acitve_labels, vocab_size])
-        active_shift_labels = shift_labels[shift_label_mask != 0].contiguous()  # torch.Size([num_acitve_labels])
+            # Shift so that tokens < n predict n
+            if assistant_masks is not None:
+                shift_label_mask = assistant_masks[:, 1:]  # torch.Size([bsz, seq_len - 1])
+            elif attention_mask is not None:
+                shift_label_mask = attention_mask[:, 1:]
+            else:
+                raise ValueError("assistant_masks or attention_mask should be provided")
 
-        ce_loss_fct = nn.CrossEntropyLoss()
-        text_loss = ce_loss_fct(active_shift_logits, active_shift_labels)
+            shift_logits = logits[:, :-1, :]  # torch.Size([bsz, seq_len - 1, vocab_size])
+            shift_labels = labels[:, 1:]  # torch.Size([bsz, seq_len - 1])
+            active_shift_logits = shift_logits[shift_label_mask != 0].contiguous()  # torch.Size([num_acitve_labels, vocab_size])
+            active_shift_labels = shift_labels[shift_label_mask != 0].contiguous()  # torch.Size([num_acitve_labels])
 
-        return text_loss
+            ce_loss_fct = nn.CrossEntropyLoss()
+            loss = ce_loss_fct(active_shift_logits, active_shift_labels)
 
-    # def forward_train(self, input_dict):
-    #     # Image cls: https://github.com/huggingface/transformers/blob/745bbfe4bb2b61491dedd56e1e8ee4af8ef1a9ec/src/transformers/models/swinv2/modeling_swinv2.py#L1239
+        return Vision2LanguageOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=decoder_outputs.past_key_values,
+            hidden_states=decoder_outputs.hidden_states,
+            attentions=decoder_outputs.attentions,
+            image_hidden_states=image_features if pixel_values is not None else None,
+        )
 
-    #     # get img features
-    #     encoder_outputs = self.encoder(pixel_values=input_dict["pixel_values"], return_dict=True)
-    #     image_features = encoder_outputs.last_hidden_state  # torch.Size([4, 1370, enc_dim])
+    def do_generate(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
 
-    #     # project image features
-    #     image_features = self.adaptor(image_features)
+        # As the batch size between input_ids and pixel_values may be different,
+        # we construct a dummy_inputs to ensure generate() method can use the correct batch size,
+        # which should be equals to input_ids's batch size.
+        dummy_inputs = torch.ones((input_ids.size(0), 1), dtype=torch.long, device=DEVICE)
 
-    #     # get text embeddings
-    #     input_ids = input_dict["input_ids"]
-    #     input_embeds = self.decoder.get_input_embeddings()(input_ids)
+        # We manually encode the pixel_values here, otherwize generate() will create a wrong encoder output (or error) with the dummy_inputs.
+        encoder_outputs = self.encoder(pixel_values=pixel_values, return_dict=True)
 
-    #     # inject image features into text embeddings
-    #     input_embeds = self._inject_image_features(input_ids, input_embeds, image_features)
+        # self.main_input_name = "inputs_embeds"
+        outputs = self.generate(
+            inputs=dummy_inputs,
+            encoder_outputs=encoder_outputs,
+            decoder_input_ids=input_ids,
+            decoder_attention_mask=attention_mask,
+            pad_token_id=kwargs["pad_token_id"],
+            bos_token_id=kwargs["bos_token_id"],
+            eos_token_id=kwargs["eos_token_id"],
+            max_new_tokens=20,
+            do_sample=False,
+            num_beams=3,
+            return_dict_in_generate=True,
+            output_logits=True,
+        )
 
-    #     # text generation
-    #     decoder_outputs = self.decoder(
-    #         inputs_embeds=input_embeds,
-    #         attention_mask=input_dict["attention_mask"],
-    #         return_dict=True,
-    #     )
+        return outputs
 
-    #     # text loss
-    #     logits = decoder_outputs.logits
-    #     label_mask = input_dict["assistant_masks"]  # 0: system/user tokens, 1: assistant tokens, which is the tokens that need to be generated
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        encoder_outputs=None,
+        pixel_values=None,
+        cache_position=None,
+        logits_to_keep=None,
+        **kwargs,
+    ):
+        """
+        Copy from LLaVA.
+        Overwritten -- in specific circumstances we don't want to forward image inputs to the model.
+        """
 
-    #     shift_logits = logits[:, :-1, :]  # torch.Size([bsz, seq_len - 1, vocab_size])
-    #     shift_labels = input_ids[:, 1:]  # torch.Size([bsz, seq_len - 1])
-    #     shift_label_mask = label_mask[:, 1:]  # torch.Size([bsz, seq_len - 1])
+        # At the first round, we need encoder_outputs (encoded from pixel_values) and input_ids
+        # At the following rounds, we need input_ids (the generated ones) and past_key_values (represent the previous input_embeds for decoder)
 
-    #     active_shift_logits = shift_logits[shift_label_mask != 0].contiguous()  # torch.Size([num_acitve_labels, vocab_size])
-    #     active_shift_labels = shift_labels[shift_label_mask != 0].contiguous()  # torch.Size([num_acitve_labels])
+        # If we're in cached decoding stage (after the first round), pixel values should be None
+        # because input ids do not contain special image token anymore
+        model_inputs = self.decoder.prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
 
-    #     ce_loss_fct = nn.CrossEntropyLoss()
-    #     text_loss = ce_loss_fct(active_shift_logits, active_shift_labels)
+        # At the first generation round, we need encoder_outputs to be passed to model. pixel_values has encoded into encoder_outputs in do_generate().
+        # e.g.
+        # at the first round, cache_position == tensor([   0,    1,    2,  ..., 2805, 2806, 2807])
+        # at second round, cache_position == tensor([2808])
+        if cache_position[0] == 0:
+            # model_inputs["pixel_values"] = pixel_values
+            model_inputs["encoder_outputs"] = encoder_outputs
 
-    #     return text_loss
-
-    # def do_generate(self, input_dict, tokenizer):
-    #     """先提取图像特征，然后拼接特征，最后主动调用generate函数。该函数会调用forward方法进行生成"""
-
-    #     # encode process
-    #     image_features = self.encoder(pixel_values=input_dict["pixel_values"], return_dict=True).last_hidden_state  # torch.Size([4, 64, 768])
-    #     present_logits, absent_logits, uncertain_logits, _ = self.image_classification(image_features)
-    #     batch_label_text = self.get_label_text(present_logits, absent_logits, uncertain_logits, topk=CONFIG.topk, threshold=CONFIG.threshold)
-
-    #     # manually add special tokens to the input text
-    #     if "bart" in tokenizer.name_or_path:
-    #         prefix_tokens = tokenizer.eos_token + tokenizer.bos_token
-    #         suffix_tokens = tokenizer.eos_token + tokenizer.eos_token
-    #     elif "roberta" in tokenizer.name_or_path:
-    #         prefix_tokens = tokenizer.bos_token + tokenizer.bos_token
-    #         suffix_tokens = tokenizer.eos_token + tokenizer.eos_token
-    #     else:
-    #         raise ValueError("Check tokenizer about how it will add special tokens between two sentence")
-    #     batch_label_text = [prefix_tokens + text + suffix_tokens for text in batch_label_text]
-
-    #     # left_padding
-    #     tokenizer.padding_side = "left"
-    #     assert tokenizer.padding_side == "left", f"tokenizer.padding_side should be [left] but got: [{tokenizer.padding_side}]"
-    #     tokenized_out = tokenizer(batch_label_text, padding=True, add_special_tokens=False, return_tensors="pt")
-    #     label_text_len = tokenized_out.input_ids.shape[1]
-
-    #     if self.config.encoder_hidden_size != self.config.decoder_hidden_size:
-    #         image_features = self.enc_to_dec_proj(image_features)
-    #     encoder_outputs = BaseModelOutput(last_hidden_state=image_features)
-
-    #     # decode process
-    #     # when we pass decoder_input_ids, the generate func will use it as decoder input rather than build a new input
-    #     outputs = self.generate(
-    #         encoder_outputs=encoder_outputs,
-    #         decoder_input_ids=tokenized_out.input_ids.to(DEVICE),
-    #         decoder_attention_mask=tokenized_out.attention_mask.to(DEVICE),
-    #         max_new_tokens=CONFIG.max_generation_len,
-    #         num_beams=CONFIG.num_beam,
-    #         early_stopping=True,
-    #         renormalize_logits=True,
-    #         return_dict_in_generate=True,
-    #         output_scores=True,
-    #         output_logits=True,
-    #     )
-    #     # outputs.scores是数组，数组的每个元素表示一次自回归迭代，并为每个句子生成了一个token
-    #     self.config.vocab_size = self.decoder.config.vocab_size
-    #     transition_scores = self.compute_transition_scores(outputs.sequences, outputs.scores, outputs.beam_indices, normalize_logits=False)
-    #     transition_logits = self.compute_transition_scores(outputs.sequences, outputs.logits, outputs.beam_indices, normalize_logits=False)
-    #     print(transition_scores)
-
-    #     return {
-    #         "generated_ids": generated_ids,
-    #         "generated_ids_without_label_text": generated_ids[:, label_text_len:],
-    #         "present_logits": present_logits,
-    #         "absent_logits": absent_logits,
-    #         "uncertain_logits": uncertain_logits,
-    #         "decoder_input_ids": tokenized_out.input_ids,
-    #     }
-
-    # def forward(
-    #     self,
-    #     pixel_values: Optional[torch.FloatTensor] = None,
-    #     decoder_input_ids: Optional[torch.LongTensor] = None,
-    #     decoder_attention_mask: Optional[torch.BoolTensor] = None,
-    #     encoder_outputs: Optional[Tuple[torch.FloatTensor]] = None,
-    #     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-    #     decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
-    #     labels: Optional[torch.LongTensor] = None,
-    #     use_cache: Optional[bool] = None,
-    #     output_attentions: Optional[bool] = None,
-    #     output_hidden_states: Optional[bool] = None,
-    #     return_dict: Optional[bool] = None,
-    #     **kwargs,
-    # ):
-    #     """Copy from the transformers.models.vision_encoder_decoder.modeling_vision_encoder_decoder.VisionEncoderDecoderModel.forward
-    #     This is expected to be called only by the generate(). For training, use the forward_train().
-    #     We remove the projection operation as we have done the projection before passing the encoder_outputs into here."""
-    #     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-    #     kwargs_encoder = {argument: value for argument, value in kwargs.items() if not argument.startswith("decoder_")}
-    #     kwargs_decoder = {argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")}
-
-    #     if encoder_outputs is None:
-    #         raise ValueError("You have to provide encoder_outputs")
-    #     elif isinstance(encoder_outputs, tuple):
-    #         encoder_outputs = BaseModelOutput(*encoder_outputs)
-
-    #     encoder_hidden_states = encoder_outputs[0]
-
-    #     # We should have done the projection before passing the encoder_outputs in this function.
-    #     # optionally project encoder_hidden_states
-    #     # if self.encoder.config.hidden_size != self.decoder.config.hidden_size and self.decoder.config.cross_attention_hidden_size is None:
-    #     #     encoder_hidden_states = self.enc_to_dec_proj(encoder_hidden_states)
-
-    #     # else:
-    #     encoder_attention_mask = None
-
-    #     if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
-    #         decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
-
-    #     # Decode
-    #     decoder_outputs = self.decoder(
-    #         input_ids=decoder_input_ids,
-    #         attention_mask=decoder_attention_mask,
-    #         encoder_hidden_states=encoder_hidden_states,
-    #         encoder_attention_mask=encoder_attention_mask,
-    #         input_embeds=decoder_inputs_embeds,
-    #         output_attentions=output_attentions,
-    #         output_hidden_states=output_hidden_states,
-    #         use_cache=use_cache,
-    #         past_key_values=past_key_values,
-    #         return_dict=return_dict,
-    #         **kwargs_decoder,
-    #     )
-
-    #     # Compute loss independent from decoder (as some shift the logits inside them)
-    #     loss = None
-    #     if labels is not None:
-    #         logits = decoder_outputs.logits if return_dict else decoder_outputs[0]
-    #         loss_fct = nn.CrossEntropyLoss()
-    #         loss = loss_fct(logits.reshape(-1, self.decoder.config.vocab_size), labels.reshape(-1))
-
-    #     if not return_dict:
-    #         if loss is not None:
-    #             return (loss,) + decoder_outputs + encoder_outputs
-    #         else:
-    #             return decoder_outputs + encoder_outputs
-
-    #     return Seq2SeqLMOutput(
-    #         loss=loss,
-    #         logits=decoder_outputs.logits,
-    #         past_key_values=decoder_outputs.past_key_values,
-    #         decoder_hidden_states=decoder_outputs.hidden_states,
-    #         decoder_attentions=decoder_outputs.attentions,
-    #         cross_attentions=decoder_outputs.cross_attentions,
-    #         encoder_last_hidden_state=encoder_outputs.last_hidden_state,
-    #         encoder_hidden_states=encoder_outputs.hidden_states,
-    #         encoder_attentions=encoder_outputs.attentions,
-    #     )
-
-    # def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs):
-    #     """What we added is to pass the attention_mask to the decoder.prepare_inputs_for_generation func."""
-    #     # 传入attention_mask=kwargs["decoder_attention_mask"]，则原样返回。若不传，则按照input_ids的形状，构造全1的tensor
-    #     decoder_inputs = self.decoder.prepare_inputs_for_generation(input_ids, attention_mask=kwargs["decoder_attention_mask"], past_key_values=past_key_values)
-    #     decoder_attention_mask = decoder_inputs["attention_mask"] if "attention_mask" in decoder_inputs else None
-
-    #     # generate函数中会自动在decoder_attention_mask末尾加1，保证与decoder_input_ids的形状一致
-
-    #     # # 将原始decoder_attention_mask中有效部分的值复制到新attention mask中
-    #     # if decoder_attention_mask is not None:
-    #     #     init_attention_mask = kwargs["decoder_attention_mask"]
-    #     #     initial_length = init_attention_mask.size(1)
-    #     #     decoder_attention_mask[:, :initial_length] = init_attention_mask
-
-    #     input_dict = {
-    #         "attention_mask": attention_mask,
-    #         "decoder_attention_mask": decoder_attention_mask,
-    #         "decoder_input_ids": decoder_inputs["input_ids"],
-    #         "encoder_outputs": encoder_outputs,
-    #         "past_key_values": decoder_inputs["past_key_values"],
-    #         "use_cache": use_cache,
-    #     }
-    #     return input_dict
+        return model_inputs
 
 
 class ImageTextDataset(Dataset):
@@ -391,7 +330,7 @@ class ImageTextDataset(Dataset):
         return self.samples[index]
 
 
-def collate_fn(batch_data, img_processor, tokenizer):
+def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
 
     # 处理图像，因为每个样本的图像数量不一样，所以需要image_indices_map来记录每个样本的图像在batch中的索引
     nested_images = [i["images"] for i in batch_data]  # nested list of imgs: [[img1, img2], [img1], ...]
@@ -426,14 +365,30 @@ def collate_fn(batch_data, img_processor, tokenizer):
     # See descriptions for assistant_tokens_mask
     # Assistant tokens are the tokens that need to be generated, we use these tokens to compute the loss
     # https://huggingface.co/docs/transformers/internal/tokenization_utils#transformers.PreTrainedTokenizerBase.apply_chat_template.return_assistant_tokens_mask
-    input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=False, tokenize=True, padding=True, truncation=True, return_dict=True, return_tensors="pt", return_assistant_tokens_mask=True)
+
+    tokenizer_kwargs = {"pad_to_multiple_of": 8}
+
+    if do_inference:
+        add_generation_prompt = True
+        return_assistant_tokens_mask = False
+        tokenizer_kwargs["padding_side"] = "left"
+    else:
+        add_generation_prompt = False
+        return_assistant_tokens_mask = True
+        tokenizer_kwargs["padding_side"] = "right"
+
+    input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
+
+    assistant_masks = None
+    if "assistant_masks" in input_text_tensor_dict:
+        assistant_masks = input_text_tensor_dict.assistant_masks.to(DEVICE)
 
     return {
         "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
         "input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
         "attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
-        "assistant_masks": input_text_tensor_dict.assistant_masks.to(DEVICE),
+        "assistant_masks": assistant_masks,
         "data_id_list": [i["doc_key"] for i in batch_data],
     }
 
@@ -576,13 +531,21 @@ def evaluate(model, target_dataloader, output_result=False):
     LOGGER.info("Source = %s", target_dataloader.dataset.src_path)
     LOGGER.info("Batch size = %d", CONFIG["eval"]["batch_size"])
     LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
+    tokenizer = target_dataloader.dataset.tokenizer
 
     start = time.time()
     model.eval()
     with torch.no_grad():
         for input_tensors_dict in target_dataloader:
-            # Model inference
-            logits = model(input_dict=input_tensors_dict)
+            # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
+            outputs = model.do_generate(
+                pixel_values=input_tensors_dict["pixel_values"],
+                input_ids=input_tensors_dict["input_ids"],
+                attention_mask=input_tensors_dict["attention_mask"],
+                pad_token_id=tokenizer.pad_token_id,
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
 
             probs = torch.sigmoid(logits)
             predicted_labels = probs.squeeze()  # -> (bsz,)
@@ -713,7 +676,8 @@ def train(model, train_dataloader, valid_dataloader):
                 # Accelerate enables automatic mixed precision, so autocast() is only needed if there are other mixed precision operations besides those performed on loss by backward() which already handles the scaling.
                 with ACCELERATOR.autocast():
                     model.train()
-                    loss = model.forward(**batch_inputs_dict)
+                    out = model.forward(output_loss=True, **batch_inputs_dict)
+                    loss = out.loss
 
                 ACCELERATOR.backward(loss)
                 if train_cfg["clip_grad_norm"] > 0:
@@ -929,6 +893,10 @@ def set_seed(seed):
 
 
 #############################################
+# Data pre-processing
+#############################################
+
+
 def convert_label_str_to_int(label_str, label_type):
     label_map = {"onehot": {"present": [1, 0, 0], "absent": [0, 1, 0], "uncertain": [0, 0, 1]}, "regression": {"present": 1, "absent": 0, "uncertain": 0.5}}
     return label_map[label_type][label_str]
@@ -1066,8 +1034,8 @@ def get_dataloaders(ds_dict, img_processor, tokenizer, use_debug_subset=False):
             test_dataset = ImageTextDataset(ds_dict["test"], img_processor=img_processor, tokenizer=tokenizer, split="test")
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_cfg["batch_size"], drop_last=True)
-    valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_cfg["batch_size"], drop_last=False)
-    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_cfg["batch_size"], drop_last=False)
+    valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
+    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
 
     return train_dataloader, valid_dataloader, test_dataloader
 
@@ -1111,16 +1079,49 @@ def load_src_datasets(data_paths):
     return ds_img, ds_text
 
 
-def update_attributes_for_image_token_replacement(model, tokenizer):
-    # 用于在 input_ids 中查找需要替换的图像占位符 <|image_token|>
-    model.config.image_token_index = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS_MAP["<|image_token|>"])
+def preprocess_dataset():
+    img_dataset, text_dataset = load_src_datasets(data_paths=CONFIG["data_path"])
 
-    # 用于提前计算图像占位符 <|image_token|> 被替换后的特征维度
-    img_size = model.config.encoder.image_size
-    dummy_img = torch.zeros((1, 3, img_size, img_size))
-    num_image_tokens = model.encoder(dummy_img).last_hidden_state.size(1)
-    model.config.num_image_tokens = num_image_tokens
-    tokenizer.num_image_tokens = num_image_tokens
+    # Get dataloader for training and testing
+    image_processor_name = CONFIG["preprocess"]["image_processor"]
+    model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
+
+    if image_processor_name == "clip":
+        img_processor = processor.image_processor
+        resize_h_w = (img_processor.size["shortest_edge"], img_processor.size["shortest_edge"])
+    elif image_processor_name == "swinv2":
+        img_processor = processor
+        resize_h_w = (img_processor.size["height"], img_processor.size["width"])
+
+    ds_dict = {}
+    for split in ["train", "validation", "test"]:
+        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], resize_h_w=resize_h_w, convert_to_rgb=True)
+        # .select(range(len(text_dataset[split]) - 200, len(text_dataset[split])))
+
+    pre_processed_dataset_dict = DatasetDict(ds_dict)
+    pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
+    LOGGER.info("Preprocessed dataset dict saved to: %s", CONFIG["preprocess"]["cache_path"])
+
+
+#############################################
+
+
+def post_init_model_and_tokenizer(model, tokenizer):
+    if len(tokenizer) != model.config.decoder.vocab_size:
+        LOGGER.info("Resizing model decoder to match tokenizer size: %d -> %d", model.config.decoder.vocab_size, len(tokenizer))
+        model.decoder.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8, mean_resizing=True)
+
+    # 用于在 input_ids 中查找需要替换的图像占位符 <|image_token|>
+    if not hasattr(model.config, "image_token_index"):
+        model.config.image_token_index = tokenizer.convert_tokens_to_ids("<|image_token|>")
+
+    if not hasattr(tokenizer, "num_image_tokens"):
+        # 计算 vision model 输出的图像特征的数量，该数量等于我们应该在 input_ids 中插入 <|image_token|> 的数量
+        img_size = model.config.encoder.image_size
+        dummy_img = torch.zeros((1, 3, img_size, img_size))
+        num_image_tokens = model.encoder(dummy_img).last_hidden_state.size(1)
+        tokenizer.num_image_tokens = num_image_tokens
 
 
 def init_model(vision_model_path, language_model_path, model_base_cfg):
@@ -1143,10 +1144,18 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
 
     # Add special tokens
     LOGGER.info("Adding special tokens")
-    special_tokens = {"additional_special_tokens": [i for i in SPECIAL_TOKENS_MAP.values()]}
-    if not tokenizer.pad_token:
-        special_tokens["pad_token"] = tokenizer.eos_token  # set this for the use of apply_chat_template(padding=True)
-    tokenizer.add_special_tokens(special_tokens)
+    bos_token = tokenizer.bos_token if tokenizer.bos_token else "<BOS>"
+    eos_token = tokenizer.eos_token if tokenizer.eos_token else "<EOS>"
+    pad_token = tokenizer.pad_token if tokenizer.pad_token else "<PAD>"
+    special_tokens_dict = {
+        "bos_token": bos_token,
+        "eos_token": eos_token,
+        "pad_token": pad_token,
+        "additional_special_tokens": ["<|image_token|>", "<|image_start|>", "<|image_end|>"],
+    }
+    tokenizer.add_special_tokens(special_tokens_dict)
+    # print special tokens and their ids
+    LOGGER.info("Special tokens: %s", [(key, tok, tokenizer.convert_tokens_to_ids(tok)) for key, tok in tokenizer.special_tokens_map.items()])
 
     # set chat template
     assert tokenizer.chat_template == None, "Tokenizer has chat_template, please check whether to use the existing one or our new chat template."
@@ -1154,10 +1163,7 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
     LOGGER.info("Adding chat template to tokenizer from: %s", chat_template_path)
     with open(chat_template_path, "r") as f:
         chat_template = "".join([line.strip() for line in f.readlines()])
-        for k, v in SPECIAL_TOKENS_MAP.items():
-            chat_template = chat_template.replace(k, v)
-        tokenizer.chat_template = chat_template
-        assert "<|reserved_special_token_1|>" in chat_template, "Chat template is not matched w.r.t. special tokens."
+    tokenizer.chat_template = chat_template
     LOGGER.info("Chat template: %s", tokenizer.chat_template)
 
     return img_processor, tokenizer
@@ -1285,7 +1291,7 @@ def main():
     if CONFIG["do_train"]:
         # Training
         model = init_model(vision_model_path, language_model_path, model_base_cfg)
-        update_attributes_for_image_token_replacement(model, tokenizer)
+        post_init_model_and_tokenizer(model, tokenizer)
 
         model.to(DEVICE)
         model = ACCELERATOR.prepare(model)
@@ -1296,9 +1302,16 @@ def main():
         end = time.time()
         LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
+        img_processor.save_pretrained(CONFIG["output_dir"]["model"])
+        tokenizer.save_pretrained(CONFIG["output_dir"]["model"])
+        LOGGER.info("Tokenizer and Image Processor are saved to: %s", CONFIG["output_dir"]["model"])
+
     if CONFIG["do_test"]:
         # Testing
-        model = load_model(CONFIG["output_dir"]["model"])
+        # model = load_model(CONFIG["output_dir"]["model"])
+        model = init_model(vision_model_path, language_model_path, model_base_cfg)
+        post_init_model_and_tokenizer(model, tokenizer)
+
         model.to(DEVICE)
         model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
 
@@ -1306,31 +1319,6 @@ def main():
         evaluate(model, test_dataloader, output_result=True)
         end = time.time()
         LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
-
-
-def preprocess_dataset():
-    img_dataset, text_dataset = load_src_datasets(data_paths=CONFIG["data_path"])
-
-    # Get dataloader for training and testing
-    image_processor_name = CONFIG["preprocess"]["image_processor"]
-    model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
-
-    if image_processor_name == "clip":
-        img_processor = processor.image_processor
-        resize_h_w = (img_processor.size["shortest_edge"], img_processor.size["shortest_edge"])
-    elif image_processor_name == "swinv2":
-        img_processor = processor
-        resize_h_w = (img_processor.size["height"], img_processor.size["width"])
-
-    ds_dict = {}
-    for split in ["train", "validation", "test"]:
-        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], resize_h_w=resize_h_w, convert_to_rgb=True)
-        # .select(range(len(text_dataset[split]) - 200, len(text_dataset[split])))
-
-    pre_processed_dataset_dict = DatasetDict(ds_dict)
-    pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
-    LOGGER.info("Preprocessed dataset dict saved to: %s", CONFIG["preprocess"]["cache_path"])
 
 
 if __name__ == "__main__":

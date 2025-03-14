@@ -36,7 +36,7 @@ preprocess:
 # path to checkpoint or, bool;
 # if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
 resume_from_checkpoint: False
-do_train: True
+do_train: False
 # if do_test=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 do_test: True
 use_debug_subset: True
