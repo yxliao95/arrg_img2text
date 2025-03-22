@@ -1,7 +1,5 @@
 #############################################
-# 基于 1_cls_effu_notallimg_fast.py
-# 改进：
-# 使用回归损失函数，不再使用分类损失函数，0.0, 0.5, 1.0 三个类别，分别表示absent、uncertain、present
+# 改用生成模型
 #############################################
 import argparse
 import datetime
@@ -31,6 +29,7 @@ from accelerate.logging import MultiProcessAdapter
 from accelerate.utils import GradientAccumulationPlugin, gather, gather_object, set_seed
 from datasets import DatasetDict, concatenate_datasets, load_from_disk
 from PIL import Image
+from scorers.scores import compute_scores
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
@@ -358,8 +357,14 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
                     {"type": "text", "text": "Given the chest X-ray images, generate a description of the findings."},
                 ],
             },
-            {"role": "assistant", "content": [{"type": "text", "text": " ".join(item["split_sents"])}]},
         ]
+        if not do_inference:
+            conversation.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": " ".join(item["split_sents"])}],
+                }
+            )
         conversations.append(conversation)
 
     # See descriptions for assistant_tokens_mask
@@ -383,6 +388,10 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
     if "assistant_masks" in input_text_tensor_dict:
         assistant_masks = input_text_tensor_dict.assistant_masks.to(DEVICE)
 
+    gold_text_list = None
+    if do_inference:
+        gold_text_list = [" ".join(i["split_sents"]) for i in batch_data]
+
     return {
         "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
@@ -390,6 +399,7 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
         "attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
         "assistant_masks": assistant_masks,
         "data_id_list": [i["doc_key"] for i in batch_data],
+        "gold_text_list": gold_text_list,
     }
 
 
@@ -407,16 +417,16 @@ class StatusInfo:
 
     global_iters: int = field(default=0)
     global_update_steps: int = field(default=0)
-    dev_best: dict = field(default_factory=lambda: {"score": 0.0, "at_epoch": 0, "at_iter": 0, "check_at": ""})
+    dev_best: dict = field(default_factory=lambda: {"text_score": 0.0, "at_epoch": 0, "at_iter": 0, "check_at": ""})
 
     batch_loss: int = field(default=0)
     batch_trained_examples: int = field(default=0)
 
     run_id: dict = field(default="")
 
-    def is_achieving_best_dev_score(self, score):
-        if score >= self.dev_best["score"]:
-            self.dev_best["score"] = score
+    def is_achieving_best_dev_score(self, text_score):
+        if text_score >= self.dev_best["text_score"]:
+            self.dev_best["text_score"] = text_score
             self.dev_best["at_iter"] = self.curr_batch_iter
             self.dev_best["at_epoch"] = self.curr_epoch
             self.dev_best["check_at"] = self.curr_checkpoint_at
@@ -505,10 +515,6 @@ class MLflowTracker:
 
 
 def evaluate(model, target_dataloader, output_result=False):
-    data_ids = []
-    data_preds = []
-    data_golds = []
-
     eval_results = {
         "present": {
             "num_gold_label": 0,
@@ -533,6 +539,10 @@ def evaluate(model, target_dataloader, output_result=False):
     LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
     tokenizer = target_dataloader.dataset.tokenizer
 
+    data_ids = []
+    pred_seqs = []
+    gold_seqs = []
+
     start = time.time()
     model.eval()
     with torch.no_grad():
@@ -547,57 +557,54 @@ def evaluate(model, target_dataloader, output_result=False):
                 eos_token_id=tokenizer.eos_token_id,
             )
 
-            probs = torch.sigmoid(logits)
-            predicted_labels = probs.squeeze()  # -> (bsz,)
-            gold_labels = input_tensors_dict["effusion_labels"]  # -> (bsz,)
-            preds = predicted_labels.cpu().numpy()  # (8,)
-            golds = gold_labels.cpu().numpy()
+            pred_seq_start_ids = input_tensors_dict["input_ids"].size(1)  # 生成的序列的起始位置
+            pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
+            pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
+            gold_sequences = input_tensors_dict["gold_text_list"]
 
             # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
             data_ids.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["data_id_list"], use_gather_object=True))
-            data_preds.extend(ACCELERATOR.gather_for_metrics(preds, use_gather_object=True))
-            data_golds.extend(ACCELERATOR.gather_for_metrics(golds, use_gather_object=True))
+            pred_seqs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
+            gold_seqs.extend(ACCELERATOR.gather_for_metrics(gold_sequences, use_gather_object=True))
 
     assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
     assert len(data_ids) == target_dataloader.total_dataset_length, f"Gathered data size ({len(data_ids)}) should equals to dataset size ({target_dataloader.total_dataset_length})"
     # LOGGER.debug("p=%s, len=%s, data_ids: %s", ACCELERATOR.process_index, len(data_ids), data_ids)
-    # LOGGER.debug("p=%s, len=%s, data_preds: %s", ACCELERATOR.process_index, len(data_preds), data_preds)
-    # LOGGER.debug("p=%s, len=%s, data_golds: %s", ACCELERATOR.process_index, len(data_golds), data_golds)
+    # LOGGER.debug("p=%s, len=%s, pred_seqs: %s", ACCELERATOR.process_index, len(pred_seqs), pred_seqs)
+    # LOGGER.debug("p=%s, len=%s, gold_seqs: %s", ACCELERATOR.process_index, len(gold_seqs), gold_seqs)
     if output_result:
         with open(f"{CONFIG['output_dir']['result']}/{target_dataloader.dataset.split}_{ACCELERATOR.process_index}.json", "w") as f:
-            f.write(json.dumps({"gold": [i.tolist() for i in data_golds], "pred": [i.tolist() for i in data_preds]}))
-
-    interval_idx_map = {0: "absent", 1: "uncertain", 2: "present"}
-    label_value_map = {0.0: "absent", 0.5: "uncertain", 1.0: "present"}
-    for gold, pred in zip(data_golds, data_preds):
-        pred_label = interval_idx_map[find_interval(pred, thresholds=[0.33, 0.66])]
-        gold_label = label_value_map[gold]
-        eval_results[gold_label]["num_gold_label"] += 1
-        eval_results[pred_label]["num_pred_label"] += 1
-
-        if pred_label == gold_label:
-            eval_results[gold_label]["num_correct_label"] += 1
+            f.write(json.dumps({"gold_seqs": [i.tolist() for i in gold_seqs], "pred_seqs": [i.tolist() for i in pred_seqs]}))
 
     # Evaluate the results
-    task_f1 = {}
-    for eval_field, result_dict in eval_results.items():
-        num_corr = result_dict["num_correct_label"]
-        num_pred = result_dict["num_pred_label"]
-        num_gt = result_dict["num_gold_label"]
-        p = num_corr / num_pred if num_corr > 0 else 0.0
-        r = num_corr / num_gt if num_corr > 0 else 0.0
-        f1 = 2 * (p * r) / (p + r) if num_corr > 0 else 0.0
-        LOGGER.info("[%s]: P: %.3f, R: %.3f, 【F1: %.3f】", eval_field, p, r, f1 * 100)
-        task_f1[eval_field] = f1
+    text_scores_dict = compute_generation_score(gold_text_list=gold_texts, pred_text_list=pred_seqs)
+    LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict))
 
-        if STATUS_INFO:
-            prefix = f"{STATUS_INFO.curr_eval_split}_{eval_field}"
-            MLFLOW_TRACKER.log({f"{prefix}_precision": p, f"{prefix}_recall": r, f"{prefix}_f1": f1}, step=STATUS_INFO.global_iters)
+    if STATUS_INFO:
+        for metric_name, metric_val in text_scores_dict.items():
+            k = f"{STATUS_INFO.curr_eval_split}_{metric_name}"
+            MLFLOW_TRACKER.log({k: metric_val}, step=STATUS_INFO.global_iters)
 
     end = time.time()
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
     check_memory()
-    return task_f1
+    return text_scores_dict
+
+
+def compute_generation_score(gold_text_list, pred_text_list):
+    """Based on the script from https://vilmedic.app/misc/bionlp24/leaderboard#anchor-baseline"""
+    if DEVICE.type == "cpu":
+        use_metrics = ["BLEU", "ROUGEL", "radgraph", "chexbert"]
+    else:
+        use_metrics = ["BLEU", "ROUGEL", "radgraph", "chexbert", "bertscore"]
+
+    refs = [" ".join(wordpunct_tokenize(s.lower())) for s in gold_text_list]
+    hyps = [" ".join(wordpunct_tokenize(s.lower())) for s in pred_text_list]
+
+    # https://github.com/jbdel/vilmedic/blob/main/vilmedic/blocks/scorers/scores.py
+    out_dict = compute_scores(use_metrics, refs=refs, hyps=hyps, split=None, seed=None, config=None, epoch=None, logger=LOGGER, dump=False)
+    out_dict = {k: float(v) for k, v in out_dict.items()}
+    return out_dict
 
 
 # 用于存储每个值的区间
@@ -763,24 +770,25 @@ def final_test_process(model, test_dataloader):
 
 def check_results_and_save_model(model, eval_result_dict):
     # Check
-    score = 0
+    text_score = 0
     num_metrics = 0
-    for metric_key in ["present", "absent", "uncertain"]:
-        if metric_key in eval_result_dict:
-            score += eval_result_dict[metric_key]
+    for metric_key in ["BLEU", "ROUGEL", "chexbert-all_micro avg_f1-score", "radgraph_partial", "bertscore"]:
+        if metric_key in eval_out:
+            TENSORBOARD.add_scalar(f"{CONFIG.output_name}-{split}/{metric_key}", eval_out[metric_key], log_info["global_steps"])
+            text_score += eval_out[metric_key]
             num_metrics += 1
-    score = score / num_metrics
+    text_score = text_score / num_metrics
 
     LOGGER.info("****************************** Checkpoint ******************************")
-    LOGGER.info("Current [%s] avg-f1: %.3f, at epoch %d, iter %d (%s)", STATUS_INFO.curr_eval_split, score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_checkpoint_at)
-    LOGGER.info("Best [%s] avg-f1: %.3f, at epoch %d, iter %d", STATUS_INFO.curr_eval_split, STATUS_INFO.dev_best["score"] * 100, STATUS_INFO.dev_best["at_epoch"], STATUS_INFO.dev_best["at_iter"])
-    MLFLOW_TRACKER.log({f"{STATUS_INFO.curr_eval_split}_avg_f1": score}, step=STATUS_INFO.global_iters)
+    LOGGER.info("Current [%s] text_avg_f1: %.3f, at epoch %d, iter %d (%s)", STATUS_INFO.curr_eval_split, text_score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_checkpoint_at)
+    LOGGER.info("Best [%s] avg-f1: %.3f, at epoch %d, iter %d", STATUS_INFO.curr_eval_split, STATUS_INFO.dev_best["text_score"] * 100, STATUS_INFO.dev_best["at_epoch"], STATUS_INFO.dev_best["at_iter"])
+    MLFLOW_TRACKER.log({f"{STATUS_INFO.curr_eval_split}_text_avg_f1": text_score}, step=STATUS_INFO.global_iters)
 
     # checkpointing
     save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
 
     # Save the best
-    if STATUS_INFO.is_achieving_best_dev_score(score):
+    if STATUS_INFO.is_achieving_best_dev_score(text_score):
         save_model(model, CONFIG["output_dir"]["model"])
 
 
@@ -1331,7 +1339,6 @@ if __name__ == "__main__":
     if CONFIG["preprocess_dataset"]:
         preprocess_dataset()
     else:
-        # TODO cProfile?
         import cProfile
 
         cProfile.run("main()", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
