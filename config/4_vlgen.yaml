@@ -24,19 +24,19 @@ model_name_or_path:
   llama32_1b: /home/yuxiang/liao/resources/downloaded_models/Llama-3.2-1B
 
 # The image processor depends on the model.vision_backbone
-preprocess_dataset: False
+preprocess_dataset: True
 preprocess:
-  image_processor: swinv2
+  image_processor: rad_dino_maira2
   text_processor: llama32_1b
-  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_rbg224 #clipbase_rbg224
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/rad_dino_maira2_rbg518 # clipbase_rbg224
   batched: True
-  batch_size: 64
-  num_proc: 16
+  batch_size: 32
+  num_proc: 12
 
 # path to checkpoint or, bool;
 # if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
 resume_from_checkpoint: False
-do_train: False
+do_train: True
 # if do_test=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 do_test: True
 use_debug_subset: True

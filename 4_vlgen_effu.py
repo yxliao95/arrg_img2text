@@ -28,7 +28,9 @@ from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.logging import MultiProcessAdapter
 from accelerate.utils import GradientAccumulationPlugin, gather, gather_object, set_seed
 from datasets import DatasetDict, concatenate_datasets, load_from_disk
+from nltk.tokenize import wordpunct_tokenize
 from PIL import Image
+from scipy.ndimage import zoom
 from scorers.scores import compute_scores
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
@@ -68,11 +70,10 @@ SPECIAL_TOKENS_MAP = {
     "<|image_end|>": "<|reserved_special_token_3|>",
 }
 
-#############################################
-# Model Design
-#############################################
 
-
+#############################################
+# Model Classes
+#############################################
 @dataclass
 class Vision2LanguageOutputWithPast(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
@@ -404,10 +405,8 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
 
 
 #############################################
-# Training and Evaluation
+# Status Class and Tracker
 #############################################
-
-
 @dataclass
 class StatusInfo:
     curr_epoch: int = field(default=0)
@@ -514,109 +513,9 @@ class MLflowTracker:
         return mlf_tracker
 
 
-def evaluate(model, target_dataloader, output_result=False):
-    eval_results = {
-        "present": {
-            "num_gold_label": 0,
-            "num_pred_label": 0,
-            "num_correct_label": 0,
-        },
-        "absent": {
-            "num_gold_label": 0,
-            "num_pred_label": 0,
-            "num_correct_label": 0,
-        },
-        "uncertain": {
-            "num_gold_label": 0,
-            "num_pred_label": 0,
-            "num_correct_label": 0,
-        },
-    }
-
-    LOGGER.info("****************************** Evaluation ******************************")
-    LOGGER.info("Source = %s", target_dataloader.dataset.src_path)
-    LOGGER.info("Batch size = %d", CONFIG["eval"]["batch_size"])
-    LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
-    tokenizer = target_dataloader.dataset.tokenizer
-
-    data_ids = []
-    pred_seqs = []
-    gold_seqs = []
-
-    start = time.time()
-    model.eval()
-    with torch.no_grad():
-        for input_tensors_dict in target_dataloader:
-            # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
-            outputs = model.do_generate(
-                pixel_values=input_tensors_dict["pixel_values"],
-                input_ids=input_tensors_dict["input_ids"],
-                attention_mask=input_tensors_dict["attention_mask"],
-                pad_token_id=tokenizer.pad_token_id,
-                bos_token_id=tokenizer.bos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-            pred_seq_start_ids = input_tensors_dict["input_ids"].size(1)  # 生成的序列的起始位置
-            pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
-            pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
-            gold_sequences = input_tensors_dict["gold_text_list"]
-
-            # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
-            data_ids.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["data_id_list"], use_gather_object=True))
-            pred_seqs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
-            gold_seqs.extend(ACCELERATOR.gather_for_metrics(gold_sequences, use_gather_object=True))
-
-    assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
-    assert len(data_ids) == target_dataloader.total_dataset_length, f"Gathered data size ({len(data_ids)}) should equals to dataset size ({target_dataloader.total_dataset_length})"
-    # LOGGER.debug("p=%s, len=%s, data_ids: %s", ACCELERATOR.process_index, len(data_ids), data_ids)
-    # LOGGER.debug("p=%s, len=%s, pred_seqs: %s", ACCELERATOR.process_index, len(pred_seqs), pred_seqs)
-    # LOGGER.debug("p=%s, len=%s, gold_seqs: %s", ACCELERATOR.process_index, len(gold_seqs), gold_seqs)
-    if output_result:
-        with open(f"{CONFIG['output_dir']['result']}/{target_dataloader.dataset.split}_{ACCELERATOR.process_index}.json", "w") as f:
-            f.write(json.dumps({"gold_seqs": [i.tolist() for i in gold_seqs], "pred_seqs": [i.tolist() for i in pred_seqs]}))
-
-    # Evaluate the results
-    text_scores_dict = compute_generation_score(gold_text_list=gold_texts, pred_text_list=pred_seqs)
-    LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict))
-
-    if STATUS_INFO:
-        for metric_name, metric_val in text_scores_dict.items():
-            k = f"{STATUS_INFO.curr_eval_split}_{metric_name}"
-            MLFLOW_TRACKER.log({k: metric_val}, step=STATUS_INFO.global_iters)
-
-    end = time.time()
-    LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
-    check_memory()
-    return text_scores_dict
-
-
-def compute_generation_score(gold_text_list, pred_text_list):
-    """Based on the script from https://vilmedic.app/misc/bionlp24/leaderboard#anchor-baseline"""
-    if DEVICE.type == "cpu":
-        use_metrics = ["BLEU", "ROUGEL", "radgraph", "chexbert"]
-    else:
-        use_metrics = ["BLEU", "ROUGEL", "radgraph", "chexbert", "bertscore"]
-
-    refs = [" ".join(wordpunct_tokenize(s.lower())) for s in gold_text_list]
-    hyps = [" ".join(wordpunct_tokenize(s.lower())) for s in pred_text_list]
-
-    # https://github.com/jbdel/vilmedic/blob/main/vilmedic/blocks/scorers/scores.py
-    out_dict = compute_scores(use_metrics, refs=refs, hyps=hyps, split=None, seed=None, config=None, epoch=None, logger=LOGGER, dump=False)
-    out_dict = {k: float(v) for k, v in out_dict.items()}
-    return out_dict
-
-
-# 用于存储每个值的区间
-def find_interval(value, thresholds):
-    # e.g. thresholds = [0.33, 0.66]
-    # value = 0.5, return 1; value = 0.8, return 2; value = 0.66, return 1
-    for i, t in enumerate(thresholds):
-        if value <= t:
-            return i  # 返回所在区间的索引
-    return len(thresholds)  # 如果大于所有阈值，返回最后一个区间
-
-
+#############################################
+# Training
+#############################################
 def train(model, train_dataloader, valid_dataloader):
     global MLFLOW_TRACKER, STATUS_INFO
 
@@ -705,6 +604,24 @@ def train(model, train_dataloader, valid_dataloader):
     MLFLOW_TRACKER.finish()
 
 
+def check_status_and_resume_checkpoint():
+    epoch_resumed, iter_resumed = 0, 0
+    resume_from_checkpoint = CONFIG["resume_from_checkpoint"]
+
+    if resume_from_checkpoint:
+        LOGGER.info("****************************** Resume checkpoint ******************************")
+        # STATUS_INFO will also be loaded automatically in load_state as we have already registered it via ACCELERATOR.register_for_checkpointing(STATUS_INFO)
+        checkpoint_dir = resume_from_checkpoint if isinstance(resume_from_checkpoint, str) and os.path.exists(resume_from_checkpoint) else CONFIG["output_dir"]["checkpoint"]
+        load_checkpoint(checkpoint_dir)
+        LOGGER.info("p=%d, Resumed status info %s", ACCELERATOR.process_index, STATUS_INFO.state_dict(), main_process_only=False)
+
+        # Prepare the next epoch and iter indices for continue training
+        epoch_resumed, iter_resumed = STATUS_INFO.get_resumed_epoch_and_iter()
+        LOGGER.info("p=%d, epoch_resumed %d, iter_resumed %d", ACCELERATOR.process_index, epoch_resumed, iter_resumed, main_process_only=False)
+
+    return epoch_resumed, iter_resumed
+
+
 def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
     STATUS_INFO.curr_epoch = curr_epoch
     STATUS_INFO.curr_batch_iter = curr_iter
@@ -742,6 +659,9 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
         STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
 
 
+#############################################
+# Validation
+#############################################
 def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
     train_cfg = CONFIG["train"]
     # global_update_steps == 0 时，默认不评估
@@ -762,10 +682,6 @@ def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
         check_memory()
         eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
         check_results_and_save_model(model, eval_result_dict)
-
-
-def final_test_process(model, test_dataloader):
-    model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
 
 
 def check_results_and_save_model(model, eval_result_dict):
@@ -792,29 +708,105 @@ def check_results_and_save_model(model, eval_result_dict):
         save_model(model, CONFIG["output_dir"]["model"])
 
 
-def check_status_and_resume_checkpoint():
-    epoch_resumed, iter_resumed = 0, 0
-    resume_from_checkpoint = CONFIG["resume_from_checkpoint"]
+#############################################
+# Evaluation
+#############################################
+def evaluate(model, target_dataloader, output_result=False):
+    eval_results = {
+        "present": {
+            "num_gold_label": 0,
+            "num_pred_label": 0,
+            "num_correct_label": 0,
+        },
+        "absent": {
+            "num_gold_label": 0,
+            "num_pred_label": 0,
+            "num_correct_label": 0,
+        },
+        "uncertain": {
+            "num_gold_label": 0,
+            "num_pred_label": 0,
+            "num_correct_label": 0,
+        },
+    }
 
-    if resume_from_checkpoint:
-        LOGGER.info("****************************** Resume checkpoint ******************************")
-        # STATUS_INFO will also be loaded automatically in load_state as we have already registered it via ACCELERATOR.register_for_checkpointing(STATUS_INFO)
-        checkpoint_dir = resume_from_checkpoint if isinstance(resume_from_checkpoint, str) and os.path.exists(resume_from_checkpoint) else CONFIG["output_dir"]["checkpoint"]
-        load_checkpoint(checkpoint_dir)
-        LOGGER.info("p=%d, Resumed status info %s", ACCELERATOR.process_index, STATUS_INFO.state_dict(), main_process_only=False)
+    LOGGER.info("****************************** Evaluation ******************************")
+    LOGGER.info("Source = %s", target_dataloader.dataset.src_path)
+    LOGGER.info("Batch size = %d", CONFIG["eval"]["batch_size"])
+    LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
+    tokenizer = target_dataloader.dataset.tokenizer
 
-        # Prepare the next epoch and iter indices for continue training
-        epoch_resumed, iter_resumed = STATUS_INFO.get_resumed_epoch_and_iter()
-        LOGGER.info("p=%d, epoch_resumed %d, iter_resumed %d", ACCELERATOR.process_index, epoch_resumed, iter_resumed, main_process_only=False)
+    data_ids = []
+    pred_seqs = []
+    gold_seqs = []
 
-    return epoch_resumed, iter_resumed
+    start = time.time()
+    model.eval()
+    with torch.no_grad():
+        for input_tensors_dict in target_dataloader:
+            # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
+            outputs = model.do_generate(
+                pixel_values=input_tensors_dict["pixel_values"],
+                input_ids=input_tensors_dict["input_ids"],
+                attention_mask=input_tensors_dict["attention_mask"],
+                pad_token_id=tokenizer.pad_token_id,
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+            pred_seq_start_ids = input_tensors_dict["input_ids"].size(1)  # 生成的序列的起始位置
+            pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
+            pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
+            gold_sequences = input_tensors_dict["gold_text_list"]
+
+            # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
+            data_ids.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["data_id_list"], use_gather_object=True))
+            pred_seqs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
+            gold_seqs.extend(ACCELERATOR.gather_for_metrics(gold_sequences, use_gather_object=True))
+
+    assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
+    assert len(data_ids) == target_dataloader.total_dataset_length, f"Gathered data size ({len(data_ids)}) should equals to dataset size ({target_dataloader.total_dataset_length})"
+    # LOGGER.debug("p=%s, len=%s, data_ids: %s", ACCELERATOR.process_index, len(data_ids), data_ids)
+    # LOGGER.debug("p=%s, len=%s, pred_seqs: %s", ACCELERATOR.process_index, len(pred_seqs), pred_seqs)
+    # LOGGER.debug("p=%s, len=%s, gold_seqs: %s", ACCELERATOR.process_index, len(gold_seqs), gold_seqs)
+    if output_result:
+        with open(f"{CONFIG['output_dir']['result']}/{target_dataloader.dataset.split}_{ACCELERATOR.process_index}.json", "w") as f:
+            f.write(json.dumps({"gold_seqs": gold_seqs, "pred_seqs": pred_seqs}))
+
+    # Evaluate the results
+    text_scores_dict = compute_generation_score(gold_text_list=gold_seqs, pred_text_list=pred_seqs)
+    LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict))
+
+    if STATUS_INFO:
+        for metric_name, metric_val in text_scores_dict.items():
+            k = f"{STATUS_INFO.curr_eval_split}_{metric_name}"
+            MLFLOW_TRACKER.log({k: metric_val}, step=STATUS_INFO.global_iters)
+
+    end = time.time()
+    LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
+    check_memory()
+    return text_scores_dict
+
+
+def compute_generation_score(gold_text_list, pred_text_list):
+    """Based on the script from https://vilmedic.app/misc/bionlp24/leaderboard#anchor-baseline"""
+    if DEVICE.type == "cpu":
+        use_metrics = ["BLEU", "ROUGEL", "radgraph", "chexbert"]
+    else:
+        use_metrics = ["BLEU", "ROUGEL", "radgraph", "chexbert", "bertscore"]
+
+    refs = [" ".join(wordpunct_tokenize(s.lower())) for s in gold_text_list]
+    hyps = [" ".join(wordpunct_tokenize(s.lower())) for s in pred_text_list]
+
+    # https://github.com/jbdel/vilmedic/blob/main/vilmedic/blocks/scorers/scores.py
+    out_dict = compute_scores(use_metrics, refs=refs, hyps=hyps, split=None, seed=None, config=None, epoch=None, logger=LOGGER, dump=False)
+    out_dict = {k: float(v) for k, v in out_dict.items()}
+    return out_dict
 
 
 #############################################
 # Utils
 #############################################
-
-
 def get_unwrapped_model(model):
     """使用Accelerator后，model 会作为 DistributedDataParallel 的一个attribute（名为module的变量）"""
     if isinstance(model, DistributedDataParallel):
@@ -853,12 +845,6 @@ def load_checkpoint(checkpoint_dir):
 
     ACCELERATOR.load_state(checkpoint_dir)
     LOGGER.info("Checkpoint loaded from %s", checkpoint_dir)
-
-
-def load_model(model_path):
-    model = Vision2LanguageModel.from_pretrained(model_path)
-    LOGGER.info("Pre-trained model loaded from %s", model_path)
-    return model
 
 
 def save_checkpoint(checkpoint_dir, max_to_keep=5):
@@ -905,57 +891,6 @@ def set_seed(seed):
 #############################################
 
 
-def convert_label_str_to_int(label_str, label_type):
-    label_map = {"onehot": {"present": [1, 0, 0], "absent": [0, 1, 0], "uncertain": [0, 0, 1]}, "regression": {"present": 1, "absent": 0, "uncertain": 0.5}}
-    return label_map[label_type][label_str]
-
-
-def get_effusion_label(col_cxrgraph_ent, col_radlex, label_type="onehot"):
-    """
-    label_type:
-        onehot: [present, absent, uncertain]
-        regression: 1=present, 0.5=uncertain, 0=absent
-    """
-
-    is_effusion_uncertain = False
-    if not col_cxrgraph_ent:
-        return convert_label_str_to_int("absent", label_type)  # 默认为absent
-
-    for sent_ents, sent_radlexes in zip(col_cxrgraph_ent, col_radlex):
-        # 获取radlex中的effusion和pleural effusion
-        candidate_nodes = []
-        for radlex in sent_radlexes:
-            if any([rid == radlex["radlex_id"] for rid in ["http://radlex.org/RID/RID4872", "http://radlex.org/RID/RID38588", "http://radlex.org/RID/RID34539"]]):
-                candidate_nodes.append(radlex)
-
-        # 如果ent的start和end，被candidate_radlex覆盖，就返回True
-        def has_matched_candidate(tok_start, tok_end):
-            for start, end in [radlex["tok_indices"] for radlex in candidate_nodes]:
-                if tok_start >= start and tok_end <= end:
-                    return True
-            return False
-
-        # 通过radlex来选择cxrgraph的ent
-        # 如果没有与radlex匹配的ent，那么就默认没有effusion；
-        # 如果有匹配的ent：
-        # 1. 只要有一个 effusion ent 被预测为 Present，就视为有effusion
-        # 2. 对于plueral，其 type 为 Anatomy，不会对默认值产生影响 （默认没有 effusion）
-        for ent in sent_ents:
-            tok_start, tok_end = ent["tok_indices"]
-            if has_matched_candidate(tok_start, tok_end):
-                if ent["ent_type"] == "Observation-Present":
-                    # 只要有一个 effusion ent 被预测为 present, 就直接返回 present
-                    return convert_label_str_to_int("present", label_type)
-                elif ent["ent_type"] == "Observation-Uncertain":
-                    # 如果有一个 effusion ent 被预测为 Uncertain，且没有其他被预测为 present 的 effusion ent，就视为 Uncertain
-                    is_effusion_uncertain = True
-
-    if is_effusion_uncertain:
-        return convert_label_str_to_int("uncertain", label_type)
-    else:
-        return convert_label_str_to_int("absent", label_type)
-
-
 def select_images(images):
     # 根据相似度选择2张图片：如果小于等于2张图片，就直接使用；否则，选择最不相似的两张图片
     selected_images = []
@@ -977,12 +912,33 @@ def select_images(images):
                 if hash_distance > max_hash_distance:
                     max_hash_distance = hash_distance
                     selected_images = [images[i], images[j]]
-                    selected_image_indices = [i, j]
+                    selected_image_indices = [int(i), int(j)]
 
     return selected_images, selected_image_indices
 
 
-def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, convert_to_rgb=True):
+def resize_image_with_bspline_pil(image, target_size=518):
+    # 转换 PIL 图像为 numpy 数组
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+
+    # 计算缩放比例，确保较短边为 target_size
+    scale = target_size / min(h, w)
+    new_h, new_w = int(h * scale), int(w * scale)
+
+    # 计算每个维度的缩放因子
+    zoom_factors = (new_h / h, new_w / w, 1)
+
+    # 使用 B-spline 插值 (order=3 表示 B-spline)
+    resized_array = zoom(img_array, zoom_factors, order=3)
+
+    # 转换回 PIL 图像
+    resized_image = Image.fromarray(np.uint8(resized_array))
+
+    return resized_image
+
+
+def pre_process_dataset(img_processor, img_dataset, text_dataset, shortest_edge, convert_to_rgb=True):
     # align image_ds to text_ds
     ds_textRowId_imgId = []
     for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
@@ -1002,8 +958,6 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, co
     LOGGER.debug("Concatenated image-text dataset dict (aligning image_ds to text_ds): \n%s", filtered_dataset)
 
     def map_func(examples):
-        # 添加 effusion label 作为分类标签: onehot: [present, absent, uncertain]
-        examples["effusion_label"] = [get_effusion_label(col_cxrgraph_ent=cxrgraph_ent, col_radlex=radlex, label_type="regression") for cxrgraph_ent, radlex in zip(examples["cxrgraph_ent"], examples["radlex"])]
 
         # Select images
         # 保存图像的piexl_values会占用极大硬盘空间，且极大的减慢模型训练时的数据读取速度。
@@ -1012,8 +966,8 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, co
         selected_indices_list = []
         for example_idx, images_per_example in enumerate(examples["images"]):
             selected_images, selected_indices = select_images(images_per_example)
-            # 更适合处理含有精细细节的图像（如 X-ray 图像）。 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
-            selected_images = [img.resize(resize_h_w, resample=Image.Resampling.LANCZOS) for img in selected_images]
+            # LANCZOS 更适合处理含有精细细节的图像 (如 X-ray 图像), 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
+            selected_images = [resize_image_with_bspline_pil(img) for img in selected_images]
             selected_images_list.append(selected_images)
             selected_indices_list.append(selected_indices)
 
@@ -1025,33 +979,6 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, resize_h_w, co
     new_dataset = filtered_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])  #
     LOGGER.debug("Preprocessed final dataset dict: \n%s", new_dataset)
     return new_dataset
-
-
-def get_dataloaders(ds_dict, img_processor, tokenizer, use_debug_subset=False):
-    train_cfg = CONFIG["train"]
-    eval_cfg = CONFIG["eval"]
-    # select是dataset caching 操作，主进程优先或许能快一点
-    with ACCELERATOR.main_process_first():
-        if use_debug_subset:
-            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), img_processor=img_processor, tokenizer=tokenizer, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 200, len(ds_dict["validation"]))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 200, len(ds_dict["test"]))), img_processor=img_processor, tokenizer=tokenizer, split="test")
-        else:
-            train_dataset = ImageTextDataset(ds_dict["train"], img_processor=img_processor, tokenizer=tokenizer, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"], img_processor=img_processor, tokenizer=tokenizer, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"], img_processor=img_processor, tokenizer=tokenizer, split="test")
-
-    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_cfg["batch_size"], drop_last=True)
-    valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
-    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
-
-    return train_dataloader, valid_dataloader, test_dataloader
-
-
-def load_preprocessed_dataset(ds_path):
-    ds_final = load_from_disk(ds_path)
-    LOGGER.info("Loaded pre_processed dataset dict: \n%s", ds_final)
-    return ds_final
 
 
 def load_src_datasets(data_paths):
@@ -1095,16 +1022,15 @@ def preprocess_dataset():
     model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
     processor = AutoProcessor.from_pretrained(model_name_or_path)
 
-    if image_processor_name == "clip":
-        img_processor = processor.image_processor
-        resize_h_w = (img_processor.size["shortest_edge"], img_processor.size["shortest_edge"])
-    elif image_processor_name == "swinv2":
+    if image_processor_name == "rad_dino_maira2":
         img_processor = processor
-        resize_h_w = (img_processor.size["height"], img_processor.size["width"])
+        shortest_edge = img_processor.size["shortest_edge"]
+    else:
+        raise ValueError(f"Invalid image_processor_name: {image_processor_name}")
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], resize_h_w=resize_h_w, convert_to_rgb=True)
+        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], shortest_edge=shortest_edge, convert_to_rgb=True)
         # .select(range(len(text_dataset[split]) - 200, len(text_dataset[split])))
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
@@ -1113,6 +1039,44 @@ def preprocess_dataset():
 
 
 #############################################
+
+
+def load_model(model_path):
+    model = Vision2LanguageModel.from_pretrained(model_path)
+    LOGGER.info("Pre-trained model loaded from %s", model_path)
+    return model
+
+
+def load_tokenizer(tokenizer_path):
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    LOGGER.info("Tokenizer loaded from %s", tokenizer_path)
+
+
+def get_dataloaders(ds_dict, img_processor, tokenizer, use_debug_subset=False):
+    train_cfg = CONFIG["train"]
+    eval_cfg = CONFIG["eval"]
+    # select是dataset caching 操作，主进程优先或许能快一点
+    with ACCELERATOR.main_process_first():
+        if use_debug_subset:
+            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), img_processor=img_processor, tokenizer=tokenizer, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 50, len(ds_dict["validation"]))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 10, len(ds_dict["test"]))), img_processor=img_processor, tokenizer=tokenizer, split="test")
+        else:
+            train_dataset = ImageTextDataset(ds_dict["train"], img_processor=img_processor, tokenizer=tokenizer, split="train")
+            vaild_dataset = ImageTextDataset(ds_dict["validation"], img_processor=img_processor, tokenizer=tokenizer, split="validation")
+            test_dataset = ImageTextDataset(ds_dict["test"], img_processor=img_processor, tokenizer=tokenizer, split="test")
+
+    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_cfg["batch_size"], drop_last=True)
+    valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
+    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
+
+    return train_dataloader, valid_dataloader, test_dataloader
+
+
+def load_preprocessed_dataset(ds_path):
+    ds_final = load_from_disk(ds_path)
+    LOGGER.info("Loaded pre_processed dataset dict: \n%s", ds_final)
+    return ds_final
 
 
 def post_init_model_and_tokenizer(model, tokenizer):
@@ -1136,6 +1100,7 @@ def init_model(vision_model_path, language_model_path, model_base_cfg):
 
     LOGGER.info("Initializing vision language mode: %s, %s", vision_model_path, language_model_path)
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(vision_model_path, language_model_path)
+    assert tokenizer.chat_template != None
 
     return model
 
@@ -1316,9 +1281,10 @@ def main():
 
     if CONFIG["do_test"]:
         # Testing
-        # model = load_model(CONFIG["output_dir"]["model"])
-        model = init_model(vision_model_path, language_model_path, model_base_cfg)
-        post_init_model_and_tokenizer(model, tokenizer)
+        model = load_model(CONFIG["output_dir"]["model"])
+        # tokenizer = load_tokenizer(CONFIG["output_dir"]["model"]) # we don't need to load tokenizer again
+        # model = init_model(vision_model_path, language_model_path, model_base_cfg)
+        # post_init_model_and_tokenizer(model, tokenizer)
 
         model.to(DEVICE)
         model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
