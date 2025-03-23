@@ -3,7 +3,7 @@
 #SBATCH --job-name=2_fast_regression_preprocess
 #SBATCH --account=scw2258
 
-# job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
+# Job stdout file. The '%J' = job number. %x = job name
 #SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stdout/stdout_%J.log
 #SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
@@ -25,23 +25,15 @@ echo "Loaded $conda, env: $env"
 nvcc -V
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
-python /scratch/c.c21051562/workspace/arrg_img2text/2_cls_effu_notallimg_fast_regression.py \
+python /scratch/c.c21051562/workspace/arrg_img2text/4_vlgen_effu.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/2_imgcls_notallimg_fast_regression.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --preprocess_dataset \
-    --image_processor swinv2 \
-    --cache_path /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/swinv2_base_resize256
+    --image_processor rad_dino_maira2 \
+    --cache_path /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/rad_dino_maira2_rbg518
 
-python /scratch/c.c21051562/workspace/arrg_img2text/2_cls_effu_notallimg_fast_regression.py \
-    --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/2_imgcls_notallimg_fast_regression.yaml \
-    --output_name $SLURM_JOB_NAME \
-    --jobid $SLURM_JOB_ID \
-    --preprocess_dataset \
-    --image_processor clip \
-    --cache_path /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/clip_base_resize224
 
 echo "Script finished."
 
