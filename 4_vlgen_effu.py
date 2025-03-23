@@ -926,8 +926,13 @@ def resize_image_with_bspline_pil(image, target_size=518):
     scale = target_size / min(h, w)
     new_h, new_w = int(h * scale), int(w * scale)
 
-    # 计算每个维度的缩放因子
-    zoom_factors = (new_h / h, new_w / w, 1)
+    # 根据图像维度计算缩放因子
+    if img_array.ndim == 2:  # 灰度图像
+        zoom_factors = (new_h / h, new_w / w)
+    elif img_array.ndim == 3:  # RGB/多通道图像
+        zoom_factors = (new_h / h, new_w / w, 1)
+    else:
+        raise ValueError(f"Unsupported image dimension: {img_array.ndim}")
 
     # 使用 B-spline 插值 (order=3 表示 B-spline)
     resized_array = zoom(img_array, zoom_factors, order=3)
@@ -958,7 +963,6 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, shortest_edge,
     LOGGER.debug("Concatenated image-text dataset dict (aligning image_ds to text_ds): \n%s", filtered_dataset)
 
     def map_func(examples):
-
         # Select images
         # 保存图像的piexl_values会占用极大硬盘空间，且极大的减慢模型训练时的数据读取速度。
         # 因此预处理只进行resize
