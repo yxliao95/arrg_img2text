@@ -1,14 +1,14 @@
 #!/bin/bash
 
-#SBATCH --job-name=3_cls_mse_loss_rm_uncertain_v100_100epoch
+#SBATCH --job-name=4_vlgen_effu_test_10ep
 #SBATCH --account=scw2258
 
-# job stdout file. The '%J' to Slurm is replaced with the job number. %x = Job name
+# Job stdout file. The '%J' = job number. %x = job name
 #SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stdout/stdout_%J.log
 #SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
-#SBATCH --partition=gpu
+#SBATCH --partition=accel_ai_dev
 #SBATCH --gres=gpu:2
 ### SBATCH -t 0-00:00
 
@@ -37,9 +37,9 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 accelerate launch\
     --multi_gpu \
     --main_process_port 29555 \
-    /scratch/c.c21051562/workspace/arrg_img2text/3_cls_mse_loss_rm_uncertain.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/4_vlgen_effu.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/3_cls_mse_loss_rm_uncertain.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     # --resume_from_checkpoint

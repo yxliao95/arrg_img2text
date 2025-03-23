@@ -1,5 +1,6 @@
 #############################################
-# 改用生成模型
+# 基于3_cls_mse_loss_rm_uncertain.py修改
+# 改用 encoder decoder 模型
 #############################################
 import argparse
 import datetime
@@ -387,6 +388,7 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
 
     assistant_masks = None
     if "assistant_masks" in input_text_tensor_dict:
+        print(input_text_tensor_dict.assistant_masks)
         assistant_masks = input_text_tensor_dict.assistant_masks.to(DEVICE)
 
     gold_text_list = None
@@ -530,13 +532,27 @@ def train(model, train_dataloader, valid_dataloader):
     adaptor_params = [(n, p) for n, p in model_params if n.startswith("adaptor")]
 
     no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
-    optimizer_grouped_parameters = [
-        {"params": [p for n, p in encoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
-        {"params": [p for n, p in encoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-        {"params": [p for n, p in decoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
-        {"params": [p for n, p in decoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-        {"params": [p for n, p in adaptor_params], "lr": train_cfg["lr"], "weight_decay": 0.0},
-    ]
+    optimizer_grouped_parameters = []
+    if not train_cfg["freeze_encoder"]:
+        optimizer_grouped_parameters.extend(
+            [
+                {"params": [p for n, p in encoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
+                {"params": [p for n, p in encoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
+            ]
+        )
+    if not train_cfg["freeze_decoder"]:
+        optimizer_grouped_parameters.extend(
+            [
+                {"params": [p for n, p in decoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
+                {"params": [p for n, p in decoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
+            ]
+        )
+    if not train_cfg["freeze_adaptor"]:
+        optimizer_grouped_parameters.extend(
+            [
+                {"params": [p for n, p in adaptor_params], "lr": train_cfg["lr"], "weight_decay": 0.0},
+            ]
+        )
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
@@ -1101,10 +1117,8 @@ def post_init_model_and_tokenizer(model, tokenizer):
 
 
 def init_model(vision_model_path, language_model_path, model_base_cfg):
-
     LOGGER.info("Initializing vision language mode: %s, %s", vision_model_path, language_model_path)
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(vision_model_path, language_model_path)
-    assert tokenizer.chat_template != None
 
     return model
 
