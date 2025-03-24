@@ -527,15 +527,15 @@ def train(model, train_dataloader, valid_dataloader):
     global MLFLOW_TRACKER, STATUS_INFO
 
     train_cfg = CONFIG["train"]
+    print("model\n", model)
+    print("unwrapped_model\n", unwrapped_model)
+    print("optimizer_grouped_parameters\n", [(n, p) for n, p in model_params])
 
     # hyperparameters
     unwrapped_model = get_unwrapped_model(model)
     model_params = list(unwrapped_model.named_parameters())
     optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
 
-    print("model\n", model)
-    print("unwrapped_model\n", unwrapped_model)
-    print("optimizer_grouped_parameters\n", optimizer_grouped_parameters)
     return
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
