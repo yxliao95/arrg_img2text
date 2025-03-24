@@ -24,11 +24,11 @@ model_name_or_path:
   llama32_1b: /home/yuxiang/liao/resources/downloaded_models/Llama-3.2-1B
 
 # The image processor depends on the model.vision_backbone
-preprocess_dataset: True
+preprocess_dataset: False
 preprocess:
   image_processor: rad_dino_maira2
   text_processor: llama32_1b
-  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/rad_dino_maira2_rbg518 # clipbase_rbg224
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_rbg224 # rad_dino_maira2_rbg518
   batched: True
   batch_size: 32
   num_proc: 12
@@ -47,6 +47,10 @@ model:
   chat_template: /home/yuxiang/liao/workspace/arrg_img2text/llama3_chat_template.jinja
 
 train:
+  freeze_encoder: True
+  freeze_decoder: False
+  freeze_adaptor: False
+
   seed: 42
   batch_size: 2
   num_epochs: 10
@@ -55,7 +59,7 @@ train:
   weight_decay: 0.0
   lr: 0.00001
   clip_grad_norm: 1.0
-  mixed_precision: "bf16" # ‘no’,‘fp16’,‘bf16’. bf16 for A100 and cpu, fp16 for V100
+  mixed_precision: "fp16" # ‘no’,‘fp16’,‘bf16’. bf16 for A100 and cpu, fp16 for V100
 
   print_loss_per_n_steps: 1
   eval_per_steps: 2

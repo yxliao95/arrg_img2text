@@ -1157,7 +1157,6 @@ def post_init_model_and_tokenizer(model, tokenizer):
 def init_model(vision_model_path, language_model_path, model_base_cfg):
     LOGGER.info("Initializing vision language mode: %s, %s", vision_model_path, language_model_path)
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(vision_model_path, language_model_path)
-
     return model
 
 
