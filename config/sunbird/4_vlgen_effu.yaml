@@ -36,9 +36,8 @@ preprocess:
 # path to checkpoint or, bool;
 # if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
 resume_from_checkpoint: False
-do_train: True
-# if do_test=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
-do_test: True
+# if test_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
+test_only: False
 use_debug_subset: False
 
 model:
@@ -52,8 +51,8 @@ train:
   freeze_adaptor: False
 
   seed: 42
-  num_epochs: 10
-  batch_size: 8
+  num_epochs: 1
+  batch_size: 1
   grad_accum_steps: 4
   warmup_proportion: 0.1
 
@@ -67,4 +66,5 @@ train:
 
 eval:
   batch_size: 16
+  max_new_tokens: 512
 

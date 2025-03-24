@@ -27,7 +27,13 @@ import transformers
 import yaml
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.logging import MultiProcessAdapter
-from accelerate.utils import GradientAccumulationPlugin, gather, gather_object, set_seed
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    FullyShardedDataParallelPlugin,
+    GradientAccumulationPlugin,
+    gather,
+    gather_object,
+)
 from datasets import DatasetDict, concatenate_datasets, load_from_disk
 from nltk.tokenize import wordpunct_tokenize
 from PIL import Image
@@ -43,15 +49,11 @@ from transformers import (
     AutoImageProcessor,
     AutoProcessor,
     AutoTokenizer,
-    CLIPVisionConfig,
-    CLIPVisionModel,
     Dinov2Config,
     Dinov2Model,
     LlamaConfig,
     PretrainedConfig,
     PreTrainedModel,
-    Swinv2Config,
-    Swinv2Model,
     VisionEncoderDecoderModel,
     get_linear_schedule_with_warmup,
 )
@@ -242,6 +244,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         input_ids: torch.LongTensor = None,
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens=128,
         **kwargs,
     ):
 
@@ -262,7 +265,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
             pad_token_id=kwargs["pad_token_id"],
             bos_token_id=kwargs["bos_token_id"],
             eos_token_id=kwargs["eos_token_id"],
-            max_new_tokens=20,
+            max_new_tokens=max_new_tokens,
             do_sample=False,
             num_beams=3,
             return_dict_in_generate=True,
@@ -388,8 +391,10 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
 
     assistant_masks = None
     if "assistant_masks" in input_text_tensor_dict:
-        print(input_text_tensor_dict.assistant_masks)
-        assistant_masks = input_text_tensor_dict.assistant_masks.to(DEVICE)
+        assistant_masks = input_text_tensor_dict.assistant_masks
+        if isinstance(assistant_masks, list):  # transformers==4.47.1 will return assistant_masks in nested list
+            assistant_masks = torch.tensor(assistant_masks)
+        assistant_masks = assistant_masks.to(DEVICE)
 
     gold_text_list = None
     if do_inference:
@@ -526,33 +531,12 @@ def train(model, train_dataloader, valid_dataloader):
     # hyperparameters
     unwrapped_model = get_unwrapped_model(model)
     model_params = list(unwrapped_model.named_parameters())
+    optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
 
-    encoder_params = [(n, p) for n, p in model_params if n.startswith("encoder")]
-    decoder_params = [(n, p) for n, p in model_params if n.startswith("decoder")]
-    adaptor_params = [(n, p) for n, p in model_params if n.startswith("adaptor")]
-
-    no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
-    optimizer_grouped_parameters = []
-    if not train_cfg["freeze_encoder"]:
-        optimizer_grouped_parameters.extend(
-            [
-                {"params": [p for n, p in encoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
-                {"params": [p for n, p in encoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-            ]
-        )
-    if not train_cfg["freeze_decoder"]:
-        optimizer_grouped_parameters.extend(
-            [
-                {"params": [p for n, p in decoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
-                {"params": [p for n, p in decoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-            ]
-        )
-    if not train_cfg["freeze_adaptor"]:
-        optimizer_grouped_parameters.extend(
-            [
-                {"params": [p for n, p in adaptor_params], "lr": train_cfg["lr"], "weight_decay": 0.0},
-            ]
-        )
+    print("model\n", model)
+    print("unwrapped_model\n", unwrapped_model)
+    print("optimizer_grouped_parameters\n", optimizer_grouped_parameters)
+    return
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
@@ -608,7 +592,7 @@ def train(model, train_dataloader, valid_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["effusion_labels"].size(0), lr=scheduler.get_last_lr()[0])
+                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["input_ids"].size(0), lr=scheduler.get_last_lr()[0])
 
                 # eval and save
                 validation_process(model, valid_dataloader, max_num_iters_per_epoch=len(train_dataloader))
@@ -618,6 +602,45 @@ def train(model, train_dataloader, valid_dataloader):
 
     LOGGER.info("Best achieved: %s", STATUS_INFO.dev_best)
     MLFLOW_TRACKER.finish()
+
+
+def prepare_optimizer_grouped_parameters(model_params, train_cfg):
+    encoder_params = [(n, p) for n, p in model_params if n.startswith("encoder")]
+    decoder_params = [(n, p) for n, p in model_params if n.startswith("decoder")]
+    adaptor_params = [(n, p) for n, p in model_params if n.startswith("adaptor")]
+
+    # # 冻结 encoder 参数
+    # for n, p in encoder_params:
+    #     p.requires_grad = False if train_cfg["freeze_encoder"] else True
+
+    # # 冻结 decoder 参数
+    # for n, p in decoder_params:
+    #     p.requires_grad = False if train_cfg["freeze_decoder"] else True
+
+    # # 冻结 adaptor 参数
+    # for n, p in adaptor_params:
+    #     p.requires_grad = False if train_cfg["freeze_adaptor"] else True
+
+    no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
+    optimizer_grouped_parameters = []
+    if not train_cfg["freeze_encoder"]:
+        optimizer_grouped_parameters.extend(
+            [
+                {"params": [p for n, p in encoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
+                {"params": [p for n, p in encoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
+            ]
+        )
+    if not train_cfg["freeze_decoder"]:
+        optimizer_grouped_parameters.extend(
+            [
+                {"params": [p for n, p in decoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
+                {"params": [p for n, p in decoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
+            ]
+        )
+    if not train_cfg["freeze_adaptor"]:
+        optimizer_grouped_parameters.append({"params": [p for n, p in adaptor_params], "lr": train_cfg["lr"], "weight_decay": 0.0})
+
+    return optimizer_grouped_parameters
 
 
 def check_status_and_resume_checkpoint():
@@ -768,6 +791,7 @@ def evaluate(model, target_dataloader, output_result=False):
                 pad_token_id=tokenizer.pad_token_id,
                 bos_token_id=tokenizer.bos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                max_new_tokens=CONFIG["eval"]["max_new_tokens"],
             )
 
             pred_seq_start_ids = input_tensors_dict["input_ids"].size(1)  # 生成的序列的起始位置
@@ -1063,32 +1087,46 @@ def preprocess_dataset():
 
 def load_model(model_path):
     model = Vision2LanguageModel.from_pretrained(model_path)
-    LOGGER.info("Pre-trained model loaded from %s", model_path)
+    LOGGER.info("Fine-tuned model loaded from %s", model_path)
     return model
 
 
-def load_tokenizer(tokenizer_path):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    LOGGER.info("Tokenizer loaded from %s", tokenizer_path)
+def load_processor(processor_path):
+    img_processor = AutoProcessor.from_pretrained(processor_path)
+    tokenizer = AutoTokenizer.from_pretrained(processor_path)
+    LOGGER.info("Image_processor and tokenizer are loaded from %s", processor_path)
+    return img_processor, tokenizer
 
 
-def get_dataloaders(ds_dict, img_processor, tokenizer, use_debug_subset=False):
+def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_test=None, use_debug_subset=False):
     train_cfg = CONFIG["train"]
     eval_cfg = CONFIG["eval"]
-    # select是dataset caching 操作，主进程优先或许能快一点
-    with ACCELERATOR.main_process_first():
-        if use_debug_subset:
-            train_dataset = ImageTextDataset(ds_dict["train"].select(range(len(ds_dict["train"]) - 200, len(ds_dict["train"]))), img_processor=img_processor, tokenizer=tokenizer, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"].select(range(len(ds_dict["validation"]) - 50, len(ds_dict["validation"]))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"].select(range(len(ds_dict["test"]) - 10, len(ds_dict["test"]))), img_processor=img_processor, tokenizer=tokenizer, split="test")
-        else:
-            train_dataset = ImageTextDataset(ds_dict["train"], img_processor=img_processor, tokenizer=tokenizer, split="train")
-            vaild_dataset = ImageTextDataset(ds_dict["validation"], img_processor=img_processor, tokenizer=tokenizer, split="validation")
-            test_dataset = ImageTextDataset(ds_dict["test"], img_processor=img_processor, tokenizer=tokenizer, split="test")
 
-    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_cfg["batch_size"], drop_last=True)
-    valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
-    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
+    train_dataloader, valid_dataloader, test_dataloader = None, None, None
+
+    if ds_train:
+        with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
+            if use_debug_subset:
+                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 200, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
+            else:
+                train_dataset = ImageTextDataset(ds_train, img_processor=img_processor, tokenizer=tokenizer, split="train")
+        train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_cfg["batch_size"], drop_last=True)
+
+    if ds_valid:
+        with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
+            if use_debug_subset:
+                vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 50, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
+            else:
+                vaild_dataset = ImageTextDataset(ds_valid, img_processor=img_processor, tokenizer=tokenizer, split="validation")
+        valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
+
+    if ds_test:
+        with ACCELERATOR.main_process_first():
+            if use_debug_subset:
+                test_dataset = ImageTextDataset(ds_test.select(range(len(ds_test) - 10, len(ds_test))), img_processor=img_processor, tokenizer=tokenizer, split="test")
+            else:
+                test_dataset = ImageTextDataset(ds_test, img_processor=img_processor, tokenizer=tokenizer, split="test")
+        test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
 
     return train_dataloader, valid_dataloader, test_dataloader
 
@@ -1160,15 +1198,46 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
     return img_processor, tokenizer
 
 
-def init_accelerator():
+def global_init_accelerator(model):
     global ACCELERATOR, DEVICE, LOGGER
 
-    dataloader_cfg = DataLoaderConfiguration(use_seedable_sampler=True)
+    # 收集需要忽略的模块实例，而不是类名
+    ignored_modules = []
+    for _, module in model.named_modules():
+        if isinstance(module, (VisionLanguageAdaptor)):
+            ignored_modules.append(module)
+
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        sharding_strategy="SHARD_GRAD_OP",  # FULL_SHARD, SHARD_GRAD_OP, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
+        backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
+        auto_wrap_policy="transformer_based_wrap",  # transformer_based_wrap, size_based_wrap, or no_wrap
+        cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。
+        ignored_modules=ignored_modules,
+        state_dict_type="FULL_STATE_DICT",  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
+        use_orig_params=False,
+        activation_checkpointing=False,
+        cpu_ram_efficient_loading=True,
+        sync_module_states=True,
+    )
+
     # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
     # 如果OOM，可以尝试设置 sync_each_batch=True，但是会导致训练速度变慢
     # adjust_scheduler=False，我们在train方法中手动计算 scheduler 在使用梯度累计后的 step
-    plugin = GradientAccumulationPlugin(num_steps=CONFIG["train"]["grad_accum_steps"], adjust_scheduler=False, sync_with_dataloader=True)
-    ACCELERATOR = Accelerator(mixed_precision=CONFIG["train"]["mixed_precision"], dataloader_config=dataloader_cfg, gradient_accumulation_plugin=plugin)
+    ga_plugin = GradientAccumulationPlugin(
+        num_steps=CONFIG["train"]["grad_accum_steps"],
+        adjust_scheduler=False,
+        sync_with_dataloader=True,
+        sync_each_batch=True,
+    )
+
+    dataloader_cfg = DataLoaderConfiguration(use_seedable_sampler=True)
+
+    ACCELERATOR = Accelerator(
+        mixed_precision=CONFIG["train"]["mixed_precision"],
+        dataloader_config=dataloader_cfg,
+        gradient_accumulation_plugin=ga_plugin,
+        fsdp_plugin=fsdp_plugin,
+    )
     DEVICE = ACCELERATOR.device
 
     if ACCELERATOR.is_local_main_process:
@@ -1178,15 +1247,15 @@ def init_accelerator():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
-    LOGGER = MultiProcessAdapter(LOGGER, {})
+    LOGGER = MultiProcessAdapter(LOGGER, {})  # must initialize the accelerate state by calling either `PartialState()` or `Accelerator()` before using the logging utility.
     LOGGER.info("Available cuda: %d", torch.cuda.device_count())
-    LOGGER.info("Accelerator state: %s", ACCELERATOR.state)
+    LOGGER.info("Accelerator state: %s", ACCELERATOR.state, main_process_only=False)
     LOGGER.info("Accelerator mixed_precision: %s", ACCELERATOR.mixed_precision)
     LOGGER.info("Accelerator process idx: %d, device: %s", ACCELERATOR.process_index, ACCELERATOR.device)
     LOGGER.info([i for i in CONFIG.items() if i[0][0] != "_"])
 
 
-def init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO):
+def global_init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO):
     global LOGGER
 
     log_file_mode = "w"
@@ -1212,7 +1281,7 @@ def init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO):
     LOGGER.root.setLevel(root_log_level)  # Other libraries' loggers will inherit this level
 
 
-def init_proj_config():
+def global_init_proj_config():
     global CONFIG
 
     parser = argparse.ArgumentParser()
@@ -1267,25 +1336,25 @@ def init_proj_config():
 
 
 def main():
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-
-    init_accelerator()
+    # Train and test
     set_seed(CONFIG["train"]["seed"])
-
-    img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
-    train_dataloader, valid_dataloader, test_dataloader = get_dataloaders(ds_final, img_processor=img_processor, tokenizer=tokenizer, use_debug_subset=CONFIG["use_debug_subset"])
 
-    if CONFIG["do_train"]:
-        # Training
+    if not CONFIG["test_only"]:
+        model_base_cfg = CONFIG["model"]
+        vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+        language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+
+        img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
         model = init_model(vision_model_path, language_model_path, model_base_cfg)
         post_init_model_and_tokenizer(model, tokenizer)
 
+        global_init_accelerator(model)
         model.to(DEVICE)
         model = ACCELERATOR.prepare(model)
+
+        train_dataloader, valid_dataloader, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], ds_valid=ds_final["validation"], use_debug_subset=CONFIG["use_debug_subset"])
+
         check_memory()
 
         start = time.time()
@@ -1295,14 +1364,15 @@ def main():
 
         img_processor.save_pretrained(CONFIG["output_dir"]["model"])
         tokenizer.save_pretrained(CONFIG["output_dir"]["model"])
-        LOGGER.info("Tokenizer and Image Processor are saved to: %s", CONFIG["output_dir"]["model"])
+        LOGGER.info("Image Processor and tokenizer are saved to: %s", CONFIG["output_dir"]["model"])
 
-    if CONFIG["do_test"]:
+    else:
         # Testing
         model = load_model(CONFIG["output_dir"]["model"])
-        # tokenizer = load_tokenizer(CONFIG["output_dir"]["model"]) # we don't need to load tokenizer again
-        # model = init_model(vision_model_path, language_model_path, model_base_cfg)
-        # post_init_model_and_tokenizer(model, tokenizer)
+        img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+        global_init_accelerator(model)
+
+        _, _, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
 
         model.to(DEVICE)
         model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
@@ -1314,8 +1384,8 @@ def main():
 
 
 if __name__ == "__main__":
-    init_proj_config()
-    init_logger()
+    global_init_proj_config()
+    global_init_logger()
     LOGGER.debug(CONFIG)
 
     start0 = time.time()

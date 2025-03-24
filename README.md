@@ -7,12 +7,11 @@ We are using CUDA/12.4
 - `conda create -n arrg_img2text python=3.11 -y`
 - `conda activate arrg_img2text`
 - `conda install -y pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.4 -c pytorch -c nvidia`
-- `pip install transformers` (==4.47.1)
+- `pip install transformers` (==4.49.0)
 - `pip install datasets` (==3.2.0)
 - `pip install imagehash` (==4.3.1)
-    - `pip install transformers==4.47.1 datasets==3.2.0 imagehash==4.3.1`
 - `pip install tensorboard` (==2.18.0)
-- `pip install accelerate` (==1.2.1)
+- `pip install accelerate` (==1.5.2)
 - `pip install mlflow` (==2.19.0)
 - `pip install sentencepiece` (==0.2.0)
 
