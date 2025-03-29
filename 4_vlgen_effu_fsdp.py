@@ -555,12 +555,13 @@ def train(model, train_dataloader, valid_dataloader):
     ACCELERATOR.register_for_checkpointing(STATUS_INFO)
 
     # TODO
-    for i, param_group in enumerate(optimizer.param_groups):
-        LOGGER.debug("[gpu%s], Parameter Group %s", ACCELERATOR.process_index, i, main_process_only=False)
-        print(f"")
-        LOGGER.debug("[gpu%s],  - Learning rate: %s", ACCELERATOR.process_index, param_group["lr"], main_process_only=False)
-        for param in param_group["params"]:
-            LOGGER.debug("[gpu%s],     - Shape: %s", ACCELERATOR.process_index, param.shape, main_process_only=False)
+    LOGGER.debug("model\n %s", model)
+    # for i, param_group in enumerate(optimizer.param_groups):
+    #     LOGGER.debug("[gpu%s], Parameter Group %s", ACCELERATOR.process_index, i, main_process_only=False)
+    #     print(f"")
+    #     LOGGER.debug("[gpu%s],  - Learning rate: %s", ACCELERATOR.process_index, param_group["lr"], main_process_only=False)
+    #     for param in param_group["params"]:
+    #         LOGGER.debug("[gpu%s],     - Shape: %s", ACCELERATOR.process_index, param.shape, main_process_only=False)
     return
 
     # 2. Check and resume checkpoint if needed
@@ -1224,17 +1225,20 @@ def global_init_accelerator(model):
         if isinstance(module, (VisionLanguageAdaptor)):
             ignored_modules.append(module)
 
+    # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
     fsdp_plugin = FullyShardedDataParallelPlugin(
-        sharding_strategy="SHARD_GRAD_OP",  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
-        backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
+        fsdp_version=2,
+        # sharding_strategy="SHARD_GRAD_OP",  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
+        # backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
+        reshard_after_forward=False,  # true (previously FULL_SHARD) or false (previously SHARD_GRAD_OP); defaults to 'FULL_SHARD' for fsdp_version=1 and True for fsdp_version=2)
         auto_wrap_policy="transformer_based_wrap",  # transformer_based_wrap, size_based_wrap, or no_wrap
         cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。
         # ignored_modules=ignored_modules,
-        state_dict_type="SHARDED_STATE_DICT",  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
-        use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等
+        state_dict_type="SHARDED_STATE_DICT",  # FSDP2 的默认选项是 SHARDED_STATE_DICT，它不会导致额外的通信，而且每个等级都会保存自己的分片；另一个可能的选项是 FULL_STATE_DICT，它会导致额外的通信和内存使用量激增，但会从等级 0 开始保存完整的模型。FULL_STATE_DICT 尚不支持加速。
+        # use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等; FSDP2 uses a DTensor class on the background, which means it always uses the original parameters by default
         activation_checkpointing=False,
-        cpu_ram_efficient_loading=True,
-        sync_module_states=True,
+        cpu_ram_efficient_loading=True,  # if true, FSDP2 will similarly load the model only on rank 0, and then parameters get synced to other ranks, this is the same behavior as FSDP1, however, setting --fsdp_sync_module_states isn’t required anymore
+        # sync_module_states=True,
     )
 
     # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
