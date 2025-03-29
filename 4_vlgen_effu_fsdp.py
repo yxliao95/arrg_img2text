@@ -527,25 +527,41 @@ def train(model, train_dataloader, valid_dataloader):
     global MLFLOW_TRACKER, STATUS_INFO
 
     train_cfg = CONFIG["train"]
-    print("model\n", model)
-    print("unwrapped_model\n", unwrapped_model)
-    print("optimizer_grouped_parameters\n", [(n, p) for n, p in model_params])
 
     # hyperparameters
-    unwrapped_model = get_unwrapped_model(model)
-    model_params = list(unwrapped_model.named_parameters())
+    model_params = list(model.named_parameters())
     optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
 
-    return
+    # TODO remove debug
+    # LOGGER.debug("model\n %s", model)
+    # LOGGER.debug("%s, optimizer_grouped_parameters\n %s", ACCELERATOR.process_index, optimizer_grouped_parameters, main_process_only=False)
+    # frozen_params = []
+    # trainable_params = []
+    # for name, param in model.named_parameters():
+    #     if not param.requires_grad:
+    #         frozen_params.append(name)
+    #     else:
+    #         trainable_params.append(name)
+    # LOGGER.debug("frozen_params\n %s", frozen_params)
+    # LOGGER.debug("trainable_params\n %s", trainable_params)
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
 
     # 1. Prepare for multi GPUs. All prepared and registered objs will be checkpointed automatically
-    train_dataloader, valid_dataloader, optimizer, scheduler = ACCELERATOR.prepare(train_dataloader, valid_dataloader, optimizer, scheduler)
+    model, train_dataloader, valid_dataloader, optimizer, scheduler = ACCELERATOR.prepare(model, train_dataloader, valid_dataloader, optimizer, scheduler)
     STATUS_INFO = StatusInfo()
     ACCELERATOR.register_for_checkpointing(STATUS_INFO)
+
+    # TODO
+    for i, param_group in enumerate(optimizer.param_groups):
+        LOGGER.debug("[gpu%s], Parameter Group %s", ACCELERATOR.process_index, i, main_process_only=False)
+        print(f"")
+        LOGGER.debug("[gpu%s],  - Learning rate: %s", ACCELERATOR.process_index, param_group["lr"], main_process_only=False)
+        for param in param_group["params"]:
+            LOGGER.debug("[gpu%s],     - Shape: %s", ACCELERATOR.process_index, param.shape, main_process_only=False)
+    return
 
     # 2. Check and resume checkpoint if needed
     epoch_resumed, iter_resumed = check_status_and_resume_checkpoint()
@@ -605,21 +621,24 @@ def train(model, train_dataloader, valid_dataloader):
 
 
 def prepare_optimizer_grouped_parameters(model_params, train_cfg):
+    # 为了节省计算资源和显存，应将需要冻结的参数的 `requires_grad` 显式设置为 `False`，并且在优化器中过滤不可训练参数
+
     encoder_params = [(n, p) for n, p in model_params if n.startswith("encoder")]
     decoder_params = [(n, p) for n, p in model_params if n.startswith("decoder")]
     adaptor_params = [(n, p) for n, p in model_params if n.startswith("adaptor")]
+    assert encoder_params and decoder_params and adaptor_params
 
-    # # 冻结 encoder 参数
-    # for n, p in encoder_params:
-    #     p.requires_grad = False if train_cfg["freeze_encoder"] else True
+    # 冻结 encoder 参数
+    for n, p in encoder_params:
+        p.requires_grad = False if train_cfg["freeze_encoder"] else True
 
-    # # 冻结 decoder 参数
-    # for n, p in decoder_params:
-    #     p.requires_grad = False if train_cfg["freeze_decoder"] else True
+    # 冻结 decoder 参数
+    for n, p in decoder_params:
+        p.requires_grad = False if train_cfg["freeze_decoder"] else True
 
-    # # 冻结 adaptor 参数
-    # for n, p in adaptor_params:
-    #     p.requires_grad = False if train_cfg["freeze_adaptor"] else True
+    # 冻结 adaptor 参数
+    for n, p in adaptor_params:
+        p.requires_grad = False if train_cfg["freeze_adaptor"] else True
 
     no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
     optimizer_grouped_parameters = []
@@ -847,12 +866,6 @@ def compute_generation_score(gold_text_list, pred_text_list):
 #############################################
 # Utils
 #############################################
-def get_unwrapped_model(model):
-    """使用Accelerator后，model 会作为 DistributedDataParallel 的一个attribute（名为module的变量）"""
-    if isinstance(model, DistributedDataParallel):
-        return ACCELERATOR.unwrap_model(model)
-    else:
-        return model
 
 
 def check_memory():
@@ -889,7 +902,7 @@ def load_checkpoint(checkpoint_dir):
 
 def save_checkpoint(checkpoint_dir, max_to_keep=5):
     ckp_path = os.path.join(checkpoint_dir, f"epoch_{STATUS_INFO.curr_epoch}_iter_{STATUS_INFO.curr_batch_iter}")
-    ACCELERATOR.save_state(ckp_path, safe_serialization=False)
+    ACCELERATOR.save_state(ckp_path)
     LOGGER.info("Checkpoint saved to %s", ckp_path)
 
     # 如果文件数量超过 max_to_keep，删除旧的 checkpoint
@@ -907,7 +920,12 @@ def save_checkpoint(checkpoint_dir, max_to_keep=5):
 
 def save_model(model, output_dir):
     unwrapped_model = ACCELERATOR.unwrap_model(model)
-    unwrapped_model.save_pretrained(output_dir, is_main_process=ACCELERATOR.is_main_process, save_function=ACCELERATOR.save)
+    unwrapped_model.save_pretrained(
+        output_dir,
+        is_main_process=ACCELERATOR.is_main_process,
+        save_function=ACCELERATOR.save,
+        state_dict=accelerator.get_state_dict(model),
+    )
     LOGGER.info("Model saved to %s", output_dir)
 
 
@@ -1207,13 +1225,13 @@ def global_init_accelerator(model):
             ignored_modules.append(module)
 
     fsdp_plugin = FullyShardedDataParallelPlugin(
-        sharding_strategy="SHARD_GRAD_OP",  # FULL_SHARD, SHARD_GRAD_OP, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
+        sharding_strategy="SHARD_GRAD_OP",  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
         backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
         auto_wrap_policy="transformer_based_wrap",  # transformer_based_wrap, size_based_wrap, or no_wrap
         cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。
-        ignored_modules=ignored_modules,
-        state_dict_type="FULL_STATE_DICT",  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
-        use_orig_params=False,
+        # ignored_modules=ignored_modules,
+        state_dict_type="SHARDED_STATE_DICT",  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
+        use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等
         activation_checkpointing=False,
         cpu_ram_efficient_loading=True,
         sync_module_states=True,
@@ -1350,7 +1368,6 @@ def main():
 
         global_init_accelerator(model)
         model.to(DEVICE)
-        model = ACCELERATOR.prepare(model)
 
         train_dataloader, valid_dataloader, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], ds_valid=ds_final["validation"], use_debug_subset=CONFIG["use_debug_subset"])
 
@@ -1380,6 +1397,9 @@ def main():
         evaluate(model, test_dataloader, output_result=True)
         end = time.time()
         LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
+
+    if torch.distributed.is_initialized() and ACCELERATOR and ACCELERATOR.is_main_process:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

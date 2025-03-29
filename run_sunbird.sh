@@ -37,7 +37,7 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 accelerate launch\
     --multi_gpu \
     --main_process_port 29555 \
-    /scratch/c.c21051562/workspace/arrg_img2text/4_vlgen_effu.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/4_vlgen_effu_fsdp.py \
     --from_bash \
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu.yaml \
     --output_name $SLURM_JOB_NAME \
