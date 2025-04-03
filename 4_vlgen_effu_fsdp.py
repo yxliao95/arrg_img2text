@@ -40,7 +40,8 @@ from PIL import Image
 from scipy.ndimage import zoom
 from scorers.scores import compute_scores
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel
+from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
@@ -58,6 +59,8 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 from transformers.modeling_outputs import BaseModelOutput, ModelOutput
+from transformers.models.dinov2.modeling_dinov2 import Dinov2Embeddings
+from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 CONFIG = None
 LOGGER = None
@@ -247,7 +250,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         max_new_tokens=128,
         **kwargs,
     ):
-
         # As the batch size between input_ids and pixel_values may be different,
         # we construct a dummy_inputs to ensure generate() method can use the correct batch size,
         # which should be equals to input_ids's batch size.
@@ -430,6 +432,8 @@ class StatusInfo:
 
     run_id: dict = field(default="")
 
+    peak_reserved: int = field(default=0)
+
     def is_achieving_best_dev_score(self, text_score):
         if text_score >= self.dev_best["text_score"]:
             self.dev_best["text_score"] = text_score
@@ -523,6 +527,8 @@ class MLflowTracker:
 #############################################
 # Training
 #############################################
+
+
 def train(model, train_dataloader, valid_dataloader):
     global MLFLOW_TRACKER, STATUS_INFO
 
@@ -532,19 +538,6 @@ def train(model, train_dataloader, valid_dataloader):
     model_params = list(model.named_parameters())
     optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
 
-    # TODO remove debug
-    # LOGGER.debug("model\n %s", model)
-    # LOGGER.debug("%s, optimizer_grouped_parameters\n %s", ACCELERATOR.process_index, optimizer_grouped_parameters, main_process_only=False)
-    # frozen_params = []
-    # trainable_params = []
-    # for name, param in model.named_parameters():
-    #     if not param.requires_grad:
-    #         frozen_params.append(name)
-    #     else:
-    #         trainable_params.append(name)
-    # LOGGER.debug("frozen_params\n %s", frozen_params)
-    # LOGGER.debug("trainable_params\n %s", trainable_params)
-
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
@@ -553,16 +546,7 @@ def train(model, train_dataloader, valid_dataloader):
     model, train_dataloader, valid_dataloader, optimizer, scheduler = ACCELERATOR.prepare(model, train_dataloader, valid_dataloader, optimizer, scheduler)
     STATUS_INFO = StatusInfo()
     ACCELERATOR.register_for_checkpointing(STATUS_INFO)
-
-    # TODO
-    LOGGER.debug("model\n %s", model)
-    # for i, param_group in enumerate(optimizer.param_groups):
-    #     LOGGER.debug("[gpu%s], Parameter Group %s", ACCELERATOR.process_index, i, main_process_only=False)
-    #     print(f"")
-    #     LOGGER.debug("[gpu%s],  - Learning rate: %s", ACCELERATOR.process_index, param_group["lr"], main_process_only=False)
-    #     for param in param_group["params"]:
-    #         LOGGER.debug("[gpu%s],     - Shape: %s", ACCELERATOR.process_index, param.shape, main_process_only=False)
-    return
+    LOGGER.debug("Model Structure: \n %s", model)
 
     # 2. Check and resume checkpoint if needed
     epoch_resumed, iter_resumed = check_status_and_resume_checkpoint()
@@ -576,7 +560,6 @@ def train(model, train_dataloader, valid_dataloader):
     LOGGER.info("Total optimization steps = %d", total_num_steps)
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
     LOGGER.info("Accelerator mixed_precision = %s", ACCELERATOR.mixed_precision)
-
     check_memory()
 
     model.zero_grad()
@@ -609,6 +592,7 @@ def train(model, train_dataloader, valid_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
+                check_memory(show_only_if_peak=True)
                 log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["input_ids"].size(0), lr=scheduler.get_last_lr()[0])
 
                 # eval and save
@@ -748,9 +732,12 @@ def check_results_and_save_model(model, eval_result_dict):
     text_score = 0
     num_metrics = 0
     for metric_key in ["BLEU", "ROUGEL", "chexbert-all_micro avg_f1-score", "radgraph_partial", "bertscore"]:
-        if metric_key in eval_out:
-            TENSORBOARD.add_scalar(f"{CONFIG.output_name}-{split}/{metric_key}", eval_out[metric_key], log_info["global_steps"])
-            text_score += eval_out[metric_key]
+        if metric_key in eval_result_dict:
+            MLFLOW_TRACKER.log(
+                {f"{STATUS_INFO.curr_eval_split}_{metric_key}": eval_result_dict[metric_key]},
+                step=STATUS_INFO.global_iters,
+            )
+            text_score += eval_result_dict[metric_key]
             num_metrics += 1
     text_score = text_score / num_metrics
 
@@ -804,15 +791,17 @@ def evaluate(model, target_dataloader, output_result=False):
     with torch.no_grad():
         for input_tensors_dict in target_dataloader:
             # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
-            outputs = model.do_generate(
-                pixel_values=input_tensors_dict["pixel_values"],
-                input_ids=input_tensors_dict["input_ids"],
-                attention_mask=input_tensors_dict["attention_mask"],
-                pad_token_id=tokenizer.pad_token_id,
-                bos_token_id=tokenizer.bos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                max_new_tokens=CONFIG["eval"]["max_new_tokens"],
-            )
+            with ACCELERATOR.autocast():
+                outputs = model.do_generate(
+                    pixel_values=input_tensors_dict["pixel_values"],
+                    input_ids=input_tensors_dict["input_ids"],
+                    attention_mask=input_tensors_dict["attention_mask"],
+                    pad_token_id=tokenizer.pad_token_id,
+                    bos_token_id=tokenizer.bos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    max_new_tokens=CONFIG["eval"]["max_new_tokens"],
+                )
+                check_memory(show_only_if_peak=True)
 
             pred_seq_start_ids = input_tensors_dict["input_ids"].size(1)  # 生成的序列的起始位置
             pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
@@ -867,19 +856,37 @@ def compute_generation_score(gold_text_list, pred_text_list):
 #############################################
 # Utils
 #############################################
+def check_model_params(model):
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            LOGGER.debug("Parameter %s has requires_grad=True", name)
+        elif param.grad is not None:
+            LOGGER.debug("Parameter %s has gradient: %s", name, param.grad)
+        else:
+            LOGGER.debug("Parameter %s is correctly frozen", name)
 
 
-def check_memory():
+def check_memory(show_only_if_peak=False):
     if not torch.cuda.is_available():
         return
     # 获取当前 GPU 设备的属性
+
     device = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(device)
     # 获取 GPU 总显存
     total_memory = device_properties.total_memory / 1024**3  # 转换为 GB
     # 获取Torch总占用显存
     total_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
-    LOGGER.info(f"Memory reserved: {total_reserved:.2f} / {total_memory:.2f} GB")
+
+    if show_only_if_peak:
+        # 显存占用的峰值值
+        peak_reserved = torch.cuda.max_memory_reserved() / 1024**3  # GB
+        if peak_reserved > STATUS_INFO.peak_reserved:
+            STATUS_INFO.peak_reserved = peak_reserved
+            LOGGER.info(f"Peak memory reached: {peak_reserved:.2f} / {total_memory:.2f} GB")
+        # torch.cuda.reset_max_memory_reserved()  # 重置峰值值
+    else:
+        LOGGER.info(f"Memory reserved: {total_reserved:.2f} / {total_memory:.2f} GB")
 
 
 def seconds_to_time_str(seconds):
@@ -1126,7 +1133,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
     if ds_train:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
             if use_debug_subset:
-                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 200, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
+                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 100, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
             else:
                 train_dataset = ImageTextDataset(ds_train, img_processor=img_processor, tokenizer=tokenizer, split="train")
         train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_cfg["batch_size"], drop_last=True)
@@ -1134,7 +1141,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
     if ds_valid:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
             if use_debug_subset:
-                vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 50, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
+                vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 15, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
             else:
                 vaild_dataset = ImageTextDataset(ds_valid, img_processor=img_processor, tokenizer=tokenizer, split="validation")
         valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -1142,7 +1149,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
     if ds_test:
         with ACCELERATOR.main_process_first():
             if use_debug_subset:
-                test_dataset = ImageTextDataset(ds_test.select(range(len(ds_test) - 10, len(ds_test))), img_processor=img_processor, tokenizer=tokenizer, split="test")
+                test_dataset = ImageTextDataset(ds_test.select(range(len(ds_test) - 5, len(ds_test))), img_processor=img_processor, tokenizer=tokenizer, split="test")
             else:
                 test_dataset = ImageTextDataset(ds_test, img_processor=img_processor, tokenizer=tokenizer, split="test")
         test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
@@ -1219,25 +1226,45 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
 def global_init_accelerator(model):
     global ACCELERATOR, DEVICE, LOGGER
 
+    # mixed_precision = None
+    # if CONFIG["train"]["mixed_precision"] == "bf16":
+    #     mixed_precision = MixedPrecision(
+    #         param_dtype=torch.bfloat16,
+    #         reduce_dtype=torch.float32,
+    #         buffer_dtype=torch.bfloat16,
+    #     )
+    # elif CONFIG["train"]["mixed_precision"] == "fp16":
+    #     mixed_precision = MixedPrecision(
+    #         param_dtype=torch.float16,
+    #         reduce_dtype=torch.float32,
+    #         buffer_dtype=torch.float16,
+    #     )
+
     # 收集需要忽略的模块实例，而不是类名
     ignored_modules = []
-    for _, module in model.named_modules():
-        if isinstance(module, (VisionLanguageAdaptor)):
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding)):
             ignored_modules.append(module)
 
     # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
     fsdp_plugin = FullyShardedDataParallelPlugin(
-        fsdp_version=2,
-        # sharding_strategy="SHARD_GRAD_OP",  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
-        # backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
-        reshard_after_forward=False,  # true (previously FULL_SHARD) or false (previously SHARD_GRAD_OP); defaults to 'FULL_SHARD' for fsdp_version=1 and True for fsdp_version=2)
+        # mixed_precision_policy=mixed_precision,
+        sharding_strategy="FULL_SHARD",  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
+        backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
         auto_wrap_policy="transformer_based_wrap",  # transformer_based_wrap, size_based_wrap, or no_wrap
-        cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。
-        # ignored_modules=ignored_modules,
-        state_dict_type="SHARDED_STATE_DICT",  # FSDP2 的默认选项是 SHARDED_STATE_DICT，它不会导致额外的通信，而且每个等级都会保存自己的分片；另一个可能的选项是 FULL_STATE_DICT，它会导致额外的通信和内存使用量激增，但会从等级 0 开始保存完整的模型。FULL_STATE_DICT 尚不支持加速。
-        # use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等; FSDP2 uses a DTensor class on the background, which means it always uses the original parameters by default
-        activation_checkpointing=False,
-        cpu_ram_efficient_loading=True,  # if true, FSDP2 will similarly load the model only on rank 0, and then parameters get synced to other ranks, this is the same behavior as FSDP1, however, setting --fsdp_sync_module_states isn’t required anymore
+        transformer_cls_names_to_wrap=[
+            "LlamaDecoderLayer",
+            "Dinov2Layer",
+            "VisionLanguageAdaptor",
+            "Vision2LanguageModel",
+        ],
+        ignored_modules=ignored_modules,
+        # transformer_layer_cls=int(1e6),
+        state_dict_type="SHARDED_STATE_DICT",  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
+        use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等
+        cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。能节省5G的peak mem，但100iter从3s下降到5s
+        activation_checkpointing=False,  # A technique to reduce memory usage by clearing activations of certain layers and recomputing them during a backward pass. Effectively, this trades extra computation time for reduced memory usage. Will cause RuntimeError: The expanded size of the tensor (2896) must match the existing size (1448) at non-singleton dimension 3.  Target sizes: [2, 32, 1448, 2896].  Tensor sizes: [2, 1, 1448, 1448]
+        # cpu_ram_efficient_loading=True, #If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. Only applicable for Transformers. When using this, sync_module_states needs to be True.
         # sync_module_states=True,
     )
 
@@ -1276,8 +1303,11 @@ def global_init_accelerator(model):
     LOGGER.info([i for i in CONFIG.items() if i[0][0] != "_"])
 
 
-def global_init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO):
+def global_init_logger(log_level=logging.DEBUG, base_log_level=logging.WARNING, root_log_level=logging.WARNING, fsdp_log_level=logging.ERROR):
     global LOGGER
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S", level=base_log_level)
+    # logging.getLogger("root").setLevel(root_log_level)  # Other libraries' loggers will inherit this level
+    logging.getLogger("torch.distributed.fsdp").setLevel(fsdp_log_level)
 
     log_file_mode = "w"
     if CONFIG["resume_from_checkpoint"]:
@@ -1291,15 +1321,12 @@ def global_init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO):
     file_handler.setFormatter(file_formatter)
 
     stream_handler = logging.StreamHandler()
-    stream_formatter = logging.Formatter("%(asctime)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S")
+    stream_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S")
     stream_handler.setFormatter(stream_formatter)
-
-    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S", level=logging.INFO)
 
     LOGGER = logging.getLogger(curr_file_name)
     LOGGER.addHandler(file_handler)
     LOGGER.setLevel(log_level)  # This logger's level
-    LOGGER.root.setLevel(root_log_level)  # Other libraries' loggers will inherit this level
 
 
 def global_init_proj_config():
@@ -1408,7 +1435,7 @@ def main():
 
 if __name__ == "__main__":
     global_init_proj_config()
-    global_init_logger()
+    global_init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO, fsdp_log_level=logging.ERROR)
     LOGGER.debug(CONFIG)
 
     start0 = time.time()

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=4_vlgen_effu_test_10ep
+#SBATCH --job-name=4_vlgen_effu_test00
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -39,7 +39,7 @@ accelerate launch\
     --main_process_port 29555 \
     /scratch/c.c21051562/workspace/arrg_img2text/4_vlgen_effu_fsdp.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu_fsdp.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     # --resume_from_checkpoint
