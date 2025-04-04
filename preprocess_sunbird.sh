@@ -25,7 +25,7 @@ echo "Loaded $conda, env: $env"
 nvcc -V
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
-python /scratch/c.c21051562/workspace/arrg_img2text/4_vlgen_effu.py \
+python /scratch/c.c21051562/workspace/arrg_img2text/4_1_vlgen_effu_fsdp_peft.py \
     --from_bash \
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu.yaml \
     --output_name $SLURM_JOB_NAME \

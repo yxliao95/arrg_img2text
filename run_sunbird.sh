@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=4_vlgen_effu_test00
+#SBATCH --job-name=4_vlgen_effu_test_1ep
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -8,7 +8,7 @@
 #SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
-#SBATCH --partition=accel_ai_dev
+#SBATCH --partition=accel_ai
 #SBATCH --gres=gpu:2
 ### SBATCH -t 0-00:00
 

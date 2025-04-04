@@ -14,6 +14,7 @@ We are using CUDA/12.4
 - `pip install accelerate` (==1.5.2)
 - `pip install mlflow` (==2.19.0)
 - `pip install sentencepiece` (==0.2.0)
+- `pip install peft` (==0.15.1)
 
 vilmedic-scorers requirements (follows the error section after installing these libraries)
 
@@ -99,3 +100,7 @@ if not os.path.exists(checkpoint):
 ##########################
 checkpoint = hf_hub_download(repo_id="StanfordAIMI/RRG_scorers", cache_dir=CACHE_DIR, filename="chexbert.pth")
 ```
+
+## Test vilmedic-scorers
+
+Run this script: `path_to_this_repo/arrg_img2text/scorers/scores.py`. Dont forget to change `sys.path.append("path_to_this_repo/arrg_img2text")` on top of the script.
