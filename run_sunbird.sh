@@ -34,6 +34,7 @@ echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
 export TORCH_DISTRIBUTED_DEBUG=INFO
+export NCCL_TIMEOUT=3600  # 默认是 1800 秒（30 分钟），你可以设置更大，比如 3600
 accelerate launch\
     --multi_gpu \
     --main_process_port 29555 \
@@ -42,7 +43,7 @@ accelerate launch\
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu_fsdp.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
-    # --resume_from_checkpoint
+    # --resume_from_checkpoint True
 echo "Script finished."
 
 # 查找所有运行中的 MLflow 进程

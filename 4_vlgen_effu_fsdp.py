@@ -48,7 +48,6 @@ from tqdm import tqdm
 from transformers import (
     AutoConfig,
     AutoImageProcessor,
-    AutoProcessor,
     AutoTokenizer,
     Dinov2Config,
     Dinov2Model,
@@ -69,6 +68,7 @@ DEVICE = None
 ACCELERATOR = None
 STATUS_INFO = None
 MLFLOW_TRACKER = None
+PEAK_MEM = 0
 
 SPECIAL_TOKENS_MAP = {
     "<|image_token|>": "<|reserved_special_token_1|>",
@@ -432,7 +432,7 @@ class StatusInfo:
 
     run_id: dict = field(default="")
 
-    peak_reserved: int = field(default=0)
+    grad_accum_eval_mark: int = field(default=0)
 
     def is_achieving_best_dev_score(self, text_score):
         if text_score >= self.dev_best["text_score"]:
@@ -707,9 +707,8 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
 #############################################
 def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
     train_cfg = CONFIG["train"]
-    # global_update_steps == 0 时，默认不评估
-    do_eval = True if STATUS_INFO.global_update_steps > 0 else False
 
+    do_eval = True
     # eval at the end of each epoch
     if STATUS_INFO.curr_batch_iter + 1 == max_num_iters_per_epoch:
         STATUS_INFO.curr_checkpoint_at = "epoch"
@@ -721,9 +720,17 @@ def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
     else:
         do_eval = False
 
+    # 当 grad_accum = N > 1 时，这 N 个 iters 的 STATUS_INFO.global_update_steps 都是一样的。不做处理时，都会激活 do_eval。
+    # 我们希望这 N 个 iters 只进行一次 eval。
+    # 目前的逻辑是，当进入这个条件时，说明在这个 global_update_steps 中，已经进行过一次 eval 了，其余的 iters 不需要进行 eval。
+    # 由于 grad_accum_eval_mark 默认值为 0，所以 global_update_steps == 0 时，也默认不评估。
+    if STATUS_INFO.grad_accum_eval_mark == STATUS_INFO.global_update_steps:
+        do_eval = False
+
     if do_eval:
         check_memory()
         eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
+        STATUS_INFO.grad_accum_eval_mark = STATUS_INFO.global_update_steps  # this line shoud runs before check_results_and_save_model(), to set the correct STATUS_INFO.grad_accum_eval_mark for checkpoingting
         check_results_and_save_model(model, eval_result_dict)
 
 
@@ -748,10 +755,12 @@ def check_results_and_save_model(model, eval_result_dict):
 
     # checkpointing
     save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
+    ACCELERATOR.wait_for_everyone()
 
     # Save the best
     if STATUS_INFO.is_achieving_best_dev_score(text_score):
         save_model(model, CONFIG["output_dir"]["model"])
+        ACCELERATOR.wait_for_everyone()
 
 
 #############################################
@@ -867,6 +876,8 @@ def check_model_params(model):
 
 
 def check_memory(show_only_if_peak=False):
+    global PEAK_MEM
+
     if not torch.cuda.is_available():
         return
     # 获取当前 GPU 设备的属性
@@ -881,8 +892,8 @@ def check_memory(show_only_if_peak=False):
     if show_only_if_peak:
         # 显存占用的峰值值
         peak_reserved = torch.cuda.max_memory_reserved() / 1024**3  # GB
-        if peak_reserved > STATUS_INFO.peak_reserved:
-            STATUS_INFO.peak_reserved = peak_reserved
+        if peak_reserved > PEAK_MEM:
+            PEAK_MEM = peak_reserved
             LOGGER.info(f"Peak memory reached: {peak_reserved:.2f} / {total_memory:.2f} GB")
         # torch.cuda.reset_max_memory_reserved()  # 重置峰值值
     else:
@@ -932,7 +943,7 @@ def save_model(model, output_dir):
         output_dir,
         is_main_process=ACCELERATOR.is_main_process,
         save_function=ACCELERATOR.save,
-        state_dict=accelerator.get_state_dict(model),
+        state_dict=ACCELERATOR.get_state_dict(model),
     )
     LOGGER.info("Model saved to %s", output_dir)
 
@@ -1090,13 +1101,8 @@ def preprocess_dataset():
     # Get dataloader for training and testing
     image_processor_name = CONFIG["preprocess"]["image_processor"]
     model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
-
-    if image_processor_name == "rad_dino_maira2":
-        img_processor = processor
-        shortest_edge = img_processor.size["shortest_edge"]
-    else:
-        raise ValueError(f"Invalid image_processor_name: {image_processor_name}")
+    img_processor = AutoImageProcessor.from_pretrained(model_name_or_path)
+    shortest_edge = img_processor.size["shortest_edge"]
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
@@ -1118,7 +1124,7 @@ def load_model(model_path):
 
 
 def load_processor(processor_path):
-    img_processor = AutoProcessor.from_pretrained(processor_path)
+    img_processor = AutoImageProcessor.from_pretrained(processor_path)
     tokenizer = AutoTokenizer.from_pretrained(processor_path)
     LOGGER.info("Image_processor and tokenizer are loaded from %s", processor_path)
     return img_processor, tokenizer
@@ -1188,10 +1194,7 @@ def init_model(vision_model_path, language_model_path, model_base_cfg):
 
 def init_processor(vision_model_path, language_model_path, model_base_cfg):
     LOGGER.info("Loading ImageProcessor from: %s", vision_model_path)
-    if model_base_cfg["vision_model"] == "clip":
-        img_processor = AutoProcessor.from_pretrained(vision_model_path).image_processor
-    else:
-        img_processor = AutoProcessor.from_pretrained(vision_model_path)
+    img_processor = AutoImageProcessor.from_pretrained(vision_model_path)
 
     LOGGER.info("Loading Tokenizer from: %s", language_model_path)
     tokenizer = AutoTokenizer.from_pretrained(language_model_path)
@@ -1338,7 +1341,7 @@ def global_init_proj_config():
 
     parser.add_argument("--output_name", type=str)
     parser.add_argument("--jobid", type=int)
-    parser.add_argument("--resume_from_checkpoint", action="store_true")
+    parser.add_argument("--resume_from_checkpoint", action="store_true", default=None)
 
     parser.add_argument("--preprocess_dataset", action="store_true")
     parser.add_argument("--image_processor", type=str, default=None)
@@ -1357,11 +1360,14 @@ def global_init_proj_config():
     if args.from_bash:
         CONFIG["output_name"] = args.output_name
         CONFIG["jobid"] = args.jobid
-        CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
+
         CONFIG["preprocess_dataset"] = args.preprocess_dataset
         if args.preprocess_dataset:
             CONFIG["preprocess"]["image_processor"] = args.image_processor
             CONFIG["preprocess"]["cache_path"] = args.cache_path
+
+        if args.resume_from_checkpoint:
+            CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
     else:
         CONFIG["jobid"] = "00000"
 
@@ -1413,21 +1419,21 @@ def main():
         tokenizer.save_pretrained(CONFIG["output_dir"]["model"])
         LOGGER.info("Image Processor and tokenizer are saved to: %s", CONFIG["output_dir"]["model"])
 
-    else:
-        # Testing
-        model = load_model(CONFIG["output_dir"]["model"])
-        img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
-        global_init_accelerator(model)
+    # Final eval on test set
+    model = load_model(CONFIG["output_dir"]["model"])
+    img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+    post_init_model_and_tokenizer(model, tokenizer)
+    global_init_accelerator(model)
 
-        _, _, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+    _, _, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
 
-        model.to(DEVICE)
-        model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
+    model.to(DEVICE)
+    model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
 
-        start = time.time()
-        evaluate(model, test_dataloader, output_result=True)
-        end = time.time()
-        LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
+    start = time.time()
+    evaluate(model, test_dataloader, output_result=True)
+    end = time.time()
+    LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
 
     if torch.distributed.is_initialized() and ACCELERATOR and ACCELERATOR.is_main_process:
         torch.distributed.destroy_process_group()
