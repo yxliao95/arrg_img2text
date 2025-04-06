@@ -36,6 +36,7 @@ from accelerate.utils import (
 )
 from datasets import DatasetDict, concatenate_datasets, load_from_disk
 from nltk.tokenize import wordpunct_tokenize
+from peft import LoraConfig, LoraModel, PeftModel, get_peft_model
 from PIL import Image
 from scipy.ndimage import zoom
 from scorers.scores import compute_scores
@@ -1163,6 +1164,32 @@ def load_preprocessed_dataset(ds_path):
     return ds_final
 
 
+def apply_peft_to_model(model):
+    # https://huggingface.co/docs/peft/developer_guides/troubleshooting#bad-results-from-a-loaded-peft-model
+
+    named_modules = [(n, type(m)) for n, m in model.named_modules()]
+    # print([(n, type(m)) for n, m in model.named_modules()])
+
+    # The names of the modules to apply the adapter to.
+    # Also check TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING: https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py
+    target_modules = ["q_proj", "v_proj"]
+    # List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
+    modules_to_save = []
+    lora_config = LoraConfig(
+        target_modules=target_modules,
+        modules_to_save=modules_to_save,
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        bias="none",
+        init_lora_weights="pissa_niter_16",  # 不确定时：True 或 pissa 是最保险的起点；你想训练少轮就见效果：corda；做正式训练/部署，追求SOTA：eva（但初始化时要花点功夫）；想节省时间资源：pissa_niter_16；LoRA + 量化一起用：pissa / loftq；
+    )
+    peft_model = get_peft_model(model, lora_config)
+    # peft_model.print_trainable_parameters()
+    # print(peft_model.targeted_module_names)
+    return peft_model
+
+
 def post_init_model_and_tokenizer(model, tokenizer):
     if len(tokenizer) != model.config.decoder.vocab_size:
         LOGGER.info("Resizing model decoder to match tokenizer size: %d -> %d", model.config.decoder.vocab_size, len(tokenizer))
@@ -1396,6 +1423,8 @@ def main():
         img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
         model = init_model(vision_model_path, language_model_path, model_base_cfg)
         post_init_model_and_tokenizer(model, tokenizer)
+
+        model = apply_peft_to_model(model)
 
         global_init_accelerator(model)
         model.to(DEVICE)
