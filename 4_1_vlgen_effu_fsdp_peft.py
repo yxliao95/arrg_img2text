@@ -742,18 +742,19 @@ def check_results_and_save_model(model, eval_result_dict):
 
     # checkpointing
     save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
-    ACCELERATOR.wait_for_everyone()
 
     # Save the best
     if STATUS_INFO.is_achieving_best_dev_score(text_score):
         save_model(model, CONFIG["output_dir"]["model"])
-        ACCELERATOR.wait_for_everyone()
 
 
 #############################################
 # Evaluation
 #############################################
 def evaluate(model, target_dataloader, output_result=False):
+    global PEAK_MEM
+
+    PEAK_MEM = 0
     eval_results = {
         "present": {
             "num_gold_label": 0,
@@ -785,7 +786,7 @@ def evaluate(model, target_dataloader, output_result=False):
     start = time.time()
     model.eval()
     with torch.no_grad():
-        for input_tensors_dict in target_dataloader:
+        for batch_idx, input_tensors_dict in enumerate(target_dataloader):
             # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
             with ACCELERATOR.autocast():
                 outputs = model.do_generate(
@@ -808,6 +809,16 @@ def evaluate(model, target_dataloader, output_result=False):
             data_ids.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["data_id_list"], use_gather_object=True))
             pred_seqs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
             gold_seqs.extend(ACCELERATOR.gather_for_metrics(gold_sequences, use_gather_object=True))
+
+            if (CONFIG["eval"]["print_log_per_n_steps"] > 0 and batch_idx % CONFIG["eval"]["print_log_per_n_steps"] == 0) or (batch_idx + 1 == len(target_dataloader)):
+                LOGGER.info(
+                    "Eval at: p=%s, iter=%d, curr_seq_len=%s, pred_seq_example=%s",
+                    ACCELERATOR.process_index,
+                    batch_idx,
+                    len(pred_seqs),
+                    pred_sequences[0],
+                    main_process_only=False,
+                )
 
     assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
     assert len(data_ids) == target_dataloader.total_dataset_length, f"Gathered data size ({len(data_ids)}) should equals to dataset size ({target_dataloader.total_dataset_length})"
@@ -1089,6 +1100,7 @@ def preprocess_dataset():
     # Get dataloader for training and testing
     image_processor_name = CONFIG["preprocess"]["image_processor"]
     model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
+    # 之前的数据是用slow版本处理的，可能会产生不一样的结果
     img_processor = AutoImageProcessor.from_pretrained(model_name_or_path, use_fast=True)
     shortest_edge = img_processor.size["shortest_edge"]
 
