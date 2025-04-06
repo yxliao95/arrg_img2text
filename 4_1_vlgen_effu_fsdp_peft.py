@@ -36,20 +36,18 @@ from accelerate.utils import (
 )
 from datasets import DatasetDict, concatenate_datasets, load_from_disk
 from nltk.tokenize import wordpunct_tokenize
-from peft import LoraConfig, LoraModel, PeftModel, get_peft_model
+from peft import LoraConfig, LoraModel, PeftModel, TaskType, get_peft_model
+from peft.utils.other import fsdp_auto_wrap_policy as peft_model_wrap_policy_for_fsdp
 from PIL import Image
 from scipy.ndimage import zoom
 from scorers.scores import compute_scores
 from torch import nn
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 from transformers import (
     AutoConfig,
     AutoImageProcessor,
-    AutoProcessor,
     AutoTokenizer,
     Dinov2Config,
     Dinov2Model,
@@ -70,6 +68,7 @@ DEVICE = None
 ACCELERATOR = None
 STATUS_INFO = None
 MLFLOW_TRACKER = None
+PEAK_MEM = 0
 
 SPECIAL_TOKENS_MAP = {
     "<|image_token|>": "<|reserved_special_token_1|>",
@@ -114,7 +113,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         self.config.decoder_hidden_size = self.decoder.config.hidden_size
 
         # replace enc_to_dec_proj with VisionLanguageAdaptor
-        self.adaptor = VisionLanguageAdaptor(self.config)
+        self.image_adaptor = VisionLanguageAdaptor(self.config)
         if hasattr(self, "enc_to_dec_proj"):
             del self.enc_to_dec_proj  # 移除投影层
 
@@ -190,7 +189,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         if encoder_outputs is not None:
             image_features = encoder_outputs.last_hidden_state  # torch.Size([4, 1370, enc_dim])
             # project image features
-            image_features = self.adaptor(image_features)
+            image_features = self.image_adaptor(image_features)
             # inject image features into text embeddings
             inputs_embeds = self._inject_image_features(input_ids, inputs_embeds, image_features)
 
@@ -433,7 +432,7 @@ class StatusInfo:
 
     run_id: dict = field(default="")
 
-    peak_reserved: int = field(default=0)
+    grad_accum_eval_mark: int = field(default=0)
 
     def is_achieving_best_dev_score(self, text_score):
         if text_score >= self.dev_best["text_score"]:
@@ -538,6 +537,7 @@ def train(model, train_dataloader, valid_dataloader):
     # hyperparameters
     model_params = list(model.named_parameters())
     optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
+    LOGGER.debug("[Stage %s] Model trainable params: \n%s", train_cfg["stage"], "\n".join([n for n, p in model.named_parameters() if p.requires_grad == True]))
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
@@ -561,6 +561,7 @@ def train(model, train_dataloader, valid_dataloader):
     LOGGER.info("Total optimization steps = %d", total_num_steps)
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
     LOGGER.info("Accelerator mixed_precision = %s", ACCELERATOR.mixed_precision)
+    LOGGER.info("Current training stage %s (1: adatpor only, 2: peft + adaptor and decoder)", train_cfg["stage"])
     check_memory()
 
     model.zero_grad()
@@ -609,41 +610,26 @@ def train(model, train_dataloader, valid_dataloader):
 def prepare_optimizer_grouped_parameters(model_params, train_cfg):
     # 为了节省计算资源和显存，应将需要冻结的参数的 `requires_grad` 显式设置为 `False`，并且在优化器中过滤不可训练参数
 
-    encoder_params = [(n, p) for n, p in model_params if n.startswith("encoder")]
-    decoder_params = [(n, p) for n, p in model_params if n.startswith("decoder")]
-    adaptor_params = [(n, p) for n, p in model_params if n.startswith("adaptor")]
-    assert encoder_params and decoder_params and adaptor_params
-
-    # 冻结 encoder 参数
-    for n, p in encoder_params:
-        p.requires_grad = False if train_cfg["freeze_encoder"] else True
-
-    # 冻结 decoder 参数
-    for n, p in decoder_params:
-        p.requires_grad = False if train_cfg["freeze_decoder"] else True
-
-    # 冻结 adaptor 参数
-    for n, p in adaptor_params:
-        p.requires_grad = False if train_cfg["freeze_adaptor"] else True
-
-    no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
     optimizer_grouped_parameters = []
-    if not train_cfg["freeze_encoder"]:
-        optimizer_grouped_parameters.extend(
-            [
-                {"params": [p for n, p in encoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
-                {"params": [p for n, p in encoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-            ]
-        )
-    if not train_cfg["freeze_decoder"]:
-        optimizer_grouped_parameters.extend(
-            [
-                {"params": [p for n, p in decoder_params if any(nd in n for nd in no_decay_names)], "lr": (train_cfg["lr"]), "weight_decay": 0.0},
-                {"params": [p for n, p in decoder_params if all(nd not in n for nd in no_decay_names)], "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]},
-            ]
-        )
-    if not train_cfg["freeze_adaptor"]:
+    if train_cfg["stage"] == 1:
+        encoder_params = [(n, p) for n, p in model_params if n.startswith("encoder")]
+        decoder_params = [(n, p) for n, p in model_params if n.startswith("decoder")]
+        adaptor_params = [(n, p) for n, p in model_params if n.startswith("image_adaptor")]
+        assert encoder_params and decoder_params and adaptor_params
+
+        # 冻结 encoder, decoder，训练 image_adaptor
+        for n, p in encoder_params + decoder_params:
+            p.requires_grad = False
+        for n, p in adaptor_params:
+            p.requires_grad = True
+
+        # no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
         optimizer_grouped_parameters.append({"params": [p for n, p in adaptor_params], "lr": train_cfg["lr"], "weight_decay": 0.0})
+
+    elif train_cfg["stage"] == 2:
+        # When using peft, params requires_grad are set during initialization of PeftModel. See `apply_peft_to_model()`.
+        # We only need to group them for optimizer.
+        optimizer_grouped_parameters.append({"params": [p for n, p in model_params if p.requires_grad == True], "lr": train_cfg["lr"], "weight_decay": 0.0})
 
     return optimizer_grouped_parameters
 
@@ -708,9 +694,8 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
 #############################################
 def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
     train_cfg = CONFIG["train"]
-    # global_update_steps == 0 时，默认不评估
-    do_eval = True if STATUS_INFO.global_update_steps > 0 else False
 
+    do_eval = True
     # eval at the end of each epoch
     if STATUS_INFO.curr_batch_iter + 1 == max_num_iters_per_epoch:
         STATUS_INFO.curr_checkpoint_at = "epoch"
@@ -722,9 +707,17 @@ def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
     else:
         do_eval = False
 
+    # 当 grad_accum = N > 1 时，这 N 个 iters 的 STATUS_INFO.global_update_steps 都是一样的。不做处理时，都会激活 do_eval。
+    # 我们希望这 N 个 iters 只进行一次 eval。
+    # 目前的逻辑是，当进入这个条件时，说明在这个 global_update_steps 中，已经进行过一次 eval 了，其余的 iters 不需要进行 eval。
+    # 由于 grad_accum_eval_mark 默认值为 0，所以 global_update_steps == 0 时，也默认不评估。
+    if STATUS_INFO.grad_accum_eval_mark == STATUS_INFO.global_update_steps:
+        do_eval = False
+
     if do_eval:
         check_memory()
         eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
+        STATUS_INFO.grad_accum_eval_mark = STATUS_INFO.global_update_steps  # this line shoud runs before check_results_and_save_model(), to set the correct STATUS_INFO.grad_accum_eval_mark for checkpoingting
         check_results_and_save_model(model, eval_result_dict)
 
 
@@ -749,10 +742,12 @@ def check_results_and_save_model(model, eval_result_dict):
 
     # checkpointing
     save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
+    ACCELERATOR.wait_for_everyone()
 
     # Save the best
     if STATUS_INFO.is_achieving_best_dev_score(text_score):
         save_model(model, CONFIG["output_dir"]["model"])
+        ACCELERATOR.wait_for_everyone()
 
 
 #############################################
@@ -868,6 +863,8 @@ def check_model_params(model):
 
 
 def check_memory(show_only_if_peak=False):
+    global PEAK_MEM
+
     if not torch.cuda.is_available():
         return
     # 获取当前 GPU 设备的属性
@@ -882,8 +879,8 @@ def check_memory(show_only_if_peak=False):
     if show_only_if_peak:
         # 显存占用的峰值值
         peak_reserved = torch.cuda.max_memory_reserved() / 1024**3  # GB
-        if peak_reserved > STATUS_INFO.peak_reserved:
-            STATUS_INFO.peak_reserved = peak_reserved
+        if peak_reserved > PEAK_MEM:
+            PEAK_MEM = peak_reserved
             LOGGER.info(f"Peak memory reached: {peak_reserved:.2f} / {total_memory:.2f} GB")
         # torch.cuda.reset_max_memory_reserved()  # 重置峰值值
     else:
@@ -933,7 +930,8 @@ def save_model(model, output_dir):
         output_dir,
         is_main_process=ACCELERATOR.is_main_process,
         save_function=ACCELERATOR.save,
-        state_dict=accelerator.get_state_dict(model),
+        state_dict=ACCELERATOR.get_state_dict(model),
+        # save_embedding_layers=True,
     )
     LOGGER.info("Model saved to %s", output_dir)
 
@@ -1091,13 +1089,8 @@ def preprocess_dataset():
     # Get dataloader for training and testing
     image_processor_name = CONFIG["preprocess"]["image_processor"]
     model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
-
-    if image_processor_name == "rad_dino_maira2":
-        img_processor = processor
-        shortest_edge = img_processor.size["shortest_edge"]
-    else:
-        raise ValueError(f"Invalid image_processor_name: {image_processor_name}")
+    img_processor = AutoImageProcessor.from_pretrained(model_name_or_path, use_fast=True)
+    shortest_edge = img_processor.size["shortest_edge"]
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
@@ -1110,6 +1103,9 @@ def preprocess_dataset():
 
 
 #############################################
+def load_peft_model(base_model, peft_model_path):
+    peft_model = LoraModel.from_pretrained(base_model, peft_model_path)
+    return peft_model, auto_wrap_policy
 
 
 def load_model(model_path):
@@ -1119,7 +1115,7 @@ def load_model(model_path):
 
 
 def load_processor(processor_path):
-    img_processor = AutoProcessor.from_pretrained(processor_path)
+    img_processor = AutoImageProcessor.from_pretrained(processor_path, use_fast=True)
     tokenizer = AutoTokenizer.from_pretrained(processor_path)
     LOGGER.info("Image_processor and tokenizer are loaded from %s", processor_path)
     return img_processor, tokenizer
@@ -1164,32 +1160,6 @@ def load_preprocessed_dataset(ds_path):
     return ds_final
 
 
-def apply_peft_to_model(model):
-    # https://huggingface.co/docs/peft/developer_guides/troubleshooting#bad-results-from-a-loaded-peft-model
-
-    named_modules = [(n, type(m)) for n, m in model.named_modules()]
-    # print([(n, type(m)) for n, m in model.named_modules()])
-
-    # The names of the modules to apply the adapter to.
-    # Also check TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING: https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py
-    target_modules = ["q_proj", "v_proj"]
-    # List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
-    modules_to_save = []
-    lora_config = LoraConfig(
-        target_modules=target_modules,
-        modules_to_save=modules_to_save,
-        r=8,
-        lora_alpha=32,
-        lora_dropout=0.1,
-        bias="none",
-        init_lora_weights="pissa_niter_16",  # 不确定时：True 或 pissa 是最保险的起点；你想训练少轮就见效果：corda；做正式训练/部署，追求SOTA：eva（但初始化时要花点功夫）；想节省时间资源：pissa_niter_16；LoRA + 量化一起用：pissa / loftq；
-    )
-    peft_model = get_peft_model(model, lora_config)
-    # peft_model.print_trainable_parameters()
-    # print(peft_model.targeted_module_names)
-    return peft_model
-
-
 def post_init_model_and_tokenizer(model, tokenizer):
     if len(tokenizer) != model.config.decoder.vocab_size:
         LOGGER.info("Resizing model decoder to match tokenizer size: %d -> %d", model.config.decoder.vocab_size, len(tokenizer))
@@ -1215,13 +1185,10 @@ def init_model(vision_model_path, language_model_path, model_base_cfg):
 
 def init_processor(vision_model_path, language_model_path, model_base_cfg):
     LOGGER.info("Loading ImageProcessor from: %s", vision_model_path)
-    if model_base_cfg["vision_model"] == "clip":
-        img_processor = AutoProcessor.from_pretrained(vision_model_path).image_processor
-    else:
-        img_processor = AutoProcessor.from_pretrained(vision_model_path)
+    img_processor = AutoImageProcessor.from_pretrained(vision_model_path, use_fast=True)
 
     LOGGER.info("Loading Tokenizer from: %s", language_model_path)
-    tokenizer = AutoTokenizer.from_pretrained(language_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(language_model_path, use_fast=True)
 
     # Add special tokens
     LOGGER.info("Adding special tokens")
@@ -1250,18 +1217,50 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
     return img_processor, tokenizer
 
 
-def global_init_accelerator(model):
+def apply_peft_to_model(model):
+    # https://huggingface.co/docs/peft/developer_guides/troubleshooting#bad-results-from-a-loaded-peft-model
+
+    # named_modules = [(n, type(m)) for n, m in model.named_modules()]
+    # print([(n, type(m)) for n, m in model.named_modules()])
+
+    # The names of the modules to apply the adapter to.
+    # Also check TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING: https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py
+    # When the lora layers are applied to embedding layers, the corresponding base model embedding layers are also saved.
+    target_modules = ["embed_tokens", "lm_head", "q_proj", "v_proj"]  # 需要注入 LoRA 的模块。
+    # List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
+    # e.g. Transformers adds a randomly initialized classification head on top of the model. If you do not add this layer to modules_to_save, the classification head won’t be saved. The next time you load the model, you’ll get a different randomly initialized classification head, resulting in completely different results.
+    modules_to_save = ["image_adaptor"]  # 没注入LoRA 但又需要训练和保存的模块。添加模块后，peft会包装一个一模一样的模块，并将requires_grad 会被设置为 True。原模块不变。
+    lora_config = LoraConfig(
+        target_modules=target_modules,
+        modules_to_save=modules_to_save,
+        r=64,
+        lora_alpha=128,
+        lora_dropout=0.1,
+        bias="none",
+        init_lora_weights="pissa_niter_16",  # 不确定时：True 或 pissa 是最保险的起点；你想训练少轮就见效果：corda；做正式训练/部署，追求SOTA：eva（但初始化时要花点功夫）；想节省时间资源：pissa_niter_16；LoRA + 量化一起用：pissa / loftq；
+        # task_type=TaskType.CAUSAL_LM,
+    )
+    peft_model = get_peft_model(model, lora_config)
+    LOGGER.info("PEFT model applied: %s", peft_model.print_trainable_parameters())
+    # LOGGER.debug("PEFT model trainable: %s", "\n".join([n for n, p in peft_model.named_parameters() if p.requires_grad == True]))
+
+    auto_wrap_policy = peft_model_wrap_policy_for_fsdp(peft_model)
+
+    return peft_model, auto_wrap_policy
+
+
+def global_init_accelerator(model, use_orig_params, auto_wrap_policy=None):
     global ACCELERATOR, DEVICE, LOGGER
 
     # mixed_precision = None
     # if CONFIG["train"]["mixed_precision"] == "bf16":
-    #     mixed_precision = MixedPrecision(
+    #     mixed_precision = torch.distributed.fsdp.MixedPrecision(
     #         param_dtype=torch.bfloat16,
     #         reduce_dtype=torch.float32,
     #         buffer_dtype=torch.bfloat16,
     #     )
     # elif CONFIG["train"]["mixed_precision"] == "fp16":
-    #     mixed_precision = MixedPrecision(
+    #     mixed_precision = torch.distributed.fsdp.MixedPrecision(
     #         param_dtype=torch.float16,
     #         reduce_dtype=torch.float32,
     #         buffer_dtype=torch.float16,
@@ -1294,6 +1293,9 @@ def global_init_accelerator(model):
         # cpu_ram_efficient_loading=True, #If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. Only applicable for Transformers. When using this, sync_module_states needs to be True.
         # sync_module_states=True,
     )
+
+    if auto_wrap_policy:
+        fsdp_plugin.auto_wrap_policy = auto_wrap_policy
 
     # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
     # 如果OOM，可以尝试设置 sync_each_batch=True，但是会导致训练速度变慢
@@ -1330,10 +1332,9 @@ def global_init_accelerator(model):
     LOGGER.info([i for i in CONFIG.items() if i[0][0] != "_"])
 
 
-def global_init_logger(log_level=logging.DEBUG, base_log_level=logging.WARNING, root_log_level=logging.WARNING, fsdp_log_level=logging.ERROR):
+def global_init_logger(log_level=logging.DEBUG, base_log_level=logging.WARNING, fsdp_log_level=logging.ERROR):
     global LOGGER
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S", level=base_log_level)
-    # logging.getLogger("root").setLevel(root_log_level)  # Other libraries' loggers will inherit this level
     logging.getLogger("torch.distributed.fsdp").setLevel(fsdp_log_level)
 
     log_file_mode = "w"
@@ -1365,7 +1366,7 @@ def global_init_proj_config():
 
     parser.add_argument("--output_name", type=str)
     parser.add_argument("--jobid", type=int)
-    parser.add_argument("--resume_from_checkpoint", action="store_true")
+    parser.add_argument("--resume_from_checkpoint", action="store_true", default=None)
 
     parser.add_argument("--preprocess_dataset", action="store_true")
     parser.add_argument("--image_processor", type=str, default=None)
@@ -1376,7 +1377,7 @@ def global_init_proj_config():
     if args.from_bash:
         file_path = args.config_file
     else:
-        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/4_vlgen.yaml"
+        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/4_vlgen_peft.yaml"
 
     with open(file_path, "r") as f:
         CONFIG = yaml.safe_load(f)
@@ -1384,11 +1385,14 @@ def global_init_proj_config():
     if args.from_bash:
         CONFIG["output_name"] = args.output_name
         CONFIG["jobid"] = args.jobid
-        CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
+
         CONFIG["preprocess_dataset"] = args.preprocess_dataset
         if args.preprocess_dataset:
             CONFIG["preprocess"]["image_processor"] = args.image_processor
             CONFIG["preprocess"]["cache_path"] = args.cache_path
+
+        if args.resume_from_checkpoint:
+            CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
     else:
         CONFIG["jobid"] = "00000"
 
@@ -1411,22 +1415,29 @@ def global_init_proj_config():
 
 
 def main():
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+
     # Train and test
     set_seed(CONFIG["train"]["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
     if not CONFIG["test_only"]:
-        model_base_cfg = CONFIG["model"]
-        vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-        language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-
         img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
         model = init_model(vision_model_path, language_model_path, model_base_cfg)
         post_init_model_and_tokenizer(model, tokenizer)
 
-        model = apply_peft_to_model(model)
+        # stage1: train the image_adaptor only, freeze encoder and decoder;
+        # stage2: use peft to train image_adaptor and decoder, freeze encoder.
+        if CONFIG["train"]["stage"] == 1:
+            use_orig_params = True
+            custom_wrap_policy = None
+        elif CONFIG["train"]["stage"] == 2:
+            use_orig_params = False
+            model, custom_wrap_policy = apply_peft_to_model(model)
 
-        global_init_accelerator(model)
+        global_init_accelerator(model, use_orig_params=use_orig_params, auto_wrap_policy=custom_wrap_policy)
         model.to(DEVICE)
 
         train_dataloader, valid_dataloader, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], ds_valid=ds_final["validation"], use_debug_subset=CONFIG["use_debug_subset"])
@@ -1442,21 +1453,33 @@ def main():
         tokenizer.save_pretrained(CONFIG["output_dir"]["model"])
         LOGGER.info("Image Processor and tokenizer are saved to: %s", CONFIG["output_dir"]["model"])
 
-    else:
-        # Testing
+    # Final eval on test set
+    if CONFIG["train"]["stage"] == 1:
         model = load_model(CONFIG["output_dir"]["model"])
         img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
-        global_init_accelerator(model)
+        post_init_model_and_tokenizer(model, tokenizer)
+        global_init_accelerator(model, use_orig_params=True, auto_wrap_policy=None)
 
-        _, _, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+    elif CONFIG["train"]["stage"] == 2:
+        # 当使用peft时，训练的参数都保存在了peft_model中，包括了扩展后的embedding层。
+        # 所以需要按照训练前的方式初始化base_model，然后将peft_model加载到base_model中。
+        img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+        model = init_model(vision_model_path, language_model_path, model_base_cfg)
+        post_init_model_and_tokenizer(model, tokenizer)
 
-        model.to(DEVICE)
-        model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
+        model = load_peft_model(base_model=model, peft_model_path=CONFIG["output_dir"]["model"])
+        auto_wrap_policy = peft_model_wrap_policy_for_fsdp(model)
+        global_init_accelerator(model, use_orig_params=False, auto_wrap_policy=auto_wrap_policy)
 
-        start = time.time()
-        evaluate(model, test_dataloader, output_result=True)
-        end = time.time()
-        LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
+    _, _, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+
+    model.to(DEVICE)
+    model, test_dataloader = ACCELERATOR.prepare(model, test_dataloader)
+
+    start = time.time()
+    evaluate(model, test_dataloader, output_result=True)
+    end = time.time()
+    LOGGER.info("Final evaluation time: %s", seconds_to_time_str(end - start))
 
     if torch.distributed.is_initialized() and ACCELERATOR and ACCELERATOR.is_main_process:
         torch.distributed.destroy_process_group()
@@ -1464,7 +1487,7 @@ def main():
 
 if __name__ == "__main__":
     global_init_proj_config()
-    global_init_logger(log_level=logging.DEBUG, root_log_level=logging.INFO, fsdp_log_level=logging.ERROR)
+    global_init_logger(log_level=logging.DEBUG, base_log_level=logging.DEBUG, fsdp_log_level=logging.DEBUG)
     LOGGER.debug(CONFIG)
 
     start0 = time.time()

@@ -1,0 +1,66 @@
+output_name: test_000
+
+output_dir:
+  result: /home/yuxiang/liao/workspace/arrg_img2text/outputs/results
+  model: /home/yuxiang/liao/workspace/arrg_img2text/outputs/models
+  checkpoint: /home/yuxiang/liao/workspace/arrg_img2text/outputs/checkpoints
+  log: /home/yuxiang/liao/workspace/arrg_img2text/outputs/logs
+
+data_path:
+  mimic: /home/yuxiang/liao/resources/datasets/mimic-cxr
+  interpret: /home/yuxiang/liao/resources/datasets/interpret-cxr
+  interpret-test-public: /home/yuxiang/liao/resources/datasets/interpret-cxr-test-public
+  custom_text: /home/yuxiang/liao/workspace/arrg_preprocessing/outputs/interpret_text_exp/interpret_text_findings_effusion
+
+target_section: findings
+
+mlflow_url: "http://localhost:6006" # nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/home/yuxiang/liao/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
+max_checkpoints_to_keep: 3
+
+model_name_or_path:
+  clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
+  swinv2: /home/yuxiang/liao/resources/downloaded_models/swinv2-base-patch4-window8-256
+  rad_dino_maira2: /home/yuxiang/liao/resources/downloaded_models/rad-dino-maira-2
+  llama32_1b: /home/yuxiang/liao/resources/downloaded_models/Llama-3.2-1B
+
+# The image processor depends on the model.vision_backbone
+preprocess_dataset: False
+preprocess:
+  image_processor: rad_dino_maira2
+  text_processor: llama32_1b
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/clipbase_rbg224 # rad_dino_maira2_rbg518
+  batched: True
+  batch_size: 32
+  num_proc: 12
+
+# path to checkpoint or, bool;
+# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
+resume_from_checkpoint: False
+# if test_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
+test_only: False
+use_debug_subset: False
+
+model:
+  vision_model: rad_dino_maira2
+  language_model: llama32_1b
+  chat_template: /home/yuxiang/liao/workspace/arrg_img2text/llama3_chat_template.jinja
+
+train:
+  stage: 2 # stage1: pre-train the image_adaptor, freeze encoder and decoder; stage2: use peft to train image adaptor and decoder
+
+  seed: 42
+  num_epochs: 1
+  batch_size: 1
+  grad_accum_steps: 8
+  warmup_proportion: 0.1
+
+  lr: 0.0001
+  clip_grad_norm: 1.0
+  mixed_precision: "fp16" # ‘no’,‘fp16’,‘bf16’. bf16 for A100 and cpu, fp16 for V100
+
+  print_loss_per_n_steps: 1
+  eval_per_steps: 2
+
+eval:
+  batch_size: 2
+  max_new_tokens: 20
