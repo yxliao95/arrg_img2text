@@ -62,9 +62,10 @@ train:
   mixed_precision: "bf16" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
   print_loss_per_n_steps: 1000 # logging loss on .log file
-  eval_per_steps: 10000 # 550395 / 32 = 17199, 170801 / 64 = 2669
+  eval_per_steps: 5500 # 550395 / 32 = 17199, 170801 / 8 = 21350
 
 eval:
   batch_size: 2
   max_new_tokens: 512
+  print_log_per_n_steps: 300
 
