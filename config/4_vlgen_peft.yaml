@@ -64,3 +64,4 @@ train:
 eval:
   batch_size: 2
   max_new_tokens: 20
+  print_log_per_n_steps: 1

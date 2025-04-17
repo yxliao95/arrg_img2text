@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=4_vlgen_effu_test_1ep
+#SBATCH --job-name=4_vlgen_effu_fsdp_peft_test
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -8,12 +8,12 @@
 #SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
-#SBATCH --partition=accel_ai
+#SBATCH --partition=accel_ai_dev
 #SBATCH --gres=gpu:2
 ### SBATCH -t 0-00:00
 
 # Number of CPU cores per task to allocate, (maximun of 8 cpus for 2 gpus, 16 for compute nodes)
-#SBATCH --ntasks=1
+#SBATCH --ntasks=2
 #SBATCH --cpus-per-task=8
 
 cuda=CUDA/12.4
@@ -33,14 +33,16 @@ nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/scrat
 echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
-export TORCH_DISTRIBUTED_DEBUG=INFO
-export NCCL_TIMEOUT=3600  # 默认是 1800 秒（30 分钟），你可以设置更大，比如 3600
+export TORCH_DISTRIBUTED_DEBUG=OFF # OFF, INFO, or DETAIL
+export NCCL_TIMEOUT=1800  # 默认是 1800 秒（30 分钟），你可以设置更大，比如 3600
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # 避免碎片化
 accelerate launch\
     --multi_gpu \
-    --main_process_port 29555 \
-    /scratch/c.c21051562/workspace/arrg_img2text/4_vlgen_effu_fsdp.py \
+    --num_processes 2 \
+    --main_process_port 29556 \
+    /scratch/c.c21051562/workspace/arrg_img2text/4_1_vlgen_effu_fsdp_peft.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu_fsdp.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_1_vlgen_effu_fsdp_peft.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     # --resume_from_checkpoint True
