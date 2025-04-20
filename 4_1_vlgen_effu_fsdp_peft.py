@@ -4,6 +4,7 @@
 #############################################
 import argparse
 import datetime
+import gc
 import glob
 import json
 import logging
@@ -15,7 +16,7 @@ import shutil
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import datasets
 import imagehash
@@ -66,6 +67,8 @@ from transformers import (
     VisionEncoderDecoderModel,
     get_cosine_schedule_with_warmup,
 )
+from transformers.generation import GenerationConfig
+from transformers.generation import utils as tf_generation_utils
 from transformers.modeling_outputs import BaseModelOutput, ModelOutput
 from transformers.models.dinov2.modeling_dinov2 import Dinov2Embeddings
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
@@ -126,31 +129,33 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         if hasattr(self, "enc_to_dec_proj"):
             del self.enc_to_dec_proj  # 移除投影层
 
-    def _inject_image_features(self, input_ids, inputs_embeds, image_features):
+    def _inject_image_features(self, input_ids, decoder_input_ids, image_features):
         # image_indices_map 是一个嵌套list，每个样本对应一个list，list中的元素是图像在 last_hidden_state 中的索引
         # e.g. [[0], [1], [2, 3], ...]
 
         # replace img features with the <|image_token|> placeholder token in the input text
         special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
-        special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+        special_image_mask = special_image_mask.expand_as(decoder_input_ids).to(decoder_input_ids.device)
 
-        # 保证所有 image_features 都能够被复制到 inputs_embeds 中
-        assert special_image_mask.sum() == image_features.numel(), f"special_image_mask.sum()={special_image_mask.sum()}, image_features.numel()={image_features.numel()}, should be equal to guarantee that all image features are copied to inputs_embeds"
+        # 保证所有 image_features 都能够被复制到 decoder_input_ids 中
+        assert special_image_mask.sum() == image_features.numel(), f"special_image_mask.sum()={special_image_mask.sum()}, image_features.numel()={image_features.numel()}, should be equal to guarantee that all image features are copied to decoder_input_ids"
 
-        image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        image_features = image_features.to(decoder_input_ids.device, decoder_input_ids.dtype)
+        decoder_input_ids = decoder_input_ids.masked_scatter(special_image_mask, image_features)
 
-        return inputs_embeds
+        return decoder_input_ids
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        decoder_assistant_masks: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[torch.FloatTensor]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -158,58 +163,70 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_loss: Optional[bool] = False,
-        assistant_masks: Optional[torch.Tensor] = None,
-        encoder_outputs: Optional[ModelOutput] = None,
         **kwargs,
     ) -> Union[Tuple, Vision2LanguageOutputWithPast]:
         """Additional args:
-        `inputs_embeds`: should represent the text embeddings with image features injected.
-        `encoder_outputs`: in inference statge, we encode `pixel_values` and get `encoder_outputs` outside this forward method. This is because the `pixel_values` and `input_ids` have different batch sizes, which cause error in generate().
+        `decoder_inputs_embeds`: should represent the text embeddings with image features injected.
+        `encoder_outputs`: in inference statge, we encode `pixel_values` and get `encoder_outputs` outside this forward method. This is because the `pixel_values` and `decoder_input_ids` have different batch sizes, which cause error in generate().
 
-        If `output_loss` is True, by default we use `input_ids` as `labels`.
-        And the `assistant_masks` should be provided to compute the loss.
-        `assistant_masks` is provided by `tokenizer.apply_chat_template`.
-        `assistant_masks` is a tensor with the same shape as input_ids, and the value is 0 or 1. 0: system/user tokens, 1: assistant tokens, which is the tokens that need to be generated.
+        If `output_loss` is True, by default we use `decoder_input_ids` as `labels`.
+        And the `decoder_assistant_masks` should be provided to compute the loss.
+        `decoder_assistant_masks` is provided by `tokenizer.apply_chat_template`.
+        `decoder_assistant_masks` is a tensor with the same shape as decoder_input_ids, and the value is 0 or 1. 0: system/user tokens, 1: assistant tokens, which is the tokens that need to be generated.
         """
+        LOGGER.debug("rank[%s], kwargs %s", ACCELERATOR.process_index, kwargs)
+        LOGGER.debug("rank[%s], pixel_values: %s", ACCELERATOR.process_index, pixel_values.shape if pixel_values is not None else None)
+        LOGGER.debug("rank[%s], decoder_input_ids: %s", ACCELERATOR.process_index, decoder_input_ids)
+        LOGGER.debug("rank[%s], decoder_attention_mask: %s", ACCELERATOR.process_index, decoder_attention_mask.shape)
+        LOGGER.debug("rank[%s], encoder_outputs: %s", ACCELERATOR.process_index, encoder_outputs.to_tuple() if encoder_outputs is not None else None)
+        LOGGER.debug("rank[%s], past_key_values: %s", ACCELERATOR.process_index, past_key_values)
+        LOGGER.debug("rank[%s], decoder_inputs_embeds: %s", ACCELERATOR.process_index, decoder_inputs_embeds)
+        LOGGER.debug("rank[%s], position_ids: %s", ACCELERATOR.process_index, position_ids)
+        LOGGER.debug("rank[%s], logits_to_keep: %s", ACCELERATOR.process_index, logits_to_keep)
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
 
+        # train时，有pixel_values，没有encoder_outputs
+        # inference时，没有pixel_values，有encoder_outputs；encoder_outputs只有第一轮才需要，后续需要忽略
         if (pixel_values is not None) and (encoder_outputs is not None):
-            # train时，传入 pixel_values
-            # inference时，第一轮生成，encoder_outputs 由 do_generate 传入；后续生成则都不需要
-            raise ValueError("You must not specify both pixel_values and encoder_outputs, choose one of them or leave them None (for cache generation).")
+            raise ValueError("You must not specify both pixel_values and encoder_outputs.")
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        # 我们目前没有使用过 decoder_inputs_embeds
+        if (decoder_input_ids is None) ^ (decoder_inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of decoder_input_ids or decoder_inputs_embeds")
 
-        if (pixel_values is not None or encoder_outputs is not None) and inputs_embeds is not None:
-            raise ValueError("You cannot specify both `pixel_values`/`encoder_outputs` and `inputs_embeds` at the same time, and must specify either one")
+        if (pixel_values is not None or encoder_outputs is not None) and decoder_inputs_embeds is not None:
+            raise ValueError("You cannot specify both `pixel_values`/`encoder_outputs` and `decoder_inputs_embeds` at the same time, and must specify either one")
 
-        if inputs_embeds is None:
+        if decoder_inputs_embeds is None:
             # get text embeddings
-            inputs_embeds = self.decoder.get_input_embeddings()(input_ids)
+            decoder_inputs_embeds = self.decoder.get_input_embeddings()(decoder_input_ids)
 
         # 如果有encoder_outputs，就不需要再次 encode pixel_values
         if (pixel_values is not None) and (encoder_outputs is None):
             # get img features
             encoder_outputs = self.encoder(pixel_values=pixel_values, return_dict=True)
 
-        if encoder_outputs is not None:
+        # train forward 以及 inference first round，需要进行这一步
+        # train forward 会提供 pixel_values
+        # inference all rounds 会提供 encoder_outputs，而pixel_values=None；在first round时，past_key_values=None，后续为past_key_values=DynamicCache()
+        if encoder_outputs is not None and past_key_values is None:
             image_features = encoder_outputs.last_hidden_state  # torch.Size([4, 1370, enc_dim])
             # project image features
+            LOGGER.debug("rank[%s], v2lmodel forward image_features shape: %s", ACCELERATOR.process_index, image_features.shape)
             image_features = self.v2l_projector(image_features)
             # inject image features into text embeddings
-            inputs_embeds = self._inject_image_features(input_ids, inputs_embeds, image_features)
+            decoder_inputs_embeds = self._inject_image_features(decoder_input_ids, decoder_inputs_embeds, image_features)
 
-        # Text generation. inputs_embeds is used in replace of input_ids on decoder in all cases.
-        # In train statge, input_ids is encoded into inputs_embeds and then merged with image features.
-        # In inference stage, inputs_embeds is passed from generate(), where the encoding and merging are done in model.do_generate(). We do this in do_generate() as the image_features and input_ids have different batch sizes.
+        # Text generation. decoder_inputs_embeds is used in replace of decoder_input_ids on decoder in all cases.
+        # In train statge, decoder_input_ids is encoded into decoder_inputs_embeds and then merged with image features.
+        # In inference stage, encoder_outputs is passed from generate() in replace of pixel_values.
         decoder_outputs = self.decoder(
-            attention_mask=attention_mask,
+            attention_mask=decoder_attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -224,15 +241,15 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         # text loss
         loss = None
         if output_loss:
-            labels = labels if labels is not None else input_ids
+            labels = labels if labels is not None else decoder_input_ids
 
             # Shift so that tokens < n predict n
-            if assistant_masks is not None:
-                shift_label_mask = assistant_masks[:, 1:]  # torch.Size([bsz, seq_len - 1])
-            elif attention_mask is not None:
-                shift_label_mask = attention_mask[:, 1:]
+            if decoder_assistant_masks is not None:
+                shift_label_mask = decoder_assistant_masks[:, 1:]  # torch.Size([bsz, seq_len - 1])
+            elif decoder_attention_mask is not None:
+                shift_label_mask = decoder_attention_mask[:, 1:]
             else:
-                raise ValueError("assistant_masks or attention_mask should be provided")
+                raise ValueError("decoder_assistant_masks or decoder_attention_mask should be provided")
 
             shift_logits = logits[:, :-1, :]  # torch.Size([bsz, seq_len - 1, vocab_size])
             shift_labels = labels[:, 1:]  # torch.Size([bsz, seq_len - 1])
@@ -251,81 +268,515 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
             image_hidden_states=image_features if pixel_values is not None else None,
         )
 
-    def do_generate(
+    @torch.no_grad()
+    def generate(
         self,
-        input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens=128,
-        **kwargs,
+        inputs,
+        generation_config=None,
+        logits_processor=None,
+        stopping_criteria=None,
+        prefix_allowed_tokens_fn=None,
+        synced_gpus=None,
+        assistant_model=None,
+        streamer=None,
+        negative_prompt_ids=None,
+        negative_prompt_attention_mask=None,
+        **kwargs,  # If the model is an encoder-decoder model, encoder specific kwargs should not be prefixed and decoder specific kwargs should be prefixed with decoder_.
     ):
-        # As the batch size between input_ids and pixel_values may be different,
-        # we construct a dummy_inputs to ensure generate() method can use the correct batch size,
-        # which should be equals to input_ids's batch size.
-        dummy_inputs = torch.ones((input_ids.size(0), 1), dtype=torch.long, device=DEVICE)
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        self._validate_model_class()
+        tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+        assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
+        LOGGER.debug("rank[%s], step1", ACCELERATOR.process_index)
+        LOGGER.debug("rank[%s], tokenizer %s", ACCELERATOR.process_index, tokenizer)
+        LOGGER.debug("rank[%s], assistant_tokenizer: %s", ACCELERATOR.process_index, assistant_tokenizer)
 
-        # We manually encode the pixel_values here, otherwize generate() will create a wrong encoder output (or error) with the dummy_inputs.
-        encoder_outputs = self.encoder(pixel_values=pixel_values, return_dict=True)
+        generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
+        self._validate_model_kwargs(model_kwargs.copy())
+        self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
+        LOGGER.debug("rank[%s], generation_config: %s", ACCELERATOR.process_index, generation_config)
+        LOGGER.debug("rank[%s], model_kwargs step1: %s", ACCELERATOR.process_index, model_kwargs)
+        LOGGER.debug("rank[%s], decoder_input_ids: %s", ACCELERATOR.process_index, model_kwargs["decoder_input_ids"].shape)
+        LOGGER.debug("rank[%s], decoder_attention_mask: %s", ACCELERATOR.process_index, model_kwargs["decoder_attention_mask"].shape)
 
-        # self.main_input_name = "inputs_embeds"
-        outputs = self.generate(
-            inputs=dummy_inputs,
-            encoder_outputs=encoder_outputs,
-            decoder_input_ids=input_ids,
-            decoder_attention_mask=attention_mask,
-            pad_token_id=kwargs["pad_token_id"],
-            bos_token_id=kwargs["bos_token_id"],
-            eos_token_id=kwargs["eos_token_id"],
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=3,
-            return_dict_in_generate=True,
-            output_logits=True,
+        # 2. Set generation parameters if not already defined
+        if synced_gpus is None:
+            synced_gpus = (tf_generation_utils.is_deepspeed_zero3_enabled() or tf_generation_utils.is_fsdp_managed_module(self)) and tf_generation_utils.dist.get_world_size() > 1
+        LOGGER.debug("rank[%s], step2", ACCELERATOR.process_index)
+        LOGGER.debug("rank[%s], synced_gpus: %s (should be True)", ACCELERATOR.process_index, synced_gpus, main_process_only=False)
+
+        logits_processor = logits_processor if logits_processor is not None else tf_generation_utils.LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else tf_generation_utils.StoppingCriteriaList()
+        LOGGER.debug("rank[%s], logits_processor: %s", ACCELERATOR.process_index, logits_processor)
+        LOGGER.debug("rank[%s], stopping_criteria: %s", ACCELERATOR.process_index, stopping_criteria)
+
+        accepts_attention_mask = "attention_mask" in set(tf_generation_utils.inspect.signature(self.forward).parameters.keys())
+        requires_attention_mask = "encoder_outputs" not in model_kwargs
+        kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
+        LOGGER.debug("rank[%s], accepts_attention_mask: %s", ACCELERATOR.process_index, accepts_attention_mask)
+        LOGGER.debug("rank[%s], requires_attention_mask: %s", ACCELERATOR.process_index, requires_attention_mask)
+        LOGGER.debug("rank[%s], kwargs_has_attention_mask: %s", ACCELERATOR.process_index, kwargs_has_attention_mask)
+
+        # 3. Define model inputs
+        inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(inputs, generation_config.bos_token_id, model_kwargs)
+        # batch_size = inputs_tensor.shape[0]
+        # encoder和decoder的bsz可能不一样，我们以decoder的bsz为准
+        batch_size = model_kwargs["decoder_input_ids"].shape[0]
+        LOGGER.debug("rank[%s], step3", ACCELERATOR.process_index)
+        LOGGER.debug("rank[%s], inputs_tensor: %s", ACCELERATOR.process_index, inputs_tensor.shape)
+        LOGGER.debug("rank[%s], model_input_name: %s", ACCELERATOR.process_index, model_input_name)
+        LOGGER.debug("rank[%s], model_kwargs step3: %s", ACCELERATOR.process_index, model_kwargs)
+        LOGGER.debug("rank[%s], batch_size: %s", ACCELERATOR.process_index, batch_size)
+
+        device = inputs_tensor.device
+        self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
+
+        # decoder-only models must use left-padding for batched generation.
+        LOGGER.debug("rank[%s], self.config.is_encoder_decoder %s", ACCELERATOR.process_index, self.config.is_encoder_decoder)
+        if not self.config.is_encoder_decoder and not tf_generation_utils.is_torchdynamo_compiling():
+            # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
+            # Note: If using, `inputs_embeds` this check does not work, because we want to be more hands-off.
+            LOGGER.warning("Should not see this warning!!! A decoder-only architecture is detected, while we are using encoder-decoder model.")
+            if generation_config._pad_token_tensor is not None and batch_size > 1 and len(inputs_tensor.shape) == 2 and torch.sum(inputs_tensor[:, -1] == generation_config._pad_token_tensor) > 0:
+                LOGGER.warning("A decoder-only architecture is being used, but right-padding was detected! For correct " "generation results, please set `padding_side='left'` when initializing the tokenizer.")
+
+        # 4. Define other model kwargs
+        # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+        # generating the first new token or not, and we only want to use the embeddings for the first new token)
+        LOGGER.debug("rank[%s], step4", ACCELERATOR.process_index)
+        LOGGER.debug("rank[%s], Conv2D weight shape: %s", ACCELERATOR.process_index, self.encoder.embeddings.patch_embeddings.projection.weight.shape, main_process_only=False)
+        if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+            generation_config.use_cache = True
+
+        if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
+            model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(inputs_tensor, generation_config, model_kwargs)
+            LOGGER.debug("rank[%s], model_kwargs['attention_mask']: %s", ACCELERATOR.process_index, model_kwargs["attention_mask"].shape)
+        elif kwargs_has_attention_mask:
+            # TODO (joao): generalize this check with other types of inputs
+            if model_input_name == "input_ids" and len(model_kwargs["attention_mask"].shape) > 2:
+                raise ValueError("`attention_mask` passed to `generate` must be 2D.")
+
+        if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
+            # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
+            model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(inputs_tensor, model_kwargs, model_input_name, generation_config)
+            LOGGER.debug("rank[%s], model_kwargs step4: %s", ACCELERATOR.process_index, model_kwargs)
+            LOGGER.debug("rank[%s], model_kwargs['encoder_outputs'].last_hidden_state: %s", ACCELERATOR.process_index, model_kwargs["encoder_outputs"].last_hidden_state.shape)
+            LOGGER.debug("rank[%s], model_kwargs['encoder_outputs'].pooler_output: %s", ACCELERATOR.process_index, model_kwargs["encoder_outputs"].pooler_output.shape)
+
+        # 5. Prepare `input_ids` which will be used for auto-regressive generation
+        LOGGER.debug("rank[%s], step5", ACCELERATOR.process_index)
+        if self.config.is_encoder_decoder:
+            LOGGER.debug("rank[%s], model_input_name: %s", ACCELERATOR.process_index, model_input_name)
+            LOGGER.debug("rank[%s], before decoder_start_token_id: %s", ACCELERATOR.process_index, generation_config._decoder_start_token_tensor)
+            # 原始方法，当input_ids不是以decoder_start_token_id开头时，添加decoder_start_token_id
+            # 更新后的方法，当input_ids不是以decoder_start_token_id 或 pad_token_id 开头时，添加decoder_start_token_id
+            # 因为我们在collect_fn中，会将input_ids以8的倍数填充left padding，然后紧跟着decoder_start_token_id和正文
+            input_ids, model_kwargs = self._prepare_decoder_input_ids_for_generation(
+                batch_size=batch_size,
+                model_input_name=model_input_name,
+                model_kwargs=model_kwargs,
+                decoder_start_token_id=generation_config._decoder_start_token_tensor,
+                pad_token_id=torch.tensor(generation_config.pad_token_id, device=inputs_tensor.device),
+                device=inputs_tensor.device,
+            )
+            LOGGER.debug("rank[%s], input_ids: %s", ACCELERATOR.process_index, input_ids.shape)
+            LOGGER.debug("rank[%s], input_ids: %s", ACCELERATOR.process_index, input_ids.tolist())
+            LOGGER.debug("rank[%s], model_kwargs step5: %s", ACCELERATOR.process_index, model_kwargs)
+        else:
+            input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+
+        if generation_config.token_healing:
+            input_ids = self.heal_tokens(input_ids, tokenizer)
+
+        if streamer is not None:
+            streamer.put(input_ids.cpu())
+
+        # 6. Prepare `max_length` depending on other stopping criteria.
+        LOGGER.debug("rank[%s], step6", ACCELERATOR.process_index)
+        input_ids_length = input_ids.shape[-1]
+        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+        has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+        generation_config = self._prepare_generated_length(
+            generation_config=generation_config,
+            has_default_max_length=has_default_max_length,
+            has_default_min_length=has_default_min_length,
+            model_input_name=model_input_name,
+            inputs_tensor=inputs_tensor,
+            input_ids_length=input_ids_length,
         )
+        LOGGER.debug("rank[%s], input_ids_length: %s", ACCELERATOR.process_index, input_ids_length)
+        LOGGER.debug("rank[%s], has_default_max_length: %s", ACCELERATOR.process_index, has_default_max_length)
+        LOGGER.debug("rank[%s], has_default_min_length: %s", ACCELERATOR.process_index, has_default_min_length)
+        LOGGER.debug("rank[%s], generation_config: %s", ACCELERATOR.process_index, type(generation_config))
 
-        return outputs
+        # If the model supports `logits_to_keep` in forward(), set it to 1 to avoid computing the whole
+        # logit matrix. This can save a lot of memory during the first forward pass. Note that assisted decoding
+        # dynamically overrides this value as it can need more than the last token logits
+        if self._supports_logits_to_keep() and "logits_to_keep" not in model_kwargs:
+            model_kwargs["logits_to_keep"] = 1
+            LOGGER.debug("rank[%s], model_kwargs step6: %s", ACCELERATOR.process_index, model_kwargs)
 
-    def prepare_inputs_for_generation(
+        self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+
+        # 7. Prepare the cache.
+        # - `model_kwargs` may be updated in place with a cache as defined by the parameters in `generation_config`.
+        # - different models have a different cache name expected by the model (default = "past_key_values")
+        # - `max_length`, prepared above, is used to determine the maximum cache length
+        max_cache_length = generation_config.max_length - 1
+        if inputs_tensor.shape[1] != input_ids_length and model_input_name == "inputs_embeds" and not self.config.is_encoder_decoder:
+            max_cache_length += inputs_tensor.shape[1]
+        self._prepare_cache_for_generation(generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device)
+
+        # 8. determine generation mode
+        LOGGER.debug("rank[%s], step8", ACCELERATOR.process_index)
+        generation_mode = generation_config.get_generation_mode(assistant_model)
+        LOGGER.debug("rank[%s], generation_mode %s", ACCELERATOR.process_index, generation_mode)
+
+        if streamer is not None and (generation_config.num_beams > 1):
+            raise ValueError("`streamer` cannot be used with beam search (yet!). Make sure that `num_beams` is set to 1.")
+
+        if not tf_generation_utils.is_torchdynamo_compiling() and self.device.type != input_ids.device.type:
+            tf_generation_utils.warnings.warn(
+                "You are calling .generate() with the `input_ids` being on a device type different" f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model" f" is on {self.device.type}. You may experience unexpected behaviors or slower generation." " Please make sure that you have put `input_ids` to the" f" correct device by calling for example input_ids = input_ids.to('{self.device.type}') before" " running `.generate()`.",
+                UserWarning,
+            )
+
+        # 9. prepare logits processors and stopping criteria
+        prepared_logits_processor = self._get_logits_processor(
+            generation_config=generation_config,
+            input_ids_seq_length=input_ids_length,
+            encoder_input_ids=inputs_tensor,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            logits_processor=logits_processor,
+            device=inputs_tensor.device,
+            model_kwargs=model_kwargs,
+            negative_prompt_ids=negative_prompt_ids,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+        )
+        prepared_stopping_criteria = self._get_stopping_criteria(generation_config=generation_config, stopping_criteria=stopping_criteria, tokenizer=tokenizer, **kwargs)
+
+        # Set model_kwargs `use_cache` so we can use it later in forward runs
+        model_kwargs["use_cache"] = generation_config.use_cache
+        LOGGER.debug("rank[%s], model_kwargs step9: %s", ACCELERATOR.process_index, model_kwargs)
+
+        # 10. go into different generation modes
+        result = None
+        if generation_mode == tf_generation_utils.GenerationMode.ASSISTED_GENERATION:
+            if generation_config.num_return_sequences > 1:
+                raise ValueError("num_return_sequences has to be 1 when doing assisted generate, " f"but is {generation_config.num_return_sequences}.")
+            if batch_size > 1:
+                raise ValueError("assisted generate is only supported for batch_size = 1")
+            if not model_kwargs["use_cache"]:
+                raise ValueError("assisted generate requires `use_cache=True`")
+            if generation_config.cache_implementation in ["static", "hybrid", "sliding_window"]:
+                raise ValueError("assisted generate is not supported with Static cache classes`")
+            if self._is_stateful:
+                # In assisted generation we need the ability to confirm whether the model would pick certain tokens,
+                # which is not possible with stateful models (they can't reset to a previous subset of generated text)
+                raise ValueError(f"assisted generation is not supported with stateful models, such as {self.__class__.__name__}")
+
+            # 11. Get the candidate generator, given the parameterization
+            candidate_generator = self._get_candidate_generator(
+                generation_config=generation_config,
+                input_ids=input_ids,
+                inputs_tensor=inputs_tensor,
+                assistant_model=assistant_model,
+                logits_processor=logits_processor,
+                target_tokenizer=tokenizer,
+                assistant_tokenizer=assistant_tokenizer,
+                model_kwargs=model_kwargs,
+            )
+
+            # 12. run assisted generate
+            result = self._assisted_decoding(
+                input_ids,
+                candidate_generator=candidate_generator,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                streamer=streamer,
+                **model_kwargs,
+            )
+        elif generation_mode == tf_generation_utils.GenerationMode.DOLA_GENERATION:
+            if self._is_stateful:
+                # DoLa decoding was not designed for stateful models, and would require some changes
+                raise ValueError(f"dola decoding is not supported with stateful models, such as {self.__class__.__name__}")
+            result = self._dola_decoding(
+                input_ids,
+                dola_layers=generation_config.dola_layers,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                streamer=streamer,
+                **model_kwargs,
+            )
+
+        elif generation_mode == tf_generation_utils.GenerationMode.CONTRASTIVE_SEARCH:
+            if not model_kwargs["use_cache"]:
+                raise ValueError("Contrastive search requires `use_cache=True`")
+            if self._is_stateful:
+                # Just like assisted generation, we need to be able to rollback to a previous state (see comment above)
+                raise ValueError(f"contrastive search is not supported with stateful models, such as {self.__class__.__name__}")
+
+            result = self._contrastive_search(
+                input_ids,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                streamer=streamer,
+                **model_kwargs,
+            )
+
+        elif generation_mode in (tf_generation_utils.GenerationMode.SAMPLE, tf_generation_utils.GenerationMode.GREEDY_SEARCH):
+            # 11. expand input_ids with `num_return_sequences` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids=input_ids,
+                expand_size=generation_config.num_return_sequences,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
+            )
+
+            # 12. run sample (it degenerates to greedy search when `generation_config.do_sample=False`)
+            result = self._sample(
+                input_ids,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                streamer=streamer,
+                **model_kwargs,
+            )
+
+        elif generation_mode in (tf_generation_utils.GenerationMode.BEAM_SAMPLE, tf_generation_utils.GenerationMode.BEAM_SEARCH):
+            # 11. prepare beam search scorer
+            beam_scorer = tf_generation_utils.BeamSearchScorer(
+                batch_size=batch_size,
+                num_beams=generation_config.num_beams,
+                device=inputs_tensor.device,
+                length_penalty=generation_config.length_penalty,
+                do_early_stopping=generation_config.early_stopping,
+                num_beam_hyps_to_keep=generation_config.num_return_sequences,
+                max_length=generation_config.max_length,
+            )
+
+            # 12. interleave input_ids with `num_beams` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids=input_ids,
+                expand_size=generation_config.num_beams,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
+            )
+
+            # 13. run beam sample
+            result = self._beam_search(
+                input_ids,
+                beam_scorer,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif generation_mode == tf_generation_utils.GenerationMode.GROUP_BEAM_SEARCH:
+            # 11. prepare beam search scorer
+            beam_scorer = tf_generation_utils.BeamSearchScorer(
+                batch_size=batch_size,
+                num_beams=generation_config.num_beams,
+                device=inputs_tensor.device,
+                length_penalty=generation_config.length_penalty,
+                do_early_stopping=generation_config.early_stopping,
+                num_beam_hyps_to_keep=generation_config.num_return_sequences,
+                num_beam_groups=generation_config.num_beam_groups,
+                max_length=generation_config.max_length,
+            )
+            # 12. interleave input_ids with `num_beams` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids=input_ids,
+                expand_size=generation_config.num_beams,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
+            )
+            # 13. run beam search
+            result = self._group_beam_search(
+                input_ids,
+                beam_scorer,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif generation_mode == tf_generation_utils.GenerationMode.CONSTRAINED_BEAM_SEARCH:
+            final_constraints = []
+            if generation_config.constraints is not None:
+                final_constraints = generation_config.constraints
+
+            if generation_config.force_words_ids is not None:
+
+                def typeerror():
+                    raise ValueError("`force_words_ids` has to either be a `List[List[List[int]]]` or `List[List[int]]` " f"of positive integers, but is {generation_config.force_words_ids}.")
+
+                if not isinstance(generation_config.force_words_ids, list) or len(generation_config.force_words_ids) == 0:
+                    typeerror()
+
+                for word_ids in generation_config.force_words_ids:
+                    if isinstance(word_ids[0], list):
+                        if not isinstance(word_ids, list) or len(word_ids) == 0:
+                            typeerror()
+                        if any(not isinstance(token_ids, list) for token_ids in word_ids):
+                            typeerror()
+                        if any(any((not isinstance(token_id, int) or token_id < 0) for token_id in token_ids) for token_ids in word_ids):
+                            typeerror()
+
+                        constraint = tf_generation_utils.DisjunctiveConstraint(word_ids)
+                    else:
+                        if not isinstance(word_ids, list) or len(word_ids) == 0:
+                            typeerror()
+                        if any((not isinstance(token_id, int) or token_id < 0) for token_id in word_ids):
+                            typeerror()
+
+                        constraint = tf_generation_utils.PhrasalConstraint(word_ids)
+                    final_constraints.append(constraint)
+
+            # 11. prepare beam search scorer
+            constrained_beam_scorer = tf_generation_utils.ConstrainedBeamSearchScorer(
+                constraints=final_constraints,
+                batch_size=batch_size,
+                num_beams=generation_config.num_beams,
+                device=inputs_tensor.device,
+                length_penalty=generation_config.length_penalty,
+                do_early_stopping=generation_config.early_stopping,
+                num_beam_hyps_to_keep=generation_config.num_return_sequences,
+                max_length=generation_config.max_length,
+            )
+            # 12. interleave input_ids with `num_beams` additional sequences per batch
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids=input_ids,
+                expand_size=generation_config.num_beams,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
+            )
+            # 13. run beam search
+            result = self._constrained_beam_search(
+                input_ids,
+                constrained_beam_scorer=constrained_beam_scorer,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        # Convert to legacy cache format if requested
+        if generation_config.return_legacy_cache is True and not tf_generation_utils.is_torchdynamo_compiling() and hasattr(result, "past_key_values") and getattr(result.past_key_values, "to_legacy_cache") is not None:
+            result.past_key_values = result.past_key_values.to_legacy_cache()
+        return result
+
+    def _prepare_decoder_input_ids_for_generation(
         self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        encoder_outputs=None,
-        pixel_values=None,
-        cache_position=None,
-        logits_to_keep=None,
-        **kwargs,
-    ):
+        batch_size: int,
+        model_input_name: str,
+        model_kwargs: Dict[str, torch.Tensor],
+        decoder_start_token_id: torch.Tensor,
+        pad_token_id: torch.Tensor,
+        device: torch.device = None,
+    ) -> Tuple[torch.LongTensor, Dict[str, torch.Tensor]]:
+        """Prepares `decoder_input_ids` for generation with encoder-decoder models
+        Update: if the first token is not decoder_start_token_id or pad_token_id, we need to prepend decoder_start_token_id. Because our input_ids are left padded to multiple of 8, and then followed by decoder_start_token_id and the real input_ids. It is done in the collate_fn.
         """
-        Copy from LLaVA.
-        Overwritten -- in specific circumstances we don't want to forward image inputs to the model.
-        """
+        # 1. Check whether the user has defined `decoder_input_ids` manually. To facilitate in terms of input naming,
+        # we also allow the user to pass it under `input_ids`, if the encoder does not use it as the main input.
+        if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
+            decoder_input_ids = model_kwargs.pop("decoder_input_ids")
+        elif "input_ids" in model_kwargs and model_input_name != "input_ids":
+            decoder_input_ids = model_kwargs.pop("input_ids")
+        else:
+            decoder_input_ids = None
 
-        # At the first round, we need encoder_outputs (encoded from pixel_values) and input_ids
-        # At the following rounds, we need input_ids (the generated ones) and past_key_values (represent the previous input_embeds for decoder)
+        # 2. `decoder_start_token_id` must have shape (batch_size, 1)
+        if device is None:
+            device = self.device
+        if decoder_start_token_id.ndim == 1:
+            if decoder_start_token_id.shape[0] != batch_size:
+                raise ValueError(f"`decoder_start_token_id` expected to have length {batch_size} but got {decoder_start_token_id.shape[0]}")
+            decoder_start_token_id = decoder_start_token_id.view(-1, 1)
+        else:
+            decoder_start_token_id = torch.ones((batch_size, 1), dtype=torch.long, device=device) * decoder_start_token_id
 
-        # If we're in cached decoding stage (after the first round), pixel values should be None
-        # because input ids do not contain special image token anymore
-        model_inputs = self.decoder.prepare_inputs_for_generation(
-            input_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            logits_to_keep=logits_to_keep,
-            **kwargs,
-        )
+        # 3. Encoder-decoder models expect the `decoder_input_ids` to start with a special token. Let's ensure that.
+        # no user input -> use decoder_start_token_id as decoder_input_ids
+        if decoder_input_ids is None:
+            decoder_input_ids = decoder_start_token_id
+        # exception: Donut checkpoints have task-specific decoder starts and don't expect a BOS token. Note that the
+        # original checkpoints can't be detected through `self.__class__.__name__.lower()`, needing custom logic.
+        # See: https://github.com/huggingface/transformers/pull/31470
+        elif "donut" in self.__class__.__name__.lower() or (self.config.model_type == "vision-encoder-decoder" and "donut" in self.config.encoder.model_type.lower()):
+            pass
+        elif self.config.model_type in ["whisper"]:
+            pass
+        # user input but doesn't start with decoder_start_token_id -> prepend decoder_start_token_id (and adjust
+        # decoder_attention_mask if provided)
+        # !!! Update: if the first token is not decoder_start_token_id or pad_token_id, we need to prepend decoder_start_token_id
+        elif ((decoder_input_ids[:, 0] != decoder_start_token_id[:, 0]) & (decoder_input_ids[:, 0] != pad_token_id)).all().item():
+            decoder_input_ids = torch.cat([decoder_start_token_id, decoder_input_ids], dim=-1)
+            if "decoder_attention_mask" in model_kwargs:
+                decoder_attention_mask = model_kwargs["decoder_attention_mask"]
+                decoder_attention_mask = torch.cat(
+                    (torch.ones_like(decoder_attention_mask)[:, :1], decoder_attention_mask),
+                    dim=-1,
+                )
+                model_kwargs["decoder_attention_mask"] = decoder_attention_mask
 
-        # At the first generation round, we need encoder_outputs to be passed to model. pixel_values has encoded into encoder_outputs in do_generate().
-        # e.g.
-        # at the first round, cache_position == tensor([   0,    1,    2,  ..., 2805, 2806, 2807])
-        # at second round, cache_position == tensor([2808])
-        if cache_position[0] == 0:
-            # model_inputs["pixel_values"] = pixel_values
-            model_inputs["encoder_outputs"] = encoder_outputs
+        return decoder_input_ids, model_kwargs
 
-        return model_inputs
+    # def prepare_inputs_for_generation(
+    #     self,
+    #     input_ids,
+    #     past_key_values=None,
+    #     attention_mask=None,
+    #     inputs_embeds=None,
+    #     encoder_outputs=None,
+    #     pixel_values=None,
+    #     cache_position=None,
+    #     logits_to_keep=None,
+    #     **kwargs,
+    # ):
+    #     """
+    #     Copy from LLaVA.
+    #     Overwritten -- in specific circumstances we don't want to forward image inputs to the model.
+    #     It will be invoked via `model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)`
+    #     And the model_kwargs will be like:
+    #     """
+
+    #     # At the first round, we need encoder_outputs (encoded from pixel_values) and input_ids
+    #     # At the following rounds, we need input_ids (the generated ones) and past_key_values (represent the previous input_embeds for decoder)
+
+    #     # If we're in cached decoding stage (after the first round), pixel values should be None
+    #     # because input ids do not contain special image token anymore
+    #     model_inputs = self.decoder.prepare_inputs_for_generation(
+    #         input_ids,
+    #         past_key_values=past_key_values,
+    #         inputs_embeds=inputs_embeds,
+    #         attention_mask=attention_mask,
+    #         cache_position=cache_position,
+    #         logits_to_keep=logits_to_keep,
+    #         **kwargs,
+    #     )
+
+    #     # At the first generation round, we need encoder_outputs to be passed to model. pixel_values has been encoded into encoder_outputs
+    #     # e.g.
+    #     # at the first round, cache_position == tensor([   0,    1,    2,  ..., 2805, 2806, 2807])
+    #     # at second round, cache_position == tensor([2808])
+    #     if cache_position[0] == 0:
+    #         # model_inputs["pixel_values"] = pixel_values
+    #         model_inputs["encoder_outputs"] = encoder_outputs
+
+    #     return model_inputs
 
 
 class ImageTextDataset(Dataset):
@@ -400,23 +851,25 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
 
     input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
 
-    assistant_masks = None
-    if "assistant_masks" in input_text_tensor_dict:
-        assistant_masks = input_text_tensor_dict.assistant_masks
-        if isinstance(assistant_masks, list):  # transformers==4.47.1 will return assistant_masks in nested list
-            assistant_masks = torch.tensor(assistant_masks)
-        assistant_masks = assistant_masks.to(DEVICE)
+    decoder_assistant_masks = None
+    if "decoder_assistant_masks" in input_text_tensor_dict:
+        decoder_assistant_masks = input_text_tensor_dict.decoder_assistant_masks
+        if isinstance(decoder_assistant_masks, list):  # transformers==4.47.1 will return decoder_assistant_masks in nested list
+            decoder_assistant_masks = torch.tensor(decoder_assistant_masks)
+        decoder_assistant_masks = decoder_assistant_masks.to(DEVICE)
 
     gold_text_list = None
     if do_inference:
         gold_text_list = [" ".join(i["split_sents"]) for i in batch_data]
 
+    # LOGGER.debug("rank[%s], input text: %s", ACCELERATOR.process_index, tokenizer.batch_decode(input_text_tensor_dict.input_ids)
+
     return {
         "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
-        "input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
-        "attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
-        "assistant_masks": assistant_masks,
+        "decoder_input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
+        "decoder_attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
+        "decoder_assistant_masks": decoder_assistant_masks,
         "data_id_list": [i["doc_key"] for i in batch_data],
         "gold_text_list": gold_text_list,
     }
@@ -538,10 +991,8 @@ class MLflowTracker:
 #############################################
 
 
-def train(model, train_dataloader):
+def train(model, train_dataloader, train_cfg):
     global MLFLOW_TRACKER, STATUS_INFO
-
-    train_cfg = CONFIG["train"]
 
     # hyperparameters
     model_params = list(model.named_parameters())
@@ -604,13 +1055,10 @@ def train(model, train_dataloader):
                 optimizer.zero_grad()
 
                 check_memory(show_only_if_peak=True)
-                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["input_ids"].size(0), lr=scheduler.get_last_lr()[0])
+                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["decoder_input_ids"].size(0), lr=scheduler.get_last_lr()[0], train_cfg=train_cfg)
 
-                # eval and save
-                # validation_process(model, valid_dataloader, max_num_iters_per_epoch=len(train_dataloader))
-
-                # we dont do validation here, as it cost too much time
-                save_and_checkpoint_process(model, max_num_iters_per_epoch=len(train_dataloader))
+                # we dont do validation, as it cost too much time
+                check_and_save_checkpoint(model, max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
 
         end = time.time()
         LOGGER.info("Batch training time: %s ", seconds_to_time_str(end - start))
@@ -664,7 +1112,7 @@ def check_status_and_resume_checkpoint():
     return epoch_resumed, iter_resumed
 
 
-def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
+def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr, train_cfg):
     STATUS_INFO.curr_epoch = curr_epoch
     STATUS_INFO.curr_batch_iter = curr_iter
     STATUS_INFO.batch_trained_examples += bsz
@@ -675,7 +1123,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
         STATUS_INFO.global_update_steps += 1
 
     # Logging too often may slow down the process
-    print_loss_per_n_steps = CONFIG["train"]["print_loss_per_n_steps"]
+    print_loss_per_n_steps = train_cfg["print_loss_per_n_steps"]
     if STATUS_INFO.global_update_steps == 1 or STATUS_INFO.global_update_steps % print_loss_per_n_steps == 0:
         avg_loss = STATUS_INFO.batch_loss / STATUS_INFO.batch_trained_examples
 
@@ -701,14 +1149,12 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr):
         STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
 
 
-def save_and_checkpoint_process(model, max_num_iters_per_epoch):
-    train_cfg = CONFIG["train"]
-
+def check_and_save_checkpoint(model, max_num_iters_per_epoch, train_cfg):
     do_ckp = True
-    # eval at the end of each epoch
+    # do_ckp at the end of each epoch
     if STATUS_INFO.curr_batch_iter + 1 == max_num_iters_per_epoch:
         STATUS_INFO.curr_checkpoint_at = "epoch"
-    # eval at specific steps:
+    # do_ckp at specific steps:
     elif train_cfg["ckp_per_steps"] > 0 and STATUS_INFO.global_update_steps % train_cfg["ckp_per_steps"] == 0:
         STATUS_INFO.curr_checkpoint_at = "batch"
     else:
@@ -723,16 +1169,15 @@ def save_and_checkpoint_process(model, max_num_iters_per_epoch):
 
     if do_ckp:
         check_memory()
-        STATUS_INFO.grad_accum_eval_mark = STATUS_INFO.global_update_steps  # this line shoud runs before check_results_and_save_model(), to set the correct STATUS_INFO.grad_accum_eval_mark for checkpoingting
+        STATUS_INFO.grad_accum_eval_mark = STATUS_INFO.global_update_steps  # this line shoud runs before save_checkpoint(), to set the correct STATUS_INFO.grad_accum_eval_mark for checkpoingting
         save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
-        save_model(model, CONFIG["output_dir"]["model"])
 
 
 #############################################
 # Validation
+# Since the validation process takes a lot of time, we skip the validation process in training.
 #############################################
-def validation_process(model, valid_dataloader, max_num_iters_per_epoch):
-    train_cfg = CONFIG["train"]
+def validation_process(model, valid_dataloader, max_num_iters_per_epoch, train_cfg):
 
     do_eval = True
     # eval at the end of each epoch
@@ -790,14 +1235,18 @@ def check_results_and_save_model(model, eval_result_dict):
 #############################################
 # Evaluation
 #############################################
-def evaluate(model, target_dataloader, output_result=False):
+def evaluate(model, target_dataloader, output_result=False, **kwargs):
     global PEAK_MEM
 
     PEAK_MEM = 0
 
+    eval_bsz = kwargs["eval_batch_size"]
+    max_new_tokens = kwargs["max_new_tokens"]
+    print_pred_per_n_steps = kwargs["print_pred_per_n_steps"]
+
     LOGGER.info("****************************** Evaluation ******************************")
     LOGGER.info("Source = %s", target_dataloader.dataset.src_path)
-    LOGGER.info("Batch size = %d", CONFIG["eval"]["batch_size"])
+    LOGGER.info("Batch size = %d", eval_bsz)
     LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
     tokenizer = target_dataloader.dataset.tokenizer
 
@@ -811,18 +1260,29 @@ def evaluate(model, target_dataloader, output_result=False):
         for batch_idx, input_tensors_dict in enumerate(target_dataloader):
             # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
             with ACCELERATOR.autocast():
-                outputs = model.do_generate(
-                    pixel_values=input_tensors_dict["pixel_values"],
-                    input_ids=input_tensors_dict["input_ids"],
-                    attention_mask=input_tensors_dict["attention_mask"],
+                LOGGER.debug("rank[%s], eval pixel_values shape: %s", ACCELERATOR.process_index, input_tensors_dict["pixel_values"].shape, main_process_only=False)
+
+                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
+                generation_config = GenerationConfig(
+                    max_new_tokens=max_new_tokens,
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
                     eos_token_id=tokenizer.eos_token_id,
-                    max_new_tokens=CONFIG["eval"]["max_new_tokens"],
+                    do_sample=False,
+                    num_beams=3,
+                    return_dict_in_generate=True,
+                    output_logits=True,
+                )
+                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
+                outputs = model.generate(
+                    generation_config=generation_config,
+                    inputs=input_tensors_dict["pixel_values"],
+                    decoder_input_ids=input_tensors_dict["decoder_input_ids"],
+                    decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
                 )
                 check_memory(show_only_if_peak=True)
 
-            pred_seq_start_ids = input_tensors_dict["input_ids"].size(1)  # 生成的序列的起始位置
+            pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
             pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
             pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
             gold_sequences = input_tensors_dict["gold_text_list"]
@@ -832,7 +1292,7 @@ def evaluate(model, target_dataloader, output_result=False):
             pred_seqs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
             gold_seqs.extend(ACCELERATOR.gather_for_metrics(gold_sequences, use_gather_object=True))
 
-            if (CONFIG["eval"]["print_log_per_n_steps"] > 0 and batch_idx % CONFIG["eval"]["print_log_per_n_steps"] == 0) or (batch_idx + 1 == len(target_dataloader)):
+            if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
                 LOGGER.info(
                     "Eval at: p=%s, iter=%d, curr_seq_len=%s, pred_seq_example=%s",
                     ACCELERATOR.process_index,
@@ -958,7 +1418,6 @@ def save_checkpoint(checkpoint_dir, max_to_keep=5):
 
 
 def save_model(model, output_dir):
-
     ACCELERATOR.wait_for_everyone()
     unwrapped_model = ACCELERATOR.unwrap_model(model)
     state_dict = ACCELERATOR.get_state_dict(model)
@@ -975,6 +1434,15 @@ def save_model(model, output_dir):
         )
     ACCELERATOR.wait_for_everyone()
     LOGGER.info("Model saved to %s", output_dir)
+
+
+def save_processors(img_processor, tokenizer, output_dir):
+    ACCELERATOR.wait_for_everyone()
+    if ACCELERATOR.is_main_process:
+        img_processor.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        LOGGER.info("Image Processor and tokenizer are saved to: %s", output_dir)
+    ACCELERATOR.wait_for_everyone()
 
 
 def set_seed(seed):
@@ -1154,6 +1622,7 @@ def load_peft_model(base_model, peft_model_path):
 def load_model(model_path):
     model = Vision2LanguageModel.from_pretrained(model_path)
     LOGGER.info("Fine-tuned model loaded from %s", model_path)
+    LOGGER.debug("Model config: %s", model.config)
     return model
 
 
@@ -1164,27 +1633,25 @@ def load_processor(processor_path):
     return img_processor, tokenizer
 
 
-def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_test=None, use_debug_subset=False):
-    train_cfg = CONFIG["train"]
-    eval_cfg = CONFIG["eval"]
+def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_test=None, train_bsz=1, eval_bsz=1, use_debug_subset=False):
 
     train_dataloader, valid_dataloader, test_dataloader = None, None, None
 
     if ds_train:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
             if use_debug_subset:
-                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 100, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
+                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 10, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
             else:
                 train_dataset = ImageTextDataset(ds_train, img_processor=img_processor, tokenizer=tokenizer, split="train")
-        train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_cfg["batch_size"], drop_last=True)
+        train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_bsz, drop_last=True)
 
     if ds_valid:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
             if use_debug_subset:
-                vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 15, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
+                vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 5, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
             else:
                 vaild_dataset = ImageTextDataset(ds_valid, img_processor=img_processor, tokenizer=tokenizer, split="validation")
-        valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
+        valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_bsz, drop_last=False)
 
     if ds_test:
         with ACCELERATOR.main_process_first():
@@ -1192,7 +1659,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
                 test_dataset = ImageTextDataset(ds_test.select(range(len(ds_test) - 5, len(ds_test))), img_processor=img_processor, tokenizer=tokenizer, split="test")
             else:
                 test_dataset = ImageTextDataset(ds_test, img_processor=img_processor, tokenizer=tokenizer, split="test")
-        test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_cfg["batch_size"], drop_last=False)
+        test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_bsz, drop_last=False)
 
     return train_dataloader, valid_dataloader, test_dataloader
 
@@ -1207,10 +1674,14 @@ def post_init_model_and_tokenizer(model, tokenizer):
     if len(tokenizer) != model.config.decoder.vocab_size:
         LOGGER.info("Resizing model decoder to match tokenizer size: %d -> %d", model.config.decoder.vocab_size, len(tokenizer))
         model.decoder.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8, mean_resizing=True)
+    else:
+        LOGGER.info("Model decoder size matches tokenizer size: %d", model.config.decoder.vocab_size)
 
     # 用于在 input_ids 中查找需要替换的图像占位符 <|image_token|>
     if not hasattr(model.config, "image_token_index"):
         model.config.image_token_index = tokenizer.convert_tokens_to_ids("<|image_token|>")
+    else:
+        LOGGER.info("Model config already has key: image_token_index=%d", model.config.image_token_index)
 
     if not hasattr(tokenizer, "num_image_tokens"):
         # 计算 vision model 输出的图像特征的数量，该数量等于我们应该在 input_ids 中插入 <|image_token|> 的数量
@@ -1218,11 +1689,14 @@ def post_init_model_and_tokenizer(model, tokenizer):
         dummy_img = torch.zeros((1, 3, img_size, img_size))
         num_image_tokens = model.encoder(dummy_img).last_hidden_state.size(1)
         tokenizer.num_image_tokens = num_image_tokens
+    else:
+        LOGGER.info("Tokenizer already has attr: num_image_tokens=%d", tokenizer.num_image_tokens)
 
 
 def init_model(vision_model_path, language_model_path, model_base_cfg):
     LOGGER.info("Initializing vision language mode: %s, %s", vision_model_path, language_model_path)
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(vision_model_path, language_model_path)
+    LOGGER.debug("Model config: %s", model.config)
     return model
 
 
@@ -1290,62 +1764,64 @@ def apply_peft_to_model(model):
     return peft_model
 
 
-def global_init_accelerator(model):
+def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
     global ACCELERATOR, DEVICE, LOGGER
+
+    grad_accum_steps = kwargs["grad_accum_steps"]
+    mixed_precision = kwargs["mixed_precision"]
 
     if isinstance(model, PeftModel):
         ignored_modules = []
         for name, module in model.named_modules():
-            # LOGGER.debug("Module %s, type %s", name, type(module))
             if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding, lora.Embedding)):
                 ignored_modules.append(module)
+        transformer_cls_names_to_wrap = ["LlamaDecoderLayer"]
+        sharding_strategy = "FULL_SHARD"
+        state_dict_type = "SHARDED_STATE_DICT"
 
         # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
-        fsdp_plugin = FullyShardedDataParallelPlugin(
-            sharding_strategy="FULL_SHARD",
-            backward_prefetch="BACKWARD_PRE",
-            auto_wrap_policy="transformer_based_wrap",
-            transformer_cls_names_to_wrap=[
-                "LlamaDecoderLayer",
-            ],
-            ignored_modules=ignored_modules,
-            state_dict_type="SHARDED_STATE_DICT",
-            use_orig_params=True,
-            cpu_offload=False,
-            activation_checkpointing=False,
-        )
     else:
         ignored_modules = []
         for name, module in model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding)):
                 ignored_modules.append(module)
+        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageAdaptor"]
+        sharding_strategy = "FULL_SHARD"
+        state_dict_type = "SHARDED_STATE_DICT"
 
-        # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
-        fsdp_plugin = FullyShardedDataParallelPlugin(
-            # mixed_precision_policy=mixed_precision,
-            sharding_strategy="FULL_SHARD",  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
-            backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
-            auto_wrap_policy="transformer_based_wrap",  # transformer_based_wrap, size_based_wrap, or no_wrap
-            transformer_cls_names_to_wrap=[
-                "LlamaDecoderLayer",
-                "Dinov2Layer",
-                "VisionLanguageAdaptor",
-            ],
-            ignored_modules=ignored_modules,
-            # transformer_layer_cls=int(1e6),
-            state_dict_type="SHARDED_STATE_DICT",  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
-            use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等
-            cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。能节省5G的peak mem，但100iter从3s下降到5s
-            activation_checkpointing=False,  # A technique to reduce memory usage by clearing activations of certain layers and recomputing them during a backward pass. Effectively, this trades extra computation time for reduced memory usage. Will cause RuntimeError: The expanded size of the tensor (2896) must match the existing size (1448) at non-singleton dimension 3.  Target sizes: [2, 32, 1448, 2896].  Tensor sizes: [2, 1, 1448, 1448]
-            # cpu_ram_efficient_loading=True, #If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. Only applicable for Transformers. When using this, sync_module_states needs to be True.
-            # sync_module_states=True,
-        )
+    # 如果不使用这段代码，我们在eval时会遇到 RuntimeError: mat2 must be a matrix, got 1-D tensor
+    # 可能是因为 PEFT modules_to_save 的部分与 FSDP 不兼容。目前的临时解决办法是改成 DDP
+    if fsdp_no_shard:
+        sharding_strategy = "NO_SHARD"
+        state_dict_type = "FULL_STATE_DICT"
+
+    LOGGER.debug("FSDP init")
+    LOGGER.debug("FSDP sharding_strategy: %s", sharding_strategy)
+    LOGGER.debug("FSDP state_dict_type: %s", state_dict_type)
+    # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        # mixed_precision_policy=mixed_precision,
+        sharding_strategy=sharding_strategy,  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
+        backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
+        auto_wrap_policy="transformer_based_wrap",  # transformer_based_wrap, size_based_wrap, or no_wrap
+        transformer_cls_names_to_wrap=transformer_cls_names_to_wrap,
+        ignored_modules=ignored_modules,
+        # transformer_layer_cls=int(1e6),
+        state_dict_type=state_dict_type,  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
+        use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等
+        cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。能节省5G的peak mem，但100iter从3s下降到5s
+        activation_checkpointing=False,  # A technique to reduce memory usage by clearing activations of certain layers and recomputing them during a backward pass. Effectively, this trades extra computation time for reduced memory usage. Will cause RuntimeError: The expanded size of the tensor (2896) must match the existing size (1448) at non-singleton dimension 3.  Target sizes: [2, 32, 1448, 2896].  Tensor sizes: [2, 1, 1448, 1448]
+        # cpu_ram_efficient_loading=True, #If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. Only applicable for Transformers. When using this, sync_module_states needs to be True.
+        # sync_module_states=True,
+    )
+    LOGGER.debug("FSDP sharding_strategy: %s", fsdp_plugin.sharding_strategy)
+    LOGGER.debug("FSDP state_dict_type: %s", fsdp_plugin.state_dict_type)
 
     # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
     # 如果OOM，可以尝试设置 sync_each_batch=True，但是会导致训练速度变慢
     # adjust_scheduler=False，我们在train方法中手动计算 scheduler 在使用梯度累计后的 step
     ga_plugin = GradientAccumulationPlugin(
-        num_steps=CONFIG["train"]["grad_accum_steps"],
+        num_steps=grad_accum_steps,
         adjust_scheduler=False,
         sync_with_dataloader=True,
         sync_each_batch=False,
@@ -1354,7 +1830,7 @@ def global_init_accelerator(model):
     dataloader_cfg = DataLoaderConfiguration(use_seedable_sampler=True)
 
     ACCELERATOR = Accelerator(
-        mixed_precision=CONFIG["train"]["mixed_precision"],
+        mixed_precision=mixed_precision,
         dataloader_config=dataloader_cfg,
         gradient_accumulation_plugin=ga_plugin,
         fsdp_plugin=fsdp_plugin,
@@ -1371,8 +1847,6 @@ def global_init_accelerator(model):
     LOGGER = MultiProcessAdapter(LOGGER, {})  # must initialize the accelerate state by calling either `PartialState()` or `Accelerator()` before using the logging utility.
     LOGGER.info("Available cuda: %d", torch.cuda.device_count())
     LOGGER.info("Accelerator state: %s", ACCELERATOR.state, main_process_only=False)
-    LOGGER.info("Accelerator mixed_precision: %s", ACCELERATOR.mixed_precision)
-    LOGGER.info("Accelerator process idx: %d, device: %s", ACCELERATOR.process_index, ACCELERATOR.device)
     LOGGER.info([i for i in CONFIG.items() if i[0][0] != "_"])
 
 
@@ -1450,88 +1924,145 @@ def global_init_proj_config():
     os.makedirs(output_dirs["checkpoint"], exist_ok=True)
     # os.makedirs(output_dirs["log"], exist_ok=True)
 
-    for key in CONFIG["train"]:
-        if "lr" in key:
-            CONFIG["train"][key] = float(CONFIG["train"][key])
+    for cfg_key in ["pre_train", "train"]:
+        for key in CONFIG[cfg_key]:
+            if "lr" in key:
+                CONFIG[cfg_key][key] = float(CONFIG[cfg_key][key])
 
 
 #############################################
 
 
-def main():
+def pretrain_model(model_base_cfg, vision_model_path, language_model_path):
+    """pre-train the image_adaptor, freeze encoder and decoder"""
+
     model_base_cfg = CONFIG["model"]
     vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
     language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+    train_cfg = CONFIG["pre_train"]
 
     # Train and test
-    set_seed(CONFIG["train"]["seed"])
+    set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
-    if not CONFIG["eval_only"]:
-        img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-        model = init_model(vision_model_path, language_model_path, model_base_cfg)
-        post_init_model_and_tokenizer(model, tokenizer)
-
-        # stage1: train the v2l_projector only, freeze encoder and decoder;
-        # stage2: use peft to train v2l_projector and decoder, freeze encoder.
-        if CONFIG["train"]["stage"] == 1:
-            pass
-        elif CONFIG["train"]["stage"] == 2:
-            model = apply_peft_to_model(model)
-            # LOGGER.debug("Peft model structure: \n%s", model)
-
-        global_init_accelerator(model)
-        check_memory()
-        model.to(DEVICE)
-
-        train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], use_debug_subset=CONFIG["use_debug_subset"])
-
-        check_memory()
-
-        start = time.time()
-        train(model, train_dataloader)
-        end = time.time()
-        LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
-
-        img_processor.save_pretrained(CONFIG["output_dir"]["model"])
-        tokenizer.save_pretrained(CONFIG["output_dir"]["model"])
-        LOGGER.info("Image Processor and tokenizer are saved to: %s", CONFIG["output_dir"]["model"])
-
-    # Final eval on test set
-    if CONFIG["train"]["stage"] == 1:
-        model = load_model(CONFIG["output_dir"]["model"])
-        img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
-        post_init_model_and_tokenizer(model, tokenizer)
-        global_init_accelerator(model)
-
-    elif CONFIG["train"]["stage"] == 2:
-        # 当使用peft时，训练的参数都保存在了peft_model中，包括了扩展后的embedding层。
-        # 所以需要按照训练前的方式初始化base_model，然后将peft_model加载到base_model中。
-        img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-        model = init_model(vision_model_path, language_model_path, model_base_cfg)
-        post_init_model_and_tokenizer(model, tokenizer)
-
-        model = load_peft_model(base_model=model, peft_model_path=CONFIG["output_dir"]["model"])
-        global_init_accelerator(model)
-
-    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
-
+    #####################
+    # Train
+    #####################
+    img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+    model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    post_init_model_and_tokenizer(model, tokenizer)
+    global_init_accelerator(model, **train_cfg)
+    check_memory()
     model.to(DEVICE)
-    model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
+    train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    check_memory()
 
     start = time.time()
-    evaluate(model, validation_dataloader, output_result=True)
+    train(model, train_dataloader, train_cfg=train_cfg)
+    end = time.time()
+    LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
+
+    save_model(model, CONFIG["output_dir"]["model"])
+    save_processors(img_processor=img_processor, tokenizer=tokenizer, output_dir=CONFIG["output_dir"]["model"])
+
+    #####################
+    # Eval
+    # We dont use peft at pre-training, thus no need to change accelerator fsdp sharding_strategy.
+    # Eval can be done right after training.
+    #####################
+    model = load_model(CONFIG["output_dir"]["model"])
+    img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+    post_init_model_and_tokenizer(model, tokenizer)
+    global_init_accelerator(model, **train_cfg)
+    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+    check_memory()
+    model.to(DEVICE)
+    model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
+    check_memory()
+
+    start = time.time()
+    evaluate(model, validation_dataloader, output_result=True, **train_cfg)
     start2 = time.time()
     LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
 
-    evaluate(model, test_dataloader, output_result=True)
+    evaluate(model, test_dataloader, output_result=True, **train_cfg)
     end = time.time()
     LOGGER.info("Test time: %s", seconds_to_time_str(end - start2))
-
     LOGGER.info("Total evaluation time: %s", seconds_to_time_str(end - start))
 
-    if torch.distributed.is_initialized() and ACCELERATOR and ACCELERATOR.is_main_process:
-        torch.distributed.destroy_process_group()
+
+def train_model(model_base_cfg, vision_model_path, language_model_path):
+    """use peft with fsdp to train image projector and decoder"""
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+    train_cfg = CONFIG["train"]
+
+    # Train and test
+    set_seed(train_cfg["seed"])
+    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+
+    img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+    model = init_model(vision_model_path, language_model_path, model_base_cfg)
+
+    model = load_model(CONFIG["output_dir"]["model"])
+    img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+
+    post_init_model_and_tokenizer(model, tokenizer)
+
+    # Apply peft to model
+    model = apply_peft_to_model(model)
+
+    global_init_accelerator(model, **train_cfg)
+    check_memory()
+    model.to(DEVICE)
+    train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    check_memory()
+
+    start = time.time()
+    train(model, train_dataloader, train_cfg=train_cfg)
+    end = time.time()
+    LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
+
+    save_model(model, CONFIG["output_dir"]["model"])
+    save_processors(img_processor=img_processor, tokenizer=tokenizer, output_dir=CONFIG["output_dir"]["model"])
+
+
+def eval_model(model_base_cfg, vision_model_path, language_model_path):
+    """eval the peft model with FSDP set to NO_SHARD"""
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+    train_cfg = CONFIG["pre_train"]
+
+    # Train and test
+    set_seed(train_cfg["seed"])
+    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+
+    # Eval need to change accelerator fsdp sharding_strategy to no shard
+    model = load_model(CONFIG["output_dir"]["model"])
+    img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+    post_init_model_and_tokenizer(model, tokenizer)
+
+    model = load_peft_model(base_model=model, peft_model_path=CONFIG["output_dir"]["model"])
+
+    global_init_accelerator(model, fsdp_no_shard=True, **train_cfg)
+
+    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+    check_memory()
+    model.to(DEVICE)
+    model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
+    check_memory()
+
+    start = time.time()
+    evaluate(model, validation_dataloader, output_result=True, **train_cfg)
+    start2 = time.time()
+    LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
+
+    evaluate(model, test_dataloader, output_result=True, **train_cfg)
+    end = time.time()
+    LOGGER.info("Test time: %s", seconds_to_time_str(end - start2))
+    LOGGER.info("Total evaluation time: %s", seconds_to_time_str(end - start))
 
 
 if __name__ == "__main__":
@@ -1551,6 +2082,9 @@ if __name__ == "__main__":
         # import cProfile
         # cProfile.run("main()", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
         main()
+
+    if torch.distributed.is_initialized() and ACCELERATOR and ACCELERATOR.is_main_process:
+        torch.distributed.destroy_process_group()
 
     end0 = time.time()
     LOGGER.info("Total time: %s ", seconds_to_time_str(end0 - start0))

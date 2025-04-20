@@ -37,16 +37,36 @@ preprocess:
 # if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
-eval_only: True
-use_debug_subset: False
+eval_only: False
+use_debug_subset: True
+stage: "preprocess" # preprocess, pretrain, train, eval,
 
 model:
   vision_model: rad_dino_maira2
   language_model: llama32_1b
   chat_template: /scratch/c.c21051562/workspace/arrg_img2text/llama3_chat_template.jinja
 
+pretrain:
+  seed: 42
+  num_epochs: 1
+  batch_size: 1
+  grad_accum_steps: 8
+  warmup_proportion: 0.1
+
+  lr: 0.0001
+  clip_grad_norm: 1.0
+  mixed_precision: "bf16" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
+
+  print_loss_per_n_steps: 1 # logging loss on .log file
+  # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
+  ckp_per_steps: 1 # 550395 / 32 = 17199, 170801 / 8 = 21350
+
+  eval_batch_size: 1
+  max_new_tokens: 512
+  print_pred_per_n_steps: 1
+
 train:
-  stage: 2 # stage1: pre-train the image_adaptor, freeze encoder and decoder; stage2: use peft to train image adaptor and decoder
+  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/00_test
 
   seed: 42
   num_epochs: 1
@@ -62,7 +82,6 @@ train:
   # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
   ckp_per_steps: 1 # 550395 / 32 = 17199, 170801 / 8 = 21350
 
-eval:
-  batch_size: 1
+  eval_batch_size: 1
   max_new_tokens: 512
-  print_log_per_n_steps: 1
+  print_pred_per_n_steps: 1
