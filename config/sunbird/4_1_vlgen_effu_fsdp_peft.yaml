@@ -24,7 +24,13 @@ model_name_or_path:
 mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
 max_checkpoints_to_keep: 2
 
-preprocess_dataset: False
+# path to checkpoint or, bool;
+# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
+resume_from_checkpoint: False
+# if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
+use_debug_subset: True
+run_mode: "pretrain" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+
 preprocess:
   image_processor: rad_dino_maira2
   text_processor: llama32_1b
@@ -32,14 +38,6 @@ preprocess:
   batched: True
   batch_size: 64
   num_proc: 16
-
-# path to checkpoint or, bool;
-# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
-resume_from_checkpoint: False
-# if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
-eval_only: False
-use_debug_subset: True
-stage: "preprocess" # preprocess, pretrain, train, eval,
 
 model:
   vision_model: rad_dino_maira2
@@ -65,8 +63,8 @@ pretrain:
   max_new_tokens: 512
   print_pred_per_n_steps: 1
 
-train:
-  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/00_test
+finetune:
+  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/4_1_test_pretrain_save_with_FULL_STATE_DICT
 
   seed: 42
   num_epochs: 1

@@ -50,7 +50,8 @@ from PIL import Image
 from scipy.ndimage import zoom
 from scorers.scores import compute_scores
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType, MixedPrecision
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
@@ -102,7 +103,7 @@ class Vision2LanguageOutputWithPast(ModelOutput):
     image_hidden_states: Optional[torch.FloatTensor] = None
 
 
-class VisionLanguageAdaptor(nn.Module):
+class VisionLanguageProjector(nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -124,8 +125,8 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         self.config.encoder_hidden_size = self.encoder.config.hidden_size
         self.config.decoder_hidden_size = self.decoder.config.hidden_size
 
-        # replace enc_to_dec_proj with VisionLanguageAdaptor
-        self.v2l_projector = VisionLanguageAdaptor(self.config)
+        # replace enc_to_dec_proj with VisionLanguageProjector
+        self.v2l_projector = VisionLanguageProjector(self.config)
         if hasattr(self, "enc_to_dec_proj"):
             del self.enc_to_dec_proj  # 移除投影层
 
@@ -178,7 +179,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         LOGGER.debug("rank[%s], pixel_values: %s", ACCELERATOR.process_index, pixel_values.shape if pixel_values is not None else None)
         LOGGER.debug("rank[%s], decoder_input_ids: %s", ACCELERATOR.process_index, decoder_input_ids)
         LOGGER.debug("rank[%s], decoder_attention_mask: %s", ACCELERATOR.process_index, decoder_attention_mask.shape)
-        LOGGER.debug("rank[%s], encoder_outputs: %s", ACCELERATOR.process_index, encoder_outputs.to_tuple() if encoder_outputs is not None else None)
+        LOGGER.debug("rank[%s], encoder_outputs.last_hidden_state: %s", ACCELERATOR.process_index, encoder_outputs.last_hidden_state.shape if encoder_outputs is not None else None)
         LOGGER.debug("rank[%s], past_key_values: %s", ACCELERATOR.process_index, past_key_values)
         LOGGER.debug("rank[%s], decoder_inputs_embeds: %s", ACCELERATOR.process_index, decoder_inputs_embeds)
         LOGGER.debug("rank[%s], position_ids: %s", ACCELERATOR.process_index, position_ids)
@@ -721,7 +722,9 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
             pass
         # user input but doesn't start with decoder_start_token_id -> prepend decoder_start_token_id (and adjust
         # decoder_attention_mask if provided)
+        #######################################
         # !!! Update: if the first token is not decoder_start_token_id or pad_token_id, we need to prepend decoder_start_token_id
+        #######################################
         elif ((decoder_input_ids[:, 0] != decoder_start_token_id[:, 0]) & (decoder_input_ids[:, 0] != pad_token_id)).all().item():
             decoder_input_ids = torch.cat([decoder_start_token_id, decoder_input_ids], dim=-1)
             if "decoder_attention_mask" in model_kwargs:
@@ -733,50 +736,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 model_kwargs["decoder_attention_mask"] = decoder_attention_mask
 
         return decoder_input_ids, model_kwargs
-
-    # def prepare_inputs_for_generation(
-    #     self,
-    #     input_ids,
-    #     past_key_values=None,
-    #     attention_mask=None,
-    #     inputs_embeds=None,
-    #     encoder_outputs=None,
-    #     pixel_values=None,
-    #     cache_position=None,
-    #     logits_to_keep=None,
-    #     **kwargs,
-    # ):
-    #     """
-    #     Copy from LLaVA.
-    #     Overwritten -- in specific circumstances we don't want to forward image inputs to the model.
-    #     It will be invoked via `model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)`
-    #     And the model_kwargs will be like:
-    #     """
-
-    #     # At the first round, we need encoder_outputs (encoded from pixel_values) and input_ids
-    #     # At the following rounds, we need input_ids (the generated ones) and past_key_values (represent the previous input_embeds for decoder)
-
-    #     # If we're in cached decoding stage (after the first round), pixel values should be None
-    #     # because input ids do not contain special image token anymore
-    #     model_inputs = self.decoder.prepare_inputs_for_generation(
-    #         input_ids,
-    #         past_key_values=past_key_values,
-    #         inputs_embeds=inputs_embeds,
-    #         attention_mask=attention_mask,
-    #         cache_position=cache_position,
-    #         logits_to_keep=logits_to_keep,
-    #         **kwargs,
-    #     )
-
-    #     # At the first generation round, we need encoder_outputs to be passed to model. pixel_values has been encoded into encoder_outputs
-    #     # e.g.
-    #     # at the first round, cache_position == tensor([   0,    1,    2,  ..., 2805, 2806, 2807])
-    #     # at second round, cache_position == tensor([2808])
-    #     if cache_position[0] == 0:
-    #         # model_inputs["pixel_values"] = pixel_values
-    #         model_inputs["encoder_outputs"] = encoder_outputs
-
-    #     return model_inputs
 
 
 class ImageTextDataset(Dataset):
@@ -997,7 +956,7 @@ def train(model, train_dataloader, train_cfg):
     # hyperparameters
     model_params = list(model.named_parameters())
     optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
-    LOGGER.debug("[Stage %s] Model trainable params:\n%s", train_cfg["stage"], "\n".join([n for n, p in model.named_parameters() if p.requires_grad]))
+    LOGGER.debug("Model trainable params:\n%s", "\n".join([n for n, p in model.named_parameters() if p.requires_grad]))
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
@@ -1021,7 +980,6 @@ def train(model, train_dataloader, train_cfg):
     LOGGER.info("Total optimization steps = %d", total_num_steps)
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
     LOGGER.info("Accelerator mixed_precision = %s", ACCELERATOR.mixed_precision)
-    LOGGER.info("Current training stage %s (1: adatpor only, 2: peft + adaptor and decoder)", train_cfg["stage"])
     check_memory()
 
     model.zero_grad()
@@ -1071,7 +1029,7 @@ def prepare_optimizer_grouped_parameters(model_params, train_cfg):
     # 为了节省计算资源和显存，应将需要冻结的参数的 `requires_grad` 显式设置为 `False`，并且在优化器中过滤不可训练参数
 
     optimizer_grouped_parameters = []
-    if train_cfg["stage"] == 1:
+    if CONFIG["run_mode"] == "pretrain":
         encoder_params = [(n, p) for n, p in model_params if n.startswith("encoder")]
         decoder_params = [(n, p) for n, p in model_params if n.startswith("decoder")]
         adaptor_params = [(n, p) for n, p in model_params if n.startswith("v2l_projector")]
@@ -1086,7 +1044,7 @@ def prepare_optimizer_grouped_parameters(model_params, train_cfg):
         # no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
         optimizer_grouped_parameters.append({"params": [p for n, p in adaptor_params], "lr": train_cfg["lr"], "weight_decay": 0.0})
 
-    elif train_cfg["stage"] == 2:
+    elif CONFIG["run_mode"] == "finetune":
         # When using peft, params requires_grad are set during initialization of PeftModel. See `apply_peft_to_model()`.
         # We only need to group them for optimizer.
         optimizer_grouped_parameters.append({"params": [p for n, p in model_params if p.requires_grad], "lr": train_cfg["lr"], "weight_decay": 0.0})
@@ -1419,19 +1377,31 @@ def save_checkpoint(checkpoint_dir, max_to_keep=5):
 
 def save_model(model, output_dir):
     ACCELERATOR.wait_for_everyone()
+
     unwrapped_model = ACCELERATOR.unwrap_model(model)
-    state_dict = ACCELERATOR.get_state_dict(model)
-    if ACCELERATOR.is_main_process:
-        # peft_model (unwrapped_model) save_pretrained 会在内部调用 get_peft_model_state_dict，我们不需要提前调用
-        # 我们需要传入 ACCELERATOR.get_state_dict(model)，作为内部调用 get_peft_model_state_dict 的 state_dict
-        # ACCELERATOR.get_state_dict(model) 需要在 if ACCELERATOR.is_main_process 之外调用，否则会卡主进程
-        unwrapped_model.save_pretrained(
-            output_dir,
-            is_main_process=ACCELERATOR.is_main_process,
-            save_function=ACCELERATOR.save,
-            save_embedding_layers=True,
-            state_dict=state_dict,
-        )
+
+    full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+        LOGGER.debug("rank[%s], unwrapped_model.state_dict()", ACCELERATOR.process_index)
+        for n, p in unwrapped_model.state_dict().items():
+            LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape)
+
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+        LOGGER.debug("rank[%s], model.state_dict()", ACCELERATOR.process_index)
+        for n, p in model.state_dict().items():
+            LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape)
+
+    # if ACCELERATOR.is_main_process:
+    # peft_model (unwrapped_model) save_pretrained 会在内部调用 get_peft_model_state_dict，我们不需要提前调用
+    # 我们需要传入 ACCELERATOR.get_state_dict(model)，作为内部调用 get_peft_model_state_dict 的 state_dict
+    # ACCELERATOR.get_state_dict(model) 需要在 if ACCELERATOR.is_main_process 之外调用，否则会卡主进程
+    unwrapped_model.save_pretrained(
+        output_dir,
+        is_main_process=ACCELERATOR.is_main_process,
+        # save_function=ACCELERATOR.save,
+        save_embedding_layers=True,
+        # state_dict=state_dict,
+    )
     ACCELERATOR.wait_for_everyone()
     LOGGER.info("Model saved to %s", output_dir)
 
@@ -1743,7 +1713,7 @@ def apply_peft_to_model(model):
     # The names of the modules to apply the adapter to.
     # Also check TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING: https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py
     # When the lora layers are applied to embedding layers, the corresponding base model embedding layers are also saved.
-    target_modules = ["embed_tokens", "lm_head", "q_proj", "v_proj"]  # 需要注入 LoRA 的模块。
+    target_modules = ["embed_tokens", "q_proj", "v_proj", "lm_head"]  # 需要注入 LoRA 的模块。
     # List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
     # e.g. Transformers adds a randomly initialized classification head on top of the model. If you do not add this layer to modules_to_save, the classification head won’t be saved. The next time you load the model, you’ll get a different randomly initialized classification head, resulting in completely different results.
     modules_to_save = ["v2l_projector"]  # 没注入LoRA 但又需要训练和保存的模块。添加模块后，peft会包装一个一模一样的模块，并将requires_grad 会被设置为 True。原模块不变。
@@ -1785,7 +1755,7 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
         for name, module in model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding)):
                 ignored_modules.append(module)
-        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageAdaptor"]
+        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector"]
         sharding_strategy = "FULL_SHARD"
         state_dict_type = "SHARDED_STATE_DICT"
 
@@ -1795,9 +1765,6 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
         sharding_strategy = "NO_SHARD"
         state_dict_type = "FULL_STATE_DICT"
 
-    LOGGER.debug("FSDP init")
-    LOGGER.debug("FSDP sharding_strategy: %s", sharding_strategy)
-    LOGGER.debug("FSDP state_dict_type: %s", state_dict_type)
     # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
     fsdp_plugin = FullyShardedDataParallelPlugin(
         # mixed_precision_policy=mixed_precision,
@@ -1814,8 +1781,6 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
         # cpu_ram_efficient_loading=True, #If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. Only applicable for Transformers. When using this, sync_module_states needs to be True.
         # sync_module_states=True,
     )
-    LOGGER.debug("FSDP sharding_strategy: %s", fsdp_plugin.sharding_strategy)
-    LOGGER.debug("FSDP state_dict_type: %s", fsdp_plugin.state_dict_type)
 
     # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
     # 如果OOM，可以尝试设置 sync_each_batch=True，但是会导致训练速度变慢
@@ -1847,6 +1812,9 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
     LOGGER = MultiProcessAdapter(LOGGER, {})  # must initialize the accelerate state by calling either `PartialState()` or `Accelerator()` before using the logging utility.
     LOGGER.info("Available cuda: %d", torch.cuda.device_count())
     LOGGER.info("Accelerator state: %s", ACCELERATOR.state, main_process_only=False)
+    if ACCELERATOR.state.fsdp_plugin:
+        LOGGER.info("FSDP sharding_strategy: %s", ACCELERATOR.state.fsdp_plugin.sharding_strategy)
+        LOGGER.info("FSDP state_dict_type: %s", ACCELERATOR.state.fsdp_plugin.state_dict_type)
     LOGGER.info([i for i in CONFIG.items() if i[0][0] != "_"])
 
 
@@ -1860,7 +1828,7 @@ def global_init_logger(log_level=logging.DEBUG, base_log_level=logging.WARNING, 
         log_file_mode = "a"
 
     curr_file_name = os.path.basename(os.path.abspath(__file__))
-    log_file_path = os.path.join(CONFIG["output_dir"]["result"], f"{curr_file_name}.log")
+    log_file_path = os.path.join(CONFIG["output_dir"]["result"], f"{curr_file_name}_{CONFIG['run_mode']}.log")
 
     file_handler = logging.FileHandler(log_file_path, log_file_mode)
     file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S")
@@ -1880,13 +1848,13 @@ def global_init_proj_config():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--from_bash", action="store_true")
-    parser.add_argument("--config_file", type=str, help=f".yaml file path")
+    parser.add_argument("--config_file", type=str, help=".yaml file path")
 
     parser.add_argument("--output_name", type=str)
     parser.add_argument("--jobid", type=int)
     parser.add_argument("--resume_from_checkpoint", action="store_true", default=None)
 
-    parser.add_argument("--preprocess_dataset", action="store_true")
+    parser.add_argument("--run_mode", type=str, default=None, help="Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]")
     parser.add_argument("--image_processor", type=str, default=None)
     parser.add_argument("--cache_path", type=str, default=None)
 
@@ -1897,15 +1865,17 @@ def global_init_proj_config():
     else:
         file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/4_vlgen_peft.yaml"
 
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         CONFIG = yaml.safe_load(f)
 
     if args.from_bash:
         CONFIG["output_name"] = args.output_name
         CONFIG["jobid"] = args.jobid
 
-        CONFIG["preprocess_dataset"] = args.preprocess_dataset
-        if args.preprocess_dataset:
+        if args.run_mode:
+            CONFIG["run_mode"] = args.run_mode
+
+        if CONFIG["run_mode"] == "preprocess":
             CONFIG["preprocess"]["image_processor"] = args.image_processor
             CONFIG["preprocess"]["cache_path"] = args.cache_path
 
@@ -1924,7 +1894,7 @@ def global_init_proj_config():
     os.makedirs(output_dirs["checkpoint"], exist_ok=True)
     # os.makedirs(output_dirs["log"], exist_ok=True)
 
-    for cfg_key in ["pre_train", "train"]:
+    for cfg_key in ["pretrain", "finetune"]:
         for key in CONFIG[cfg_key]:
             if "lr" in key:
                 CONFIG[cfg_key][key] = float(CONFIG[cfg_key][key])
@@ -1933,21 +1903,15 @@ def global_init_proj_config():
 #############################################
 
 
-def pretrain_model(model_base_cfg, vision_model_path, language_model_path):
+def pretrain_model(model_base_cfg, train_cfg):
     """pre-train the image_adaptor, freeze encoder and decoder"""
-
-    model_base_cfg = CONFIG["model"]
     vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
     language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    train_cfg = CONFIG["pre_train"]
 
     # Train and test
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
-    #####################
-    # Train
-    #####################
     img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
     model = init_model(vision_model_path, language_model_path, model_base_cfg)
     post_init_model_and_tokenizer(model, tokenizer)
@@ -1965,13 +1929,16 @@ def pretrain_model(model_base_cfg, vision_model_path, language_model_path):
     save_model(model, CONFIG["output_dir"]["model"])
     save_processors(img_processor=img_processor, tokenizer=tokenizer, output_dir=CONFIG["output_dir"]["model"])
 
-    #####################
-    # Eval
-    # We dont use peft at pre-training, thus no need to change accelerator fsdp sharding_strategy.
-    # Eval can be done right after training.
-    #####################
-    model = load_model(CONFIG["output_dir"]["model"])
-    img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+
+def eval_pretrained_model(train_cfg):
+    pretain_model_path = CONFIG["output_dir"]["model"]
+
+    # Train and test
+    set_seed(train_cfg["seed"])
+    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+
+    model = load_model(pretain_model_path)
+    img_processor, tokenizer = load_processor(pretain_model_path)
     post_init_model_and_tokenizer(model, tokenizer)
     global_init_accelerator(model, **train_cfg)
     _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
@@ -1991,22 +1958,30 @@ def pretrain_model(model_base_cfg, vision_model_path, language_model_path):
     LOGGER.info("Total evaluation time: %s", seconds_to_time_str(end - start))
 
 
-def train_model(model_base_cfg, vision_model_path, language_model_path):
+def finetune_model(train_cfg):
     """use peft with fsdp to train image projector and decoder"""
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    train_cfg = CONFIG["train"]
+    # pretain_model_path = train_cfg["pretain_model_path"]
+
+    # # Train and test
+    # set_seed(train_cfg["seed"])
+    # ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+
+    # model = load_model(pretain_model_path)
+    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
+    # img_processor, tokenizer = load_processor(pretain_model_path)
+    #####################
 
     # Train and test
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
     img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
     model = init_model(vision_model_path, language_model_path, model_base_cfg)
-
-    model = load_model(CONFIG["output_dir"]["model"])
-    img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+    LOGGER.debug("Loaded model dtype: %s", model.dtype)
+    #####################
 
     post_init_model_and_tokenizer(model, tokenizer)
 
@@ -2016,6 +1991,7 @@ def train_model(model_base_cfg, vision_model_path, language_model_path):
     global_init_accelerator(model, **train_cfg)
     check_memory()
     model.to(DEVICE)
+    LOGGER.debug("Final model dtype: %s", model.dtype)
     train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
@@ -2028,23 +2004,21 @@ def train_model(model_base_cfg, vision_model_path, language_model_path):
     save_processors(img_processor=img_processor, tokenizer=tokenizer, output_dir=CONFIG["output_dir"]["model"])
 
 
-def eval_model(model_base_cfg, vision_model_path, language_model_path):
+def eval_finetuned_model(train_cfg):
     """eval the peft model with FSDP set to NO_SHARD"""
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    train_cfg = CONFIG["pre_train"]
+    pretain_model_path = train_cfg["pretain_model_path"]
+    peft_model_path = CONFIG["output_dir"]["model"]
 
     # Train and test
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
     # Eval need to change accelerator fsdp sharding_strategy to no shard
-    model = load_model(CONFIG["output_dir"]["model"])
-    img_processor, tokenizer = load_processor(CONFIG["output_dir"]["model"])
+    model = load_model(pretain_model_path)
+    img_processor, tokenizer = load_processor(pretain_model_path)
     post_init_model_and_tokenizer(model, tokenizer)
 
-    model = load_peft_model(base_model=model, peft_model_path=CONFIG["output_dir"]["model"])
+    model = load_peft_model(base_model=model, peft_model_path=peft_model_path)
 
     global_init_accelerator(model, fsdp_no_shard=True, **train_cfg)
 
@@ -2076,12 +2050,18 @@ if __name__ == "__main__":
 
     start0 = time.time()
 
-    if CONFIG["preprocess_dataset"]:
+    if CONFIG["run_mode"] == "preprocess":
         preprocess_dataset()
-    else:
+    elif CONFIG["run_mode"] == "pretrain":
         # import cProfile
         # cProfile.run("main()", filename=os.path.join(CONFIG["output_dir"]["result"], "time_statistic.cprofile"))
-        main()
+        pretrain_model(model_base_cfg=CONFIG["model"], train_cfg=CONFIG["pretrain"])
+    elif CONFIG["run_mode"] == "eval_pretrained":
+        eval_pretrained_model(train_cfg=CONFIG["pretrain"])
+    elif CONFIG["run_mode"] == "finetune":
+        finetune_model(train_cfg=CONFIG["finetune"])
+    elif CONFIG["run_mode"] == "eval_finetuned":
+        eval_finetuned_model(train_cfg=CONFIG["finetune"])
 
     if torch.distributed.is_initialized() and ACCELERATOR and ACCELERATOR.is_main_process:
         torch.distributed.destroy_process_group()
