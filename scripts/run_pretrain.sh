@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=4_1_test_pretrain_save_with_FULL_STATE_DICT
+#SBATCH --job-name=4_1_fsdo_peft_test_pretrain
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name

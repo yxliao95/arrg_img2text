@@ -1,6 +1,6 @@
 #############################################
-# 基于4_vlgen_effu_fsdp.py修改
-# 使用peft
+# 基于4_vlgen_effu_fsdp_peft.py修改
+# 改用ddp。fsdp在保存时，模型的state_dict无法被正确获取
 #############################################
 import argparse
 import datetime
@@ -1238,7 +1238,8 @@ def evaluate(model, target_dataloader, output_result=False, **kwargs):
                     output_logits=True,
                 )
                 # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
-                outputs = model.generate(
+                # Call model.module.generate() to address AttributeError: 'DistributedDataParallel' object has no attribute 'generate'
+                outputs = model.module.generate(
                     generation_config=generation_config,
                     inputs=input_tensors_dict["pixel_values"],
                     decoder_input_ids=input_tensors_dict["decoder_input_ids"],
@@ -1380,27 +1381,45 @@ def save_checkpoint(checkpoint_dir, max_to_keep=5):
 
 
 def save_model(model, output_dir):
-
     ACCELERATOR.wait_for_everyone()
-
     unwrapped_model = ACCELERATOR.unwrap_model(model)
-    # state_dict = ACCELERATOR.get_state_dict(model)
-    # LOGGER.debug("rank[%s], ACCELERATOR.get_state_dict(model)", ACCELERATOR.process_index)
-    # for n, p in state_dict.items():
-    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape)
+
+    state_dict = ACCELERATOR.get_state_dict(model)
+    LOGGER.debug("rank[%s], ACCELERATOR.get_state_dict(model)", ACCELERATOR.process_index)
+    for n, p in state_dict.items():
+        LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape)
+
+    # full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    # with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+    #     LOGGER.debug("rank[%s], unwrapped_model.state_dict()", ACCELERATOR.process_index)
+    #     for n, p in unwrapped_model.state_dict().items():
+    #         LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape)
+
+    # with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+    #     LOGGER.debug("rank[%s], model.state_dict()", ACCELERATOR.process_index)
+    #     for n, p in model.state_dict().items():
+    #         LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape)
 
     # if ACCELERATOR.is_main_process:
     # peft_model (unwrapped_model) save_pretrained 会在内部调用 get_peft_model_state_dict，我们不需要提前调用
     # 我们需要传入 ACCELERATOR.get_state_dict(model)，作为内部调用 get_peft_model_state_dict 的 state_dict
     # ACCELERATOR.get_state_dict(model) 需要在 if ACCELERATOR.is_main_process 之外调用，否则会卡主进程
-    unwrapped_model.save_pretrained(
-        output_dir,
-        is_main_process=ACCELERATOR.is_main_process,
-        # save_function=ACCELERATOR.save,
-        save_embedding_layers=True,
-        # state_dict=state_dict,
-    )
 
+    if isinstance(unwrapped_model, PeftModel):
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=ACCELERATOR.is_main_process,
+            save_function=ACCELERATOR.save,
+            save_embedding_layers=True,
+            state_dict=state_dict,
+        )
+    else:
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=ACCELERATOR.is_main_process,
+            save_function=ACCELERATOR.save,
+            state_dict=state_dict,
+        )
     ACCELERATOR.wait_for_everyone()
     LOGGER.info("Model saved to %s", output_dir)
 
@@ -1683,17 +1702,17 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
         "bos_token": bos_token,
         "eos_token": eos_token,
         "pad_token": pad_token,
-        "additional_special_tokens": ["<|image_token|>", "<|image_start|>", "<|image_end|>"],
+        "additional_special_tokens": GLOBAL_VARS.additional_special_tokens,
     }
     tokenizer.add_special_tokens(special_tokens_dict)
     # print special tokens and their ids
     LOGGER.info("Special tokens: %s", [(key, tok, tokenizer.convert_tokens_to_ids(tok)) for key, tok in tokenizer.special_tokens_map.items()])
 
     # set chat template
-    assert tokenizer.chat_template == None, "Tokenizer has chat_template, please check whether to use the existing one or our new chat template."
+    assert tokenizer.chat_template is None, "Tokenizer has chat_template, please check whether to use the existing one or our new chat template."
     chat_template_path = model_base_cfg["chat_template"]
     LOGGER.info("Adding chat template to tokenizer from: %s", chat_template_path)
-    with open(chat_template_path, "r") as f:
+    with open(chat_template_path, "r", encoding="utf-8") as f:
         chat_template = "".join([line.strip() for line in f.readlines()])
     tokenizer.chat_template = chat_template
     LOGGER.info("Chat template: %s", tokenizer.chat_template)
@@ -1731,54 +1750,11 @@ def apply_peft_to_model(model):
     return peft_model
 
 
-def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
+def global_init_accelerator(model, **kwargs):
     global ACCELERATOR, DEVICE, LOGGER
 
     grad_accum_steps = kwargs["grad_accum_steps"]
     mixed_precision = kwargs["mixed_precision"]
-
-    if isinstance(model, PeftModel):
-        # TODO 如何在不使用 ignore_modules 的情况下，让modules能够顺利的从flattened state_dict中恢复为unflattened的状态，然后保存
-        ignored_modules = []
-        for name, module in model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding, lora.Embedding, lora.Linear)):
-                ignored_modules.append(module)
-        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector"]
-        sharding_strategy = "FULL_SHARD"
-        state_dict_type = "SHARDED_STATE_DICT"
-
-        # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
-    else:
-        ignored_modules = []
-        for name, module in model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding)):
-                ignored_modules.append(module)
-        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector"]
-        sharding_strategy = "FULL_SHARD"
-        state_dict_type = "SHARDED_STATE_DICT"
-
-    # 如果不使用这段代码，我们在eval时会遇到 RuntimeError: mat2 must be a matrix, got 1-D tensor
-    # 可能是因为 PEFT modules_to_save 的部分与 FSDP 不兼容。目前的临时解决办法是改成 DDP
-    if fsdp_no_shard:
-        sharding_strategy = "NO_SHARD"
-        state_dict_type = "FULL_STATE_DICT"
-
-    # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
-    fsdp_plugin = FullyShardedDataParallelPlugin(
-        # mixed_precision_policy=mixed_precision,
-        sharding_strategy=sharding_strategy,  # FULL_SHARD=ZeRO3, SHARD_GRAD_OP=ZeRO2, NO_SHARD (DDP), HYBRID_SHARD, HYBRID_SHARD_ZERO2,
-        backward_prefetch="BACKWARD_PRE",  # [1] BACKWARD_PRE 中等显存/通用场景, [2] BACKWARD_POST 显存充足/极致优化, [3] NO_PREFETCH 显存紧张
-        auto_wrap_policy="transformer_based_wrap",  # transformer_based_wrap, size_based_wrap, or no_wrap
-        transformer_cls_names_to_wrap=transformer_cls_names_to_wrap,
-        ignored_modules=ignored_modules,
-        # transformer_layer_cls=int(1e6),
-        state_dict_type=state_dict_type,  # [1] FULL_STATE_DICT, [2] LOCAL_STATE_DICT, [3] SHARDED_STATE_DICT
-        use_orig_params=True,  # 设置为True才能手动调整params lr, requires_grad 等
-        cpu_offload=False,  # cpu_offload=True与FULL_SHARD组合可最大化显存节省，但通信开销最高。能节省5G的peak mem，但100iter从3s下降到5s
-        activation_checkpointing=False,  # A technique to reduce memory usage by clearing activations of certain layers and recomputing them during a backward pass. Effectively, this trades extra computation time for reduced memory usage. Will cause RuntimeError: The expanded size of the tensor (2896) must match the existing size (1448) at non-singleton dimension 3.  Target sizes: [2, 32, 1448, 2896].  Tensor sizes: [2, 1, 1448, 1448]
-        # cpu_ram_efficient_loading=True, #If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. Only applicable for Transformers. When using this, sync_module_states needs to be True.
-        # sync_module_states=True,
-    )
 
     # https://huggingface.co/docs/accelerate/v1.2.1/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
     # 如果OOM，可以尝试设置 sync_each_batch=True，但是会导致训练速度变慢
@@ -1796,7 +1772,6 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
         mixed_precision=mixed_precision,
         dataloader_config=dataloader_cfg,
         gradient_accumulation_plugin=ga_plugin,
-        fsdp_plugin=fsdp_plugin,
     )
     DEVICE = ACCELERATOR.device
 
@@ -1958,27 +1933,27 @@ def eval_pretrained_model(train_cfg):
 
 def finetune_model(train_cfg):
     """use peft with fsdp to train image projector and decoder"""
-    # pretain_model_path = train_cfg["pretain_model_path"]
-
-    # # Train and test
-    # set_seed(train_cfg["seed"])
-    # ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
-
-    # model = load_model(pretain_model_path)
-    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
-    # img_processor, tokenizer = load_processor(pretain_model_path)
-    #####################
+    pretain_model_path = train_cfg["pretain_model_path"]
 
     # Train and test
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-    model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    model = load_model(pretain_model_path)
     LOGGER.debug("Loaded model dtype: %s", model.dtype)
+    img_processor, tokenizer = load_processor(pretain_model_path)
+    #####################
+
+    # Train and test
+    # set_seed(train_cfg["seed"])
+    # ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+
+    # model_base_cfg = CONFIG["model"]
+    # vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    # language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+    # img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+    # model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
     #####################
 
     post_init_model_and_tokenizer(model, tokenizer)
@@ -2011,32 +1986,20 @@ def eval_finetuned_model(train_cfg):
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
-    # # Eval need to change accelerator fsdp sharding_strategy to no shard
-    # model = load_model(pretain_model_path)
-    # img_processor, tokenizer = load_processor(pretain_model_path)
-    #####################################
-
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-    model = init_model(vision_model_path, language_model_path, model_base_cfg)
-    LOGGER.debug("Loaded model dtype: %s", model.dtype)
-    #####################################
-
+    # Eval need to change accelerator fsdp sharding_strategy to no shard
+    model = load_model(pretain_model_path)
+    img_processor, tokenizer = load_processor(pretain_model_path)
     post_init_model_and_tokenizer(model, tokenizer)
 
     model = load_peft_model(base_model=model, peft_model_path=peft_model_path)
 
-    global_init_accelerator(model, fsdp_no_shard=True, **train_cfg)
+    global_init_accelerator(model, **train_cfg)
 
     _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
     model.to(DEVICE)
     model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
     check_memory()
-
-    LOGGER.debug("Final model structure:\n%s", model)
 
     start = time.time()
     evaluate(model, validation_dataloader, output_result=True, **train_cfg)
