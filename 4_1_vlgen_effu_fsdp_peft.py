@@ -1381,24 +1381,42 @@ def save_checkpoint(checkpoint_dir, max_to_keep=5):
 
 def save_model(model, output_dir):
 
-    ACCELERATOR.wait_for_everyone()
+    # LOGGER.debug("rank[%s], model", model, main_process_only=False)
+    # for n, p in model.named_parameters():
+    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
 
-    unwrapped_model = ACCELERATOR.unwrap_model(model)
+    # ACCELERATOR.wait_for_everyone()
+    # LOGGER.debug("rank[%s], model.state_dict()", ACCELERATOR.process_index, main_process_only=False)
+    # for n, p in model.state_dict().items():
+    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
+
+    # ACCELERATOR.wait_for_everyone()
+    # unwrapped_model = ACCELERATOR.unwrap_model(model)
     # state_dict = ACCELERATOR.get_state_dict(model)
-    # LOGGER.debug("rank[%s], ACCELERATOR.get_state_dict(model)", ACCELERATOR.process_index)
+    # LOGGER.debug("rank[%s], ACCELERATOR.get_state_dict(model)", ACCELERATOR.process_index, main_process_only=False)
     # for n, p in state_dict.items():
-    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape)
+    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
 
-    # if ACCELERATOR.is_main_process:
-    # peft_model (unwrapped_model) save_pretrained 会在内部调用 get_peft_model_state_dict，我们不需要提前调用
-    # 我们需要传入 ACCELERATOR.get_state_dict(model)，作为内部调用 get_peft_model_state_dict 的 state_dict
-    # ACCELERATOR.get_state_dict(model) 需要在 if ACCELERATOR.is_main_process 之外调用，否则会卡主进程
+    # # 这是 unwrapped_model.save_pretrained 内部调用的方式
+    # state_dict = get_peft_model_state_dict(unwrapped_model)
+    # LOGGER.debug("rank[%s], get_peft_model_state_dict(unwrapped_model)", ACCELERATOR.process_index, main_process_only=False)
+    # for n, p in state_dict.items():
+    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
+
+    # accelerator.get_state_dict(model) 会导致 rank1 上的 state_dict 不完整，不能使用
+    # get_peft_model_state_dict(unwrapped_model) 可以让所有rank都拿到完整的 state_dict
+    # unwrapped_model.save_pretrained 不传入 state_dict 时，会使用 get_peft_model_state_dict(self) 来获取 state_dict。也就是说是正确的
+    # 当获取state_dict时，如果程序尝试在多个rank中同步state_dict，而由使用了 if ACCELERATOR.is_main_process: 来判断是否保存模型，则可能会导致进程卡主。比如rank0需要等到rank1同步state_dict，而rank1已经跳过了这个判断，进入wait的状态。
+    # 所以结论就是，unwrapped_model 是 peft model时，不需要传入 state_dict 给 unwrapped_model.save_pretrained()，让它自己在内部调用 get_peft_model_state_dict() 来获取 state_dict即可，它也会处理不同rank的情况。
+
+    ACCELERATOR.wait_for_everyone()
+    unwrapped_model = ACCELERATOR.unwrap_model(model)
+
     unwrapped_model.save_pretrained(
         output_dir,
         is_main_process=ACCELERATOR.is_main_process,
-        # save_function=ACCELERATOR.save,
+        save_function=ACCELERATOR.save,
         save_embedding_layers=True,
-        # state_dict=state_dict,
     )
 
     ACCELERATOR.wait_for_everyone()
