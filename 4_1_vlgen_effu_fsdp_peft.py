@@ -1411,13 +1411,33 @@ def save_model(model, output_dir):
 
     ACCELERATOR.wait_for_everyone()
     unwrapped_model = ACCELERATOR.unwrap_model(model)
+    if isinstance(unwrapped_model, PeftModel):
+        # accelerator.get_state_dict(model) 会导致 rank1 上的 state_dict 不完整，不能使用
+        # get_peft_model_state_dict(unwrapped_model) 可以让所有rank都拿到完整的 state_dict
+        # unwrapped_model.save_pretrained 不传入 state_dict 时，会使用 get_peft_model_state_dict(self) 来获取 state_dict。也就是说是正确的
+        # 当获取state_dict时，如果程序尝试在多个rank中同步state_dict，而由使用了 if ACCELERATOR.is_main_process: 来判断是否保存模型，则可能会导致进程卡主。比如rank0需要等到rank1同步state_dict，而rank1已经跳过了这个判断，进入wait的状态。
+        # 所以结论就是，unwrapped_model 是 peft model时，不需要传入 state_dict 给 unwrapped_model.save_pretrained()，让它自己在内部调用 get_peft_model_state_dict() 来获取 state_dict即可，它也会处理不同rank的情况。
+        # 目前的测试来看，不需要state_dict=ACCELERATOR.get_state_dict(model)， 模型也能够正确的保存完整的参数。
+        # 当前使用的FSDPPlugin 参数为 ：sharding_strategy = "FULL_SHARD"，state_dict_type = "SHARDED_STATE_DICT"
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=ACCELERATOR.is_main_process,
+            save_function=ACCELERATOR.save,
+            save_embedding_layers=True,
+        )
+    else:
+        # 虽然Accelerate FSDP 建议使用 state_dict=ACCELERATOR.get_state_dict(model)
+        # 但经过测试，使用该参数，会导致 rank1 额外保存一个 model.satetensors 文件，导致加载时出现识别错误。
+        # 目前的测试来看，不需要state_dict=ACCELERATOR.get_state_dict(model)， 模型也能够正确的保存完整的参数。
+        # 当前使用的FSDPPlugin 参数为 ：sharding_strategy = "FULL_SHARD"，state_dict_type = "SHARDED_STATE_DICT"
+        # https://huggingface.co/docs/accelerate/usage_guides/fsdp#saving-and-loading
 
-    unwrapped_model.save_pretrained(
-        output_dir,
-        is_main_process=ACCELERATOR.is_main_process,
-        save_function=ACCELERATOR.save,
-        save_embedding_layers=True,
-    )
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=ACCELERATOR.is_main_process,
+            save_function=ACCELERATOR.save,
+            # state_dict=ACCELERATOR.get_state_dict(model),  # suggested by Accelerate FSDP when using transformers
+        )
 
     ACCELERATOR.wait_for_everyone()
     LOGGER.info("Model saved to %s", output_dir)
@@ -1609,7 +1629,6 @@ def load_peft_model(base_model, peft_model_path):
 def load_model(model_path):
     model = Vision2LanguageModel.from_pretrained(model_path)
     LOGGER.info("Fine-tuned model loaded from %s", model_path)
-    LOGGER.debug("Model config: %s", model.config)
     return model
 
 
@@ -1681,7 +1700,6 @@ def post_init_model_and_tokenizer(model, tokenizer):
 def init_model(vision_model_path, language_model_path, model_base_cfg):
     LOGGER.info("Initializing vision language mode: %s, %s", vision_model_path, language_model_path)
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(vision_model_path, language_model_path)
-    LOGGER.debug("Model config: %s", model.config)
     return model
 
 
