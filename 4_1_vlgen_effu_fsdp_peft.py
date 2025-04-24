@@ -968,6 +968,12 @@ def train(model, train_dataloader, train_cfg):
     LOGGER.debug("Model trainable params:\n%s", "\n".join([n for n, p in model.named_parameters() if p.requires_grad]))
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
+    # optimizer = AdamW(
+    #     optimizer_grouped_parameters,
+    #     eps=1e-8,
+    #     foreach=False,  # 禁用 multi-tensor
+    #     fused=False,  # 禁用 fused 优化
+    # )
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
 
@@ -979,7 +985,6 @@ def train(model, train_dataloader, train_cfg):
 
     # 2. Check and resume checkpoint if needed
     epoch_resumed, iter_resumed = check_status_and_resume_checkpoint()
-
     # 3. Launch after resuming STATUS_INFO
     MLFLOW_TRACKER = MLflowTracker.launch_tracker()
 
@@ -1017,6 +1022,7 @@ def train(model, train_dataloader, train_cfg):
                 ACCELERATOR.backward(loss)
                 if train_cfg["clip_grad_norm"] > 0:
                     ACCELERATOR.clip_grad_norm_(model.parameters(), train_cfg["clip_grad_norm"])
+
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -1678,7 +1684,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
     if ds_train:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
             if use_debug_subset:
-                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 10, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
+                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 20, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
             else:
                 train_dataset = ImageTextDataset(ds_train, img_processor=img_processor, tokenizer=tokenizer, split="train")
         train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_bsz, drop_last=True)
@@ -1772,9 +1778,6 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
 def apply_peft_to_model(model):
     # https://huggingface.co/docs/peft/developer_guides/troubleshooting#bad-results-from-a-loaded-peft-model
 
-    # named_modules = [(n, type(m)) for n, m in model.named_modules()]
-    # print([(n, type(m)) for n, m in model.named_modules()])
-
     # The names of the modules to apply the adapter to.
     # Also check TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING: https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py
     # When the lora layers are applied to embedding layers, the corresponding base model embedding layers are also saved.
@@ -1812,8 +1815,9 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
             if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding, lora.Embedding, lora.Linear)):
                 ignored_modules.append(module)
         transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector"]
-        sharding_strategy = "FULL_SHARD"
-        state_dict_type = "SHARDED_STATE_DICT"
+        # sharding_strategy = "NO_SHARD", state_dict_type = "FULL_STATE_DICT"，用这套配置可以解决加载checkpoint后，在optimizer.step()时的报错 RuntimeError: torch function 'lerp_', with args: (ShardedTensor(ShardedTensorMetadata(sha ... and kwargs: None not supported for ShardedTensor!
+        sharding_strategy = "NO_SHARD"
+        state_dict_type = "FULL_STATE_DICT"
 
         # 关于 FSDP1 -> FSDP2 https://huggingface.co/docs/accelerate/main/en/concept_guides/fsdp1_vs_fsdp2
     else:
@@ -1822,8 +1826,8 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
             if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding)):
                 ignored_modules.append(module)
         transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector"]
-        sharding_strategy = "FULL_SHARD"
-        state_dict_type = "SHARDED_STATE_DICT"
+        sharding_strategy = "NO_SHARD"
+        state_dict_type = "FULL_STATE_DICT"
 
     # 如果不使用这段代码，我们在eval时会遇到 RuntimeError: mat2 must be a matrix, got 1-D tensor
     # 可能是因为 PEFT modules_to_save 的部分与 FSDP 不兼容。目前的临时解决办法是改成 DDP

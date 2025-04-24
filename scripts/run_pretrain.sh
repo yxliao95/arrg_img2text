@@ -46,7 +46,7 @@ accelerate launch\
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --run_mode pretrain \
-    # --resume_from_checkpoint True
+    --resume_from_checkpoint
 echo "Script [pretrain] finished."
 
 accelerate launch\
@@ -58,8 +58,7 @@ accelerate launch\
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_1_vlgen_effu_fsdp_peft.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
-    --run_mode eval_pretrained \
-    # --resume_from_checkpoint True
+    --run_mode eval_pretrained
 echo "Script [eval_pretrained] finished."
 
 # 查找所有运行中的 MLflow 进程
