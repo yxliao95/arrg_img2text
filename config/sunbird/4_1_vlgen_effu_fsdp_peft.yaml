@@ -64,7 +64,7 @@ pretrain:
   print_pred_per_n_steps: 1
 
 finetune:
-  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/4_1_test_pretrain_save_with_FULL_STATE_DICT
+  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/4_1_fsdo_peft_test_pretrain
 
   seed: 42
   num_epochs: 1

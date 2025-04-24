@@ -47,6 +47,7 @@ from peft import (
 from peft.tuners import lora
 from peft.utils import AuxiliaryTrainingWrapper
 from PIL import Image
+from safetensors.torch import load_file
 from scipy.ndimage import zoom
 from scorers.scores import compute_scores
 from torch import nn
@@ -1626,6 +1627,37 @@ def load_peft_model(base_model, peft_model_path):
     return peft_model
 
 
+def load_module_state_dict_from(model_path, target_module_prefix):
+    index_file_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(index_file_path, "r", encoding="utf-8") as f:
+        sd_index = json.load(f)
+
+    target_model_file_paths = set()
+    for key, file_name in sd_index["weight_map"].items():
+        if key.startswith(target_module_prefix):
+            target_model_file_paths.add(os.path.join(model_path, file_name))
+
+    target_state_dict = {}
+    for model_file_path in target_model_file_paths:
+        for name, param in load_file(model_file_path).items():
+            if name.startswith(target_module_prefix):
+                target_state_dict[name] = param
+
+    LOGGER.info("Loaded pretrained params: [%s] from file: %s", target_state_dict.keys(), model_path)
+    return target_state_dict
+
+
+def load_state_dict_to_model(base_model, target_state_dict):
+    base_model.load_state_dict(target_state_dict, strict=False)
+
+    model_named_params = dict(base_model.named_parameters())
+    for n, p in target_state_dict.items():
+        assert torch.equal(model_named_params[n], p), f"Model params update failed [{n}], expected: {p}, got:{model_named_params[n]}"
+    LOGGER.info("Updated pretrained params to base model: [%s]", target_state_dict.keys())
+
+    return base_model
+
+
 def load_model(model_path):
     model = Vision2LanguageModel.from_pretrained(model_path)
     LOGGER.info("Fine-tuned model loaded from %s", model_path)
@@ -1680,7 +1712,7 @@ def post_init_model_and_tokenizer(model, tokenizer):
     if len(tokenizer) >= model.config.decoder.vocab_size:
         LOGGER.info("Decoder token_embedding [%d] and tokenizer [%d] size mismatch", model.config.decoder.vocab_size, len(tokenizer))
         model.decoder.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8, mean_resizing=True)
-        LOGGER.info("Resize token_embedding to [%d] (pad_to_multiple_of=8)", model.config.decoder.vocab_size)
+        LOGGER.info("Decoder token_embedding resized to [%d] (pad_to_multiple_of=8)", model.config.decoder.vocab_size)
     else:
         # 检查 tokenizer 的特殊 token 是否存在，用于判断 eval 是否加载了正确的 tokenizer
         for spec_tok in GLOBAL_VARS.additional_special_tokens:
@@ -1994,27 +2026,33 @@ def eval_pretrained_model(train_cfg):
 
 def finetune_model(train_cfg):
     """use peft with fsdp to train image projector and decoder"""
-    # pretain_model_path = train_cfg["pretain_model_path"]
+    pretain_model_path = train_cfg["pretain_model_path"]
 
-    # # Train and test
-    # set_seed(train_cfg["seed"])
-    # ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+    # Train and test
+    set_seed(train_cfg["seed"])
+    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+
+    img_processor, tokenizer = load_processor(pretain_model_path)
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+    model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    target_state_dict = load_module_state_dict_from(model_path=pretain_model_path, target_module_prefix="v2l_projector")
+    model = load_state_dict_to_model(base_model=model, target_state_dict=target_state_dict)
+    #####################
 
     # model = load_model(pretain_model_path)
     # LOGGER.debug("Loaded model dtype: %s", model.dtype)
     # img_processor, tokenizer = load_processor(pretain_model_path)
     #####################
 
-    # Train and test
-    set_seed(train_cfg["seed"])
-    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
-
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-    model = init_model(vision_model_path, language_model_path, model_base_cfg)
-    LOGGER.debug("Loaded model dtype: %s", model.dtype)
+    # # Train and test
+    # model_base_cfg = CONFIG["model"]
+    # vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    # language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+    # img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+    # model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
     #####################
 
     post_init_model_and_tokenizer(model, tokenizer)
@@ -2047,17 +2085,17 @@ def eval_finetuned_model(train_cfg):
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
-    # # Eval need to change accelerator fsdp sharding_strategy to no shard
-    # model = load_model(pretain_model_path)
-    # img_processor, tokenizer = load_processor(pretain_model_path)
+    # Eval need to change accelerator fsdp sharding_strategy to no shard
+    model = load_model(pretain_model_path)
+    img_processor, tokenizer = load_processor(pretain_model_path)
     #####################################
 
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-    model = init_model(vision_model_path, language_model_path, model_base_cfg)
-    LOGGER.debug("Loaded model dtype: %s", model.dtype)
+    # model_base_cfg = CONFIG["model"]
+    # vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    # language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
+    # img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+    # model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
     #####################################
 
     post_init_model_and_tokenizer(model, tokenizer)
