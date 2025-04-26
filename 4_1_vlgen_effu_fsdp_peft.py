@@ -184,16 +184,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         `decoder_assistant_masks` is provided by `tokenizer.apply_chat_template`.
         `decoder_assistant_masks` is a tensor with the same shape as decoder_input_ids, and the value is 0 or 1. 0: system/user tokens, 1: assistant tokens, which is the tokens that need to be generated.
         """
-        LOGGER.debug("rank[%s], kwargs %s", ACCELERATOR.process_index, kwargs)
-        LOGGER.debug("rank[%s], pixel_values: %s", ACCELERATOR.process_index, pixel_values.shape if pixel_values is not None else None)
-        LOGGER.debug("rank[%s], decoder_input_ids: %s", ACCELERATOR.process_index, decoder_input_ids)
-        LOGGER.debug("rank[%s], decoder_attention_mask: %s", ACCELERATOR.process_index, decoder_attention_mask.shape)
-        LOGGER.debug("rank[%s], encoder_outputs.last_hidden_state: %s", ACCELERATOR.process_index, encoder_outputs.last_hidden_state.shape if encoder_outputs is not None else None)
-        LOGGER.debug("rank[%s], past_key_values: %s", ACCELERATOR.process_index, past_key_values)
-        LOGGER.debug("rank[%s], decoder_inputs_embeds: %s", ACCELERATOR.process_index, decoder_inputs_embeds)
-        LOGGER.debug("rank[%s], position_ids: %s", ACCELERATOR.process_index, position_ids)
-        LOGGER.debug("rank[%s], logits_to_keep: %s", ACCELERATOR.process_index, logits_to_keep)
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
 
@@ -224,7 +214,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         if encoder_outputs is not None and past_key_values is None:
             image_features = encoder_outputs.last_hidden_state  # torch.Size([4, 1370, enc_dim])
             # project image features
-            LOGGER.debug("rank[%s], v2lmodel forward image_features shape: %s", ACCELERATOR.process_index, image_features.shape)
             image_features = self.v2l_projector(image_features)
             # inject image features into text embeddings
             decoder_inputs_embeds = self._inject_image_features(decoder_input_ids, decoder_inputs_embeds, image_features)
@@ -297,52 +286,32 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         self._validate_model_class()
         tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
         assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
-        LOGGER.debug("rank[%s], step1", ACCELERATOR.process_index)
-        LOGGER.debug("rank[%s], tokenizer %s", ACCELERATOR.process_index, tokenizer)
-        LOGGER.debug("rank[%s], assistant_tokenizer: %s", ACCELERATOR.process_index, assistant_tokenizer)
 
         generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
         self._validate_model_kwargs(model_kwargs.copy())
         self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
-        LOGGER.debug("rank[%s], generation_config: %s", ACCELERATOR.process_index, generation_config)
-        LOGGER.debug("rank[%s], model_kwargs step1: %s", ACCELERATOR.process_index, model_kwargs)
-        LOGGER.debug("rank[%s], decoder_input_ids: %s", ACCELERATOR.process_index, model_kwargs["decoder_input_ids"].shape)
-        LOGGER.debug("rank[%s], decoder_attention_mask: %s", ACCELERATOR.process_index, model_kwargs["decoder_attention_mask"].shape)
 
         # 2. Set generation parameters if not already defined
         if synced_gpus is None:
             synced_gpus = (tf_generation_utils.is_deepspeed_zero3_enabled() or tf_generation_utils.is_fsdp_managed_module(self)) and tf_generation_utils.dist.get_world_size() > 1
-        LOGGER.debug("rank[%s], step2", ACCELERATOR.process_index)
-        LOGGER.debug("rank[%s], synced_gpus: %s (should be True)", ACCELERATOR.process_index, synced_gpus, main_process_only=False)
 
         logits_processor = logits_processor if logits_processor is not None else tf_generation_utils.LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else tf_generation_utils.StoppingCriteriaList()
-        LOGGER.debug("rank[%s], logits_processor: %s", ACCELERATOR.process_index, logits_processor)
-        LOGGER.debug("rank[%s], stopping_criteria: %s", ACCELERATOR.process_index, stopping_criteria)
 
         accepts_attention_mask = "attention_mask" in set(tf_generation_utils.inspect.signature(self.forward).parameters.keys())
         requires_attention_mask = "encoder_outputs" not in model_kwargs
         kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
-        LOGGER.debug("rank[%s], accepts_attention_mask: %s", ACCELERATOR.process_index, accepts_attention_mask)
-        LOGGER.debug("rank[%s], requires_attention_mask: %s", ACCELERATOR.process_index, requires_attention_mask)
-        LOGGER.debug("rank[%s], kwargs_has_attention_mask: %s", ACCELERATOR.process_index, kwargs_has_attention_mask)
 
         # 3. Define model inputs
         inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(inputs, generation_config.bos_token_id, model_kwargs)
         # batch_size = inputs_tensor.shape[0]
         # encoder和decoder的bsz可能不一样，我们以decoder的bsz为准
         batch_size = model_kwargs["decoder_input_ids"].shape[0]
-        LOGGER.debug("rank[%s], step3", ACCELERATOR.process_index)
-        LOGGER.debug("rank[%s], inputs_tensor: %s", ACCELERATOR.process_index, inputs_tensor.shape)
-        LOGGER.debug("rank[%s], model_input_name: %s", ACCELERATOR.process_index, model_input_name)
-        LOGGER.debug("rank[%s], model_kwargs step3: %s", ACCELERATOR.process_index, model_kwargs)
-        LOGGER.debug("rank[%s], batch_size: %s", ACCELERATOR.process_index, batch_size)
 
         device = inputs_tensor.device
         self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
 
         # decoder-only models must use left-padding for batched generation.
-        LOGGER.debug("rank[%s], self.config.is_encoder_decoder %s", ACCELERATOR.process_index, self.config.is_encoder_decoder)
         if not self.config.is_encoder_decoder and not tf_generation_utils.is_torchdynamo_compiling():
             # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
             # Note: If using, `inputs_embeds` this check does not work, because we want to be more hands-off.
@@ -353,14 +322,11 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         # 4. Define other model kwargs
         # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
         # generating the first new token or not, and we only want to use the embeddings for the first new token)
-        LOGGER.debug("rank[%s], step4", ACCELERATOR.process_index)
-        LOGGER.debug("rank[%s], Conv2D weight shape: %s", ACCELERATOR.process_index, self.encoder.embeddings.patch_embeddings.projection.weight.shape, main_process_only=False)
         if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
             generation_config.use_cache = True
 
         if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
             model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(inputs_tensor, generation_config, model_kwargs)
-            LOGGER.debug("rank[%s], model_kwargs['attention_mask']: %s", ACCELERATOR.process_index, model_kwargs["attention_mask"].shape)
         elif kwargs_has_attention_mask:
             # TODO (joao): generalize this check with other types of inputs
             if model_input_name == "input_ids" and len(model_kwargs["attention_mask"].shape) > 2:
@@ -369,15 +335,8 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
             # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
             model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(inputs_tensor, model_kwargs, model_input_name, generation_config)
-            LOGGER.debug("rank[%s], model_kwargs step4: %s", ACCELERATOR.process_index, model_kwargs)
-            LOGGER.debug("rank[%s], model_kwargs['encoder_outputs'].last_hidden_state: %s", ACCELERATOR.process_index, model_kwargs["encoder_outputs"].last_hidden_state.shape)
-            LOGGER.debug("rank[%s], model_kwargs['encoder_outputs'].pooler_output: %s", ACCELERATOR.process_index, model_kwargs["encoder_outputs"].pooler_output.shape)
 
-        # 5. Prepare `input_ids` which will be used for auto-regressive generation
-        LOGGER.debug("rank[%s], step5", ACCELERATOR.process_index)
-        if self.config.is_encoder_decoder:
-            LOGGER.debug("rank[%s], model_input_name: %s", ACCELERATOR.process_index, model_input_name)
-            LOGGER.debug("rank[%s], before decoder_start_token_id: %s", ACCELERATOR.process_index, generation_config._decoder_start_token_tensor)
+            # 5. Prepare `input_ids` which will be used for auto-regressive generation
             # 原始方法，当input_ids不是以decoder_start_token_id开头时，添加decoder_start_token_id
             # 更新后的方法，当input_ids不是以decoder_start_token_id 或 pad_token_id 开头时，添加decoder_start_token_id
             # 因为我们在collect_fn中，会将input_ids以8的倍数填充left padding，然后紧跟着decoder_start_token_id和正文
@@ -389,9 +348,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 pad_token_id=torch.tensor(generation_config.pad_token_id, device=inputs_tensor.device),
                 device=inputs_tensor.device,
             )
-            LOGGER.debug("rank[%s], input_ids: %s", ACCELERATOR.process_index, input_ids.shape)
-            LOGGER.debug("rank[%s], input_ids: %s", ACCELERATOR.process_index, input_ids.tolist())
-            LOGGER.debug("rank[%s], model_kwargs step5: %s", ACCELERATOR.process_index, model_kwargs)
         else:
             input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
 
@@ -402,7 +358,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
             streamer.put(input_ids.cpu())
 
         # 6. Prepare `max_length` depending on other stopping criteria.
-        LOGGER.debug("rank[%s], step6", ACCELERATOR.process_index)
         input_ids_length = input_ids.shape[-1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
@@ -414,17 +369,12 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
             inputs_tensor=inputs_tensor,
             input_ids_length=input_ids_length,
         )
-        LOGGER.debug("rank[%s], input_ids_length: %s", ACCELERATOR.process_index, input_ids_length)
-        LOGGER.debug("rank[%s], has_default_max_length: %s", ACCELERATOR.process_index, has_default_max_length)
-        LOGGER.debug("rank[%s], has_default_min_length: %s", ACCELERATOR.process_index, has_default_min_length)
-        LOGGER.debug("rank[%s], generation_config: %s", ACCELERATOR.process_index, type(generation_config))
 
         # If the model supports `logits_to_keep` in forward(), set it to 1 to avoid computing the whole
         # logit matrix. This can save a lot of memory during the first forward pass. Note that assisted decoding
         # dynamically overrides this value as it can need more than the last token logits
         if self._supports_logits_to_keep() and "logits_to_keep" not in model_kwargs:
             model_kwargs["logits_to_keep"] = 1
-            LOGGER.debug("rank[%s], model_kwargs step6: %s", ACCELERATOR.process_index, model_kwargs)
 
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
 
@@ -438,9 +388,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         self._prepare_cache_for_generation(generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device)
 
         # 8. determine generation mode
-        LOGGER.debug("rank[%s], step8", ACCELERATOR.process_index)
         generation_mode = generation_config.get_generation_mode(assistant_model)
-        LOGGER.debug("rank[%s], generation_mode %s", ACCELERATOR.process_index, generation_mode)
 
         if streamer is not None and (generation_config.num_beams > 1):
             raise ValueError("`streamer` cannot be used with beam search (yet!). Make sure that `num_beams` is set to 1.")
@@ -467,7 +415,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
 
         # Set model_kwargs `use_cache` so we can use it later in forward runs
         model_kwargs["use_cache"] = generation_config.use_cache
-        LOGGER.debug("rank[%s], model_kwargs step9: %s", ACCELERATOR.process_index, model_kwargs)
 
         # 10. go into different generation modes
         result = None
@@ -830,8 +777,6 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
     if do_inference:
         gold_text_list = [" ".join(i["split_sents"]) for i in batch_data]
 
-    # LOGGER.debug("rank[%s], input text: %s", ACCELERATOR.process_index, tokenizer.batch_decode(input_text_tensor_dict.input_ids)
-
     return {
         "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
@@ -965,15 +910,9 @@ def train(model, train_dataloader, train_cfg):
     # hyperparameters
     model_params = list(model.named_parameters())
     optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
-    LOGGER.debug("Model trainable params:\n%s", "\n".join([n for n, p in model.named_parameters() if p.requires_grad]))
+    # LOGGER.debug("Model trainable params:\n%s", "\n".join([n for n, p in model.named_parameters() if p.requires_grad]))
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
-    # optimizer = AdamW(
-    #     optimizer_grouped_parameters,
-    #     eps=1e-8,
-    #     foreach=False,  # 禁用 multi-tensor
-    #     fused=False,  # 禁用 fused 优化
-    # )
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_num_steps * train_cfg["warmup_proportion"]), num_training_steps=total_num_steps)
 
@@ -981,7 +920,7 @@ def train(model, train_dataloader, train_cfg):
     model, train_dataloader, optimizer, scheduler = ACCELERATOR.prepare(model, train_dataloader, optimizer, scheduler)
     STATUS_INFO = StatusInfo()
     ACCELERATOR.register_for_checkpointing(STATUS_INFO)
-    LOGGER.debug("Final model structure:\n%s", model)
+    # LOGGER.debug("Final model structure:\n%s", model)
 
     # 2. Check and resume checkpoint if needed
     epoch_resumed, iter_resumed = check_status_and_resume_checkpoint()
@@ -1011,7 +950,6 @@ def train(model, train_dataloader, train_cfg):
         start = time.time()
         for curr_iter, batch_inputs_dict in enumerate(active_dataloader, start=iter_resumed if curr_epoch == epoch_resumed else 0):
             with ACCELERATOR.accumulate(model):
-                # LOGGER.debug("Train proc=%s, epoch=%s, iter=%s, global_update_steps=%s, data_ids=%s", ACCELERATOR.process_index, curr_epoch, curr_iter, STATUS_INFO.global_iters, batch_inputs_dict["data_id_list"], main_process_only=False)
                 # Not necessarily need ACCELERATOR.autocast()
                 # Accelerate enables automatic mixed precision, so autocast() is only needed if there are other mixed precision operations besides those performed on loss by backward() which already handles the scaling.
                 with ACCELERATOR.autocast():
@@ -1031,12 +969,12 @@ def train(model, train_dataloader, train_cfg):
                 log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["decoder_input_ids"].size(0), lr=scheduler.get_last_lr()[0], train_cfg=train_cfg)
 
                 # we dont do validation, as it cost too much time
-                check_and_save_checkpoint(model, max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
+                check_and_save_checkpoint(max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
 
         end = time.time()
         LOGGER.info("Batch training time: %s ", seconds_to_time_str(end - start))
 
-    LOGGER.info("Best achieved: %s", STATUS_INFO.dev_best)
+    save_model(model, CONFIG["output_dir"]["model"])
     MLFLOW_TRACKER.finish()
 
 
@@ -1122,7 +1060,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr, train_cfg):
         STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
 
 
-def check_and_save_checkpoint(model, max_num_iters_per_epoch, train_cfg):
+def check_and_save_checkpoint(max_num_iters_per_epoch, train_cfg):
     do_ckp = True
     # do_ckp at the end of each epoch
     if STATUS_INFO.curr_batch_iter + 1 == max_num_iters_per_epoch:
@@ -1231,8 +1169,6 @@ def evaluate(model, target_dataloader, output_result=False, **kwargs):
         for batch_idx, input_tensors_dict in enumerate(target_dataloader):
             # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
             with ACCELERATOR.autocast():
-                LOGGER.debug("rank[%s], eval pixel_values shape: %s", ACCELERATOR.process_index, input_tensors_dict["pixel_values"].shape, main_process_only=False)
-
                 # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
                 generation_config = GenerationConfig(
                     max_new_tokens=max_new_tokens,
@@ -1275,9 +1211,6 @@ def evaluate(model, target_dataloader, output_result=False, **kwargs):
 
     assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
     assert len(data_ids) == target_dataloader.total_dataset_length, f"Gathered data size ({len(data_ids)}) should equals to dataset size ({target_dataloader.total_dataset_length})"
-    # LOGGER.debug("p=%s, len=%s, data_ids: %s", ACCELERATOR.process_index, len(data_ids), data_ids)
-    # LOGGER.debug("p=%s, len=%s, pred_seqs: %s", ACCELERATOR.process_index, len(pred_seqs), pred_seqs)
-    # LOGGER.debug("p=%s, len=%s, gold_seqs: %s", ACCELERATOR.process_index, len(gold_seqs), gold_seqs)
     if output_result:
         with open(f"{CONFIG['output_dir']['result']}/{target_dataloader.dataset.split}_{ACCELERATOR.process_index}.json", "w", encoding="utf-8") as f:
             f.write(json.dumps({"gold_seqs": gold_seqs, "pred_seqs": pred_seqs}))
@@ -1316,14 +1249,6 @@ def compute_generation_score(gold_text_list, pred_text_list):
 #############################################
 # Utils
 #############################################
-def check_model_params(model):
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            LOGGER.debug("Parameter %s has requires_grad=True", name)
-        elif param.grad is not None:
-            LOGGER.debug("Parameter %s has gradient: %s", name, param.grad)
-        else:
-            LOGGER.debug("Parameter %s is correctly frozen", name)
 
 
 def check_memory(show_only_if_peak=False):
@@ -1387,34 +1312,33 @@ def save_checkpoint(checkpoint_dir, max_to_keep=5):
 
 
 def save_model(model, output_dir):
+    # 在使用 FULL_SHARD 和 SHARDED_STATE_DICT 时，model.state_dict()，unwrapped_model.state_dict()， ACCELERATOR.get_state_dict(model) 获得的 state_dict 都是一样的
+    ACCELERATOR.wait_for_everyone()
+    unwrapped_model = ACCELERATOR.unwrap_model(model)
+    if isinstance(unwrapped_model, PeftModel):
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=ACCELERATOR.is_main_process,
+            save_function=ACCELERATOR.save,
+            save_embedding_layers=True,
+        )
+    else:
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=ACCELERATOR.is_main_process,
+            save_function=ACCELERATOR.save,
+        )
+    ACCELERATOR.wait_for_everyone()
+    LOGGER.info("Model saved to %s", output_dir)
 
-    # LOGGER.debug("rank[%s], model", model, main_process_only=False)
-    # for n, p in model.named_parameters():
-    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
 
-    # ACCELERATOR.wait_for_everyone()
-    # LOGGER.debug("rank[%s], model.state_dict()", ACCELERATOR.process_index, main_process_only=False)
-    # for n, p in model.state_dict().items():
-    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
-
-    # ACCELERATOR.wait_for_everyone()
-    # unwrapped_model = ACCELERATOR.unwrap_model(model)
-    # state_dict = ACCELERATOR.get_state_dict(model)
-    # LOGGER.debug("rank[%s], ACCELERATOR.get_state_dict(model)", ACCELERATOR.process_index, main_process_only=False)
-    # for n, p in state_dict.items():
-    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
-
-    # # 这是 unwrapped_model.save_pretrained 内部调用的方式
-    # state_dict = get_peft_model_state_dict(unwrapped_model)
-    # LOGGER.debug("rank[%s], get_peft_model_state_dict(unwrapped_model)", ACCELERATOR.process_index, main_process_only=False)
-    # for n, p in state_dict.items():
-    #     LOGGER.debug("rank[%s], %s: %s", ACCELERATOR.process_index, n, p.shape, main_process_only=False)
-
+def save_model_outside_train_func(model, output_dir):
     # accelerator.get_state_dict(model) 会导致 rank1 上的 state_dict 不完整，不能使用
     # get_peft_model_state_dict(unwrapped_model) 可以让所有rank都拿到完整的 state_dict
     # unwrapped_model.save_pretrained 不传入 state_dict 时，会使用 get_peft_model_state_dict(self) 来获取 state_dict。也就是说是正确的
     # 当获取state_dict时，如果程序尝试在多个rank中同步state_dict，而由使用了 if ACCELERATOR.is_main_process: 来判断是否保存模型，则可能会导致进程卡主。比如rank0需要等到rank1同步state_dict，而rank1已经跳过了这个判断，进入wait的状态。
     # 所以结论就是，unwrapped_model 是 peft model时，不需要传入 state_dict 给 unwrapped_model.save_pretrained()，让它自己在内部调用 get_peft_model_state_dict() 来获取 state_dict即可，它也会处理不同rank的情况。
+    LOGGER.debug("Saving model %s", model)
 
     ACCELERATOR.wait_for_everyone()
     unwrapped_model = ACCELERATOR.unwrap_model(model)
@@ -1623,13 +1547,14 @@ def preprocess_dataset():
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
     pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
-    LOGGER.info("Preprocessed dataset dict saved to: %s", CONFIG["preprocess"]["cache_path"])
+    LOGGER.info("Preprocessed dataset dict saved to: \n%s", CONFIG["preprocess"]["cache_path"])
 
 
 #############################################
 def load_peft_model(base_model, peft_model_path):
     peft_model = PeftModel.from_pretrained(base_model, peft_model_path)
-    LOGGER.info("Fine-tuned PEFT model loaded from %s", peft_model_path)
+    LOGGER.info("Fine-tuned PEFT model loaded from \n%s", peft_model_path)
+    log_trainable_parameters(peft_model)
     return peft_model
 
 
@@ -1649,7 +1574,7 @@ def load_module_state_dict_from(model_path, target_module_prefix):
             if name.startswith(target_module_prefix):
                 target_state_dict[name] = param
 
-    LOGGER.info("Loaded pretrained params: [%s] from file: %s", target_state_dict.keys(), model_path)
+    LOGGER.info("Loaded pretrained params: [%s] from: \n%s", target_state_dict.keys(), model_path)
     return target_state_dict
 
 
@@ -1692,7 +1617,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
     if ds_valid:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
             if use_debug_subset:
-                vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 5, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
+                vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 2, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
             else:
                 vaild_dataset = ImageTextDataset(ds_valid, img_processor=img_processor, tokenizer=tokenizer, split="validation")
         valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_bsz, drop_last=False)
@@ -1735,18 +1660,30 @@ def post_init_model_and_tokenizer(model, tokenizer):
     GLOBAL_VARS.num_image_tokens = num_image_tokens
 
 
+def init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector"):
+    # 重新初始化模型，在后续再单独加载预训练的 img_projector，避免OOM的问题（不知道为什么会出现这个问题）
+    base_model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    # Load only img_projector state_dict to the base model
+    # 如果直接加载整个 pre_trained 模型，会导致训练时OOM，但只加载 img_projector 到base_model则不会
+    # 有点担心的是 decoder embedding 重新初始化，是否会导致其与 img_projector 的不匹配
+    target_state_dict = load_module_state_dict_from(model_path=pretain_model_path, target_module_prefix=target_module_prefix)
+    model = load_state_dict_to_model(base_model=base_model, target_state_dict=target_state_dict)
+    LOGGER.info("Initialized model with pretrained weights %s", target_module_prefix)
+    return model
+
+
 def init_model(vision_model_path, language_model_path, model_base_cfg):
-    LOGGER.info("Initializing vision language mode: %s, %s", vision_model_path, language_model_path)
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(vision_model_path, language_model_path)
+    LOGGER.info("Initialized vision language mode from: \n%s\n%s", vision_model_path, language_model_path)
     return model
 
 
 def init_processor(vision_model_path, language_model_path, model_base_cfg):
-    LOGGER.info("Loading ImageProcessor from: %s", vision_model_path)
     img_processor = AutoImageProcessor.from_pretrained(vision_model_path, use_fast=True)
+    LOGGER.info("Loaded ImageProcessor from: %s", vision_model_path)
 
-    LOGGER.info("Loading Tokenizer from: %s", language_model_path)
     tokenizer = AutoTokenizer.from_pretrained(language_model_path, use_fast=True)
+    LOGGER.info("Loaded Tokenizer from: %s", language_model_path)
 
     # Add special tokens
     LOGGER.info("Adding special tokens")
@@ -1796,10 +1733,15 @@ def apply_peft_to_model(model):
         # task_type=TaskType.CAUSAL_LM,
     )
     peft_model = get_peft_model(model, lora_config)
-    peft_model.print_trainable_parameters()
-    # LOGGER.debug("PEFT model trainable: %s", "\n".join([n for n, p in peft_model.named_parameters() if p.requires_grad == True]))
-
+    LOGGER.info("Applied PEFT model with config: %s", lora_config)
+    log_trainable_parameters(peft_model)
     return peft_model
+
+
+def log_trainable_parameters(peft_model):
+    peft_model.print_trainable_parameters()
+    trainable_params, all_param = peft_model.get_nb_trainable_parameters()
+    LOGGER.info("PEFT model trainable params=%d, all params=%d | trainable=[%.4f]%%", trainable_params, all_param, 100 * trainable_params / all_param)
 
 
 def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
@@ -1971,8 +1913,6 @@ def global_init_proj_config():
 
 
 #############################################
-
-
 def pretrain_model(model_base_cfg, train_cfg):
     """pre-train the image_adaptor, freeze encoder and decoder"""
     vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
@@ -1996,7 +1936,6 @@ def pretrain_model(model_base_cfg, train_cfg):
     end = time.time()
     LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
-    save_model(model, CONFIG["output_dir"]["model"])
     save_processors(img_processor=img_processor, tokenizer=tokenizer, output_dir=CONFIG["output_dir"]["model"])
 
 
@@ -2030,44 +1969,28 @@ def eval_pretrained_model(train_cfg):
 
 def finetune_model(train_cfg):
     """use peft with fsdp to train image projector and decoder"""
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
     pretain_model_path = train_cfg["pretain_model_path"]
 
     # Train and test
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
-    img_processor, tokenizer = load_processor(pretain_model_path)
-    model_base_cfg = CONFIG["model"]
-    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    model = init_model(vision_model_path, language_model_path, model_base_cfg)
-    target_state_dict = load_module_state_dict_from(model_path=pretain_model_path, target_module_prefix="v2l_projector")
-    model = load_state_dict_to_model(base_model=model, target_state_dict=target_state_dict)
-    #####################
-
-    # model = load_model(pretain_model_path)
-    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
-    # img_processor, tokenizer = load_processor(pretain_model_path)
-    #####################
-
-    # # Train and test
-    # model_base_cfg = CONFIG["model"]
-    # vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    # language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    # img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-    # model = init_model(vision_model_path, language_model_path, model_base_cfg)
-    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
-    #####################
+    if train_cfg["use_pretrained"]:
+        model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
+        img_processor, tokenizer = load_processor(pretain_model_path)
+    else:
+        model = init_model(vision_model_path, language_model_path, model_base_cfg)
+        img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
 
     post_init_model_and_tokenizer(model, tokenizer)
-
-    # Apply peft to model
     model = apply_peft_to_model(model)
-
     global_init_accelerator(model, **train_cfg)
     check_memory()
     model.to(DEVICE)
-    LOGGER.debug("Final model dtype: %s", model.dtype)
+
     train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
@@ -2076,12 +1999,14 @@ def finetune_model(train_cfg):
     end = time.time()
     LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
-    save_model(model, CONFIG["output_dir"]["model"])
     save_processors(img_processor=img_processor, tokenizer=tokenizer, output_dir=CONFIG["output_dir"]["model"])
 
 
 def eval_finetuned_model(train_cfg):
     """eval the peft model with FSDP set to NO_SHARD"""
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
     pretain_model_path = train_cfg["pretain_model_path"]
     peft_model_path = CONFIG["output_dir"]["model"]
 
@@ -2089,32 +2014,23 @@ def eval_finetuned_model(train_cfg):
     set_seed(train_cfg["seed"])
     ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
 
-    # Eval need to change accelerator fsdp sharding_strategy to no shard
-    model = load_model(pretain_model_path)
-    img_processor, tokenizer = load_processor(pretain_model_path)
-    #####################################
-
-    # model_base_cfg = CONFIG["model"]
-    # vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
-    # language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
-    # img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
-    # model = init_model(vision_model_path, language_model_path, model_base_cfg)
-    # LOGGER.debug("Loaded model dtype: %s", model.dtype)
-    #####################################
+    if train_cfg["use_pretrained"]:
+        model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
+        img_processor, tokenizer = load_processor(pretain_model_path)
+    else:
+        model = init_model(vision_model_path, language_model_path, model_base_cfg)
+        img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
 
     post_init_model_and_tokenizer(model, tokenizer)
-
     model = load_peft_model(base_model=model, peft_model_path=peft_model_path)
-
     global_init_accelerator(model, fsdp_no_shard=True, **train_cfg)
+    model.to(DEVICE)
 
     _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
-    model.to(DEVICE)
+
     model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
     check_memory()
-
-    LOGGER.debug("Final model structure:\n%s", model)
 
     start = time.time()
     evaluate(model, validation_dataloader, output_result=True, **train_cfg)
@@ -2130,11 +2046,11 @@ def eval_finetuned_model(train_cfg):
 if __name__ == "__main__":
     global_init_proj_config()
     global_init_logger(log_level=logging.DEBUG, base_log_level=logging.WARNING, fsdp_log_level=logging.WARNING)
-    LOGGER.debug(CONFIG)
+    LOGGER.info(CONFIG)
 
-    LOGGER.debug("[rank %s] CUDA_VISIBLE_DEVICES = %s", os.environ.get("RANK"), os.environ.get("CUDA_VISIBLE_DEVICES"))
-    LOGGER.debug("[rank %s] Current device: %s", os.environ.get("RANK"), torch.cuda.current_device())
-    LOGGER.debug("[rank %s] Memory allocated: %s GB", os.environ.get("RANK"), torch.cuda.memory_allocated() / 1024**3)
+    LOGGER.info("[rank %s] CUDA_VISIBLE_DEVICES = %s", os.environ.get("RANK"), os.environ.get("CUDA_VISIBLE_DEVICES"))
+    LOGGER.info("[rank %s] Current device: %s", os.environ.get("RANK"), torch.cuda.current_device())
+    LOGGER.info("[rank %s] Memory allocated: %s GB", os.environ.get("RANK"), torch.cuda.memory_allocated() / 1024**3)
 
     start0 = time.time()
 

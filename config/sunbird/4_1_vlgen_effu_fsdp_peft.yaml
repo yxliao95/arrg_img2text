@@ -64,6 +64,9 @@ pretrain:
   print_pred_per_n_steps: 1
 
 finetune:
+  # if use pretrained=True, then load the pretrained img_projector weights from path,
+  # else init the img_projector with random weights
+  use_pretrained: False
   pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/4_1_fsdo_peft_test_pretrain
 
   seed: 42

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=4_1_fsdp_peft_test_finetune_NO_SHARD_FULL_STATE_DICT
+#SBATCH --job-name=4_1_fsdp_peft_test_finetune_without_pretrain
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -49,17 +49,17 @@ accelerate launch\
     --resume_from_checkpoint
 echo "Script [finetune] finished."
 
-# accelerate launch\
-#     --multi_gpu \
-#     --num_processes 2 \
-#     --main_process_port 29556 \
-#     /scratch/c.c21051562/workspace/arrg_img2text/4_1_vlgen_effu_fsdp_peft.py \
-#     --from_bash \
-#     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_1_vlgen_effu_fsdp_peft.yaml \
-#     --output_name $SLURM_JOB_NAME \
-#     --jobid $SLURM_JOB_ID \
-#     --run_mode eval_finetuned
-# echo "Script [eval_finetuned] finished."
+accelerate launch\
+    --multi_gpu \
+    --num_processes 2 \
+    --main_process_port 29556 \
+    /scratch/c.c21051562/workspace/arrg_img2text/4_1_vlgen_effu_fsdp_peft.py \
+    --from_bash \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_1_vlgen_effu_fsdp_peft.yaml \
+    --output_name $SLURM_JOB_NAME \
+    --jobid $SLURM_JOB_ID \
+    --run_mode eval_finetuned
+echo "Script [eval_finetuned] finished."
 
 # 查找所有运行中的 MLflow 进程
 pids=$(ps aux | grep '[m]lflow' | awk '{print $2}')
