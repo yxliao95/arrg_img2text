@@ -1,6 +1,6 @@
 #############################################
 # 基于4_1修改
-# 改为使用完整报告进行训练
+# 使用fsdp，peft，使用完整报告进行训练
 #############################################
 import argparse
 import datetime
@@ -1464,24 +1464,11 @@ def resize_image_with_bspline_pil(image, target_size=518):
     return resized_image
 
 
-def pre_process_dataset(img_processor, img_dataset, text_dataset, shortest_edge, convert_to_rgb=True):
-    # align image_ds to text_ds
-    ds_textRowId_imgId = []
-    for textDs_row_idx, doc_key in enumerate(text_dataset["doc_key"]):
-        data_split, img_id, section_name = doc_key.split("#")
-        ds_textRowId_imgId.append((int(textDs_row_idx), int(img_id)))
-
-    # 按照 img_id 排序
-    sorted_ds_textRowId_imgId = sorted(ds_textRowId_imgId, key=lambda x: x[1])
-
-    # 如果传入的是裁剪后的 img_ds 数据集，那么 img_id 与 img_row_id 不一定是一一对应的
-    ds_imgId_imgRowId = {img_id: img_row_id for img_row_id, img_id in enumerate(img_dataset["img_id"])}
-
-    # 按照 img_id 的顺序，将 img_ds 的数据拼接到 text_ds 的数据中
-    filtered_img_ds = img_dataset.select([ds_imgId_imgRowId[img_id] for _, img_id in sorted_ds_textRowId_imgId if img_id in ds_imgId_imgRowId])
-    filtered_text_ds = text_dataset.select([text_row_id for text_row_id, _ in sorted_ds_textRowId_imgId])
-    filtered_dataset = concatenate_datasets([filtered_img_ds, filtered_text_ds], axis=1)
-    LOGGER.debug("Concatenated image-text dataset dict (aligning image_ds to text_ds): \n%s", filtered_dataset)
+def process_image(img_processor, img_dataset, data_split, shortest_edge, convert_to_rgb=True):
+    # add `data_key` to image dataset as a unique identifier which is identical to the text dataset's `doc_key`
+    preprocess_cfg = CONFIG["preprocess"]
+    section_name = CONFIG["target_section"]
+    img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}#{section_name}" for idx in range(len(img_dataset))])
 
     def map_func(examples):
         # Select images
@@ -1500,63 +1487,46 @@ def pre_process_dataset(img_processor, img_dataset, text_dataset, shortest_edge,
         examples["selected_indices_list"] = selected_images_list
         return examples
 
-    preprocess_cfg = CONFIG["preprocess"]
-    new_dataset = filtered_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])  #
-    LOGGER.debug("Preprocessed final dataset dict: \n%s", new_dataset)
+    new_dataset = img_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])  #
+    LOGGER.info("Resized image dataset dict: \n%s", new_dataset)
     return new_dataset
 
 
-def load_src_datasets(data_paths):
+def load_image_datasets(data_paths):
     dataset_interpret = load_from_disk(data_paths["interpret"])
-    LOGGER.debug("%s loaded from interpret_cxr", [f"{split}:{len(ds)}" for split, ds in dataset_interpret.items()])
+    LOGGER.info("%s loaded from interpret-cxr", [f"{split}:{len(ds)}" for split, ds in dataset_interpret.items()])
     dataset_mimic = load_from_disk(data_paths["mimic"])
-    LOGGER.debug("%s loaded from mimic-cxr", [f"{split}:{len(ds)}" for split, ds in dataset_mimic.items()])
+    LOGGER.info("%s loaded from mimic-cxr", [f"{split}:{len(ds)}" for split, ds in dataset_mimic.items()])
 
     # Concat both
     dataset_train_dev = DatasetDict({"train": concatenate_datasets([dataset_interpret["train"], dataset_mimic["train"]]), "validation": concatenate_datasets([dataset_interpret["validation"], dataset_mimic["validation"]])})
+
     dataset_test = load_from_disk(data_paths["interpret-test-public"])
+    LOGGER.info("%s loaded from interpret-test-public", [f"{split}:{len(ds)}" for split, ds in dataset_mimic.items()])
 
     ds_img = DatasetDict({"train": dataset_train_dev["train"], "validation": dataset_train_dev["validation"], "test": dataset_test["test"]})
     for split in ds_img:
         ds_img[split] = ds_img[split].add_column("img_id", range(len(ds_img[split])))
     LOGGER.debug("Loaded image-report dataset: \n%s", ds_img)
-
-    ds_text = load_from_disk(data_paths["custom_text"])
-
-    for split in ds_text:
-        ds_text[split] = ds_text[split].add_column("text_id", range(len(ds_text[split])))
-    LOGGER.debug("Loaded custom split_text dataset: \n%s", ds_text)
-
-    if CONFIG["target_section"] == "findings":
-        ds_img = ds_img.remove_columns("impression")
-        ds_img = ds_img.rename_column("findings", "section_text")
-    elif CONFIG["target_section"] == "impression":
-        ds_img = ds_img.remove_columns("findings")
-        ds_img = ds_img.rename_column("impression", "section_text")
-    else:
-        raise ValueError(f"Invalid target_section {CONFIG['target_section']}, expected 'findings' or 'impression'")
-
-    return ds_img, ds_text
+    return ds_img
 
 
 def preprocess_dataset():
-    img_dataset, text_dataset = load_src_datasets(data_paths=CONFIG["data_path"])
+    img_dataset = load_image_datasets(data_paths=CONFIG["data_path"])
 
     # Get dataloader for training and testing
     image_processor_name = CONFIG["preprocess"]["image_processor"]
     model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
-    # TODO 之前的数据是用slow版本处理的，可能会产生不一样的结果
     img_processor = AutoImageProcessor.from_pretrained(model_name_or_path, use_fast=True)
     shortest_edge = img_processor.size["shortest_edge"]
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = pre_process_dataset(img_processor=img_processor, img_dataset=img_dataset[split], text_dataset=text_dataset[split], shortest_edge=shortest_edge, convert_to_rgb=True)
-        # .select(range(len(text_dataset[split]) - 200, len(text_dataset[split])))
+        ds_dict[split] = process_image(img_processor=img_processor, img_dataset=img_dataset[split], data_split=split, shortest_edge=shortest_edge, convert_to_rgb=True)
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
     pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
-    LOGGER.info("Preprocessed dataset dict saved to: \n%s", CONFIG["preprocess"]["cache_path"])
+    LOGGER.info("Preprocessed image dataset, saved to: \n%s", CONFIG["preprocess"]["cache_path"])
 
 
 #############################################
@@ -1884,7 +1854,7 @@ def global_init_proj_config():
     if args.from_bash:
         file_path = args.config_file
     else:
-        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/4_vlgen_peft.yaml"
+        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/5_fsdp_peft_full_text.yaml"
 
     with open(file_path, "r", encoding="utf-8") as f:
         CONFIG = yaml.safe_load(f)
@@ -2057,9 +2027,10 @@ if __name__ == "__main__":
     global_init_logger(log_level=logging.DEBUG, base_log_level=logging.WARNING, fsdp_log_level=logging.WARNING)
     LOGGER.info(CONFIG)
 
-    LOGGER.info("[rank %s] CUDA_VISIBLE_DEVICES = %s", os.environ.get("RANK"), os.environ.get("CUDA_VISIBLE_DEVICES"))
-    LOGGER.info("[rank %s] Current device: %s", os.environ.get("RANK"), torch.cuda.current_device())
-    LOGGER.info("[rank %s] Memory allocated: %s GB", os.environ.get("RANK"), torch.cuda.memory_allocated() / 1024**3)
+    if torch.cuda.is_available():
+        LOGGER.info("[rank %s] CUDA_VISIBLE_DEVICES = %s", os.environ.get("RANK"), os.environ.get("CUDA_VISIBLE_DEVICES"))
+        LOGGER.info("[rank %s] Current device: %s", os.environ.get("RANK"), torch.cuda.current_device())
+        LOGGER.info("[rank %s] Memory allocated: %s GB", os.environ.get("RANK"), torch.cuda.memory_allocated() / 1024**3)
 
     start0 = time.time()
 
