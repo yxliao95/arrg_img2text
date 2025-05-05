@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=2_fast_regression_preprocess
+#SBATCH --job-name=5_preprocess_interpretcxr_full_text_img518
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -25,22 +25,19 @@ echo "Loaded $conda, env: $env"
 nvcc -V
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
-python /scratch/c.c21051562/workspace/arrg_img2text/4_1_vlgen_effu_fsdp_peft.py \
+python /scratch/c.c21051562/workspace/arrg_img2text/5_fsdp_peft_full_text.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_vlgen_effu.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_fsdp_peft_full_text.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
-    --preprocess_dataset \
-    --image_processor rad_dino_maira2 \
-    --cache_path /scratch/c.c21051562/workspace/arrg_img2text/dataset_cache/rad_dino_maira2_rbg518
-
+    --run_mode preprocess \
 
 echo "Script finished."
 
 
 python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Done: $SLURM_JOB_NAME"
 
-# sbatch /scratch/c.c21051562/workspace/arrg_img2text/preprocess_sunbird.sh
+# sbatch /scratch/c.c21051562/workspace/arrg_img2text/scripts/preprocess_sunbird.sh
 # scontrol show job JOBID
 # scontrol show job JOBID | grep NodeList
 # scancel JOBID

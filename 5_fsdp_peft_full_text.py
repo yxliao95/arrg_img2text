@@ -698,10 +698,28 @@ class ImageTextDataset(Dataset):
     def __init__(self, hf_dataset, img_processor, tokenizer, split):
         # column_names: ['source', 'images_path', 'images', 'section_text', 'doc_key', 'split_sents', 'split_sent_toks', 'sent_idx_split_idx', 'radlex', 'cxrgraph_ent', 'cxrgraph_attr', 'cxrgraph_rel']
         self.split = split
+        self.target_section = CONFIG["target_section"]
         self.src_path = os.path.dirname(hf_dataset.cache_files[0]["filename"]) if hf_dataset.cache_files else ""
         self.img_processor = img_processor
         self.tokenizer = tokenizer
-        self.samples = hf_dataset
+        self.samples = self._process_text(hf_dataset)
+
+    def _process_text(self, hf_dataset):
+        if self.target_section == "findings":
+            hf_dataset = hf_dataset.remove_columns("impression")
+            hf_dataset = hf_dataset.rename_column("findings", "section_text")
+        elif self.target_section == "impression":
+            hf_dataset = hf_dataset.remove_columns("findings")
+            hf_dataset = hf_dataset.rename_column("impression", "section_text")
+        else:
+            raise ValueError(f"Invalid target_section {self.target_section}, expected 'findings' or 'impression'")
+
+        # Remove empty string
+        non_empty_section_indices = [idx for idx, txt in enumerate(hf_dataset["section_text"]) if txt != ""]
+        filtered_dataset = hf_dataset.select(non_empty_section_indices)
+        num_removed_data = len(hf_dataset) - len(non_empty_section_indices)
+        LOGGER.info("Removed [%d] samples with empty [%s] section from [%s] split", num_removed_data, self.target_section, self.split)
+        return filtered_dataset
 
     def __len__(self):
         return len(self.samples)
@@ -712,6 +730,7 @@ class ImageTextDataset(Dataset):
 
 
 def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
+    target_section = CONFIG["target_section"]
 
     # 处理图像，因为每个样本的图像数量不一样，所以需要image_indices_map来记录每个样本的图像在batch中的索引
     nested_images = [i["images"] for i in batch_data]  # nested list of imgs: [[img1, img2], [img1], ...]
@@ -736,7 +755,7 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
                 "role": "user",
                 "content": [
                     {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                    {"type": "text", "text": "Given the chest X-ray images, generate a description of the findings."},
+                    {"type": "text", "text": f"Given the chest X-ray images, generate a description of the {target_section}."},
                 ],
             },
         ]
@@ -744,7 +763,7 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
             conversation.append(
                 {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": " ".join(item["split_sents"])}],
+                    "content": [{"type": "text", "text": item["section_text"]}],
                 }
             )
         conversations.append(conversation)
@@ -775,7 +794,9 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
 
     gold_text_list = None
     if do_inference:
-        gold_text_list = [" ".join(i["split_sents"]) for i in batch_data]
+        # i["split_sents"] = ['There is no evidence to suggest pleural effusion.']
+        # i["findings"] = 'Lungs are grossly clear. There are no new lung opacities which are of concern. There is no evidence to suggest pleural effusion or pneumothorax. Severe scoliosis is noted. Cardiomediastinal silhouette is unchanged. The nasogastric tube tip is in the stomach and right PICC line is approximately at the mid SVC.'
+        gold_text_list = [i["section_text"] for i in batch_data]
 
     return {
         "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
@@ -783,7 +804,7 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
         "decoder_input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
         "decoder_attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
         "decoder_assistant_masks": decoder_assistant_masks,
-        "data_id_list": [i["doc_key"] for i in batch_data],
+        "data_id_list": [i["data_key"] for i in batch_data],
         "gold_text_list": gold_text_list,
     }
 
@@ -1464,11 +1485,11 @@ def resize_image_with_bspline_pil(image, target_size=518):
     return resized_image
 
 
-def process_image(img_processor, img_dataset, data_split, shortest_edge, convert_to_rgb=True):
-    # add `data_key` to image dataset as a unique identifier which is identical to the text dataset's `doc_key`
+def process_image(img_processor, img_dataset, data_split, shortest_edge):
     preprocess_cfg = CONFIG["preprocess"]
-    section_name = CONFIG["target_section"]
-    img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}#{section_name}" for idx in range(len(img_dataset))])
+
+    # add `data_key` to image dataset as a unique identifier which is identical to the text dataset's `doc_key`
+    img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}" for idx in range(len(img_dataset))])
 
     def map_func(examples):
         # Select images
@@ -1479,7 +1500,7 @@ def process_image(img_processor, img_dataset, data_split, shortest_edge, convert
         for example_idx, images_per_example in enumerate(examples["images"]):
             selected_images, selected_indices = select_images(images_per_example)
             # LANCZOS 更适合处理含有精细细节的图像 (如 X-ray 图像), 可以更好地保留图像中高频信息。适合对病灶等微小特征的保留。
-            selected_images = [resize_image_with_bspline_pil(img) for img in selected_images]
+            selected_images = [resize_image_with_bspline_pil(img, target_size=shortest_edge) for img in selected_images]
             selected_images_list.append(selected_images)
             selected_indices_list.append(selected_indices)
 
@@ -1487,12 +1508,13 @@ def process_image(img_processor, img_dataset, data_split, shortest_edge, convert
         examples["selected_indices_list"] = selected_images_list
         return examples
 
-    new_dataset = img_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])  #
-    LOGGER.info("Resized image dataset dict: \n%s", new_dataset)
+    new_dataset = img_dataset.map(map_func, batched=preprocess_cfg["batched"], batch_size=preprocess_cfg["batch_size"], num_proc=preprocess_cfg["num_proc"])
+    LOGGER.info("Processed image dataset: \n%s", new_dataset)
     return new_dataset
 
 
 def load_image_datasets(data_paths):
+    LOGGER.info("Loading raw image dataset")
     dataset_interpret = load_from_disk(data_paths["interpret"])
     LOGGER.info("%s loaded from interpret-cxr", [f"{split}:{len(ds)}" for split, ds in dataset_interpret.items()])
     dataset_mimic = load_from_disk(data_paths["mimic"])
@@ -1507,22 +1529,24 @@ def load_image_datasets(data_paths):
     ds_img = DatasetDict({"train": dataset_train_dev["train"], "validation": dataset_train_dev["validation"], "test": dataset_test["test"]})
     for split in ds_img:
         ds_img[split] = ds_img[split].add_column("img_id", range(len(ds_img[split])))
-    LOGGER.debug("Loaded image-report dataset: \n%s", ds_img)
+    LOGGER.info("Loaded image-report dataset: \n%s", ds_img)
     return ds_img
 
 
 def preprocess_dataset():
+    LOGGER.info("Preprocessing image dataset")
     img_dataset = load_image_datasets(data_paths=CONFIG["data_path"])
 
     # Get dataloader for training and testing
     image_processor_name = CONFIG["preprocess"]["image_processor"]
     model_name_or_path = CONFIG["model_name_or_path"][image_processor_name]
     img_processor = AutoImageProcessor.from_pretrained(model_name_or_path, use_fast=True)
+    LOGGER.info("Loaded image processor from: \n%s", model_name_or_path)
     shortest_edge = img_processor.size["shortest_edge"]
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = process_image(img_processor=img_processor, img_dataset=img_dataset[split], data_split=split, shortest_edge=shortest_edge, convert_to_rgb=True)
+        ds_dict[split] = process_image(img_processor=img_processor, img_dataset=img_dataset[split], data_split=split, shortest_edge=shortest_edge)
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
     pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
@@ -1846,8 +1870,6 @@ def global_init_proj_config():
     parser.add_argument("--resume_from_checkpoint", action="store_true", default=None)
 
     parser.add_argument("--run_mode", type=str, default=None, help="Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]")
-    parser.add_argument("--image_processor", type=str, default=None)
-    parser.add_argument("--cache_path", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -1865,10 +1887,6 @@ def global_init_proj_config():
 
         if args.run_mode:
             CONFIG["run_mode"] = args.run_mode
-
-        if CONFIG["run_mode"] == "preprocess":
-            CONFIG["preprocess"]["image_processor"] = args.image_processor
-            CONFIG["preprocess"]["cache_path"] = args.cache_path
 
         if args.resume_from_checkpoint:
             CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint

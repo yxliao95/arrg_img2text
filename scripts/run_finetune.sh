@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=4_1_fsdp_peft_finetune_without_pretrain
+#SBATCH --job-name=5_finetune_full_text_118_10-5
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -12,7 +12,7 @@
 #SBATCH --gres=gpu:2
 ### SBATCH -t 0-00:00
 
-# Number of CPU cores per task to allocate, (maximun of 8 cpus for 2 gpus, 16 for compute nodes)
+# Number of CPU cores per task to allocate, (maximun of 4 cpus for 1 gpu, 16 for compute nodes)
 #SBATCH --ntasks=2
 #SBATCH --cpus-per-task=8
 
@@ -40,9 +40,9 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port 29556 \
-    /scratch/c.c21051562/workspace/arrg_img2text/4_1_vlgen_effu_fsdp_peft.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/5_fsdp_peft_full_text.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_1_vlgen_effu_fsdp_peft.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_fsdp_peft_full_text.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --run_mode finetune \
@@ -53,9 +53,9 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port 29556 \
-    /scratch/c.c21051562/workspace/arrg_img2text/4_1_vlgen_effu_fsdp_peft.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/5_fsdp_peft_full_text.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/4_1_vlgen_effu_fsdp_peft.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_fsdp_peft_full_text.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --run_mode eval_finetuned
@@ -86,10 +86,10 @@ python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbi
 # ps aux | grep <进程名>
 # kill <PID>
 
-# ssh -L 6007:localhost:6006 yuxiang@10.97.37.97
+# ssh -L 6007:localhost:6006 yuxiang@10.97.37.49
 # ssh -L 6007:localhost:6006 -J c.c21051562@sunbird.swansea.ac.uk c.c21051562@ccs2111
 
-# ssh -L 6007:localhost:6006 c.c21051562@sunbird.swansea.ac.uk
+# ssh -L 6007:localhost:6006 -J c.c21051562@hawklogin.cf.ac.uk c.c21051562@sunbird.swansea.ac.uk
 # conda activate arrg_img2text
 # mlflow server --host 127.0.0.1 --port 6006 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns
 
