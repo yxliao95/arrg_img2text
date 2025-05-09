@@ -880,7 +880,7 @@ class MLflowTracker:
             elif run_name:
                 mlflow.start_run(run_name=f"{run_name}", log_system_metrics=False)
             else:
-                raise ValueError(f"Either run_id or run_name should be provided.")
+                raise ValueError("Either run_id or run_name should be provided.")
 
             self.run = mlflow.last_active_run()
             self.run_id = self.run.info.run_id
@@ -1870,6 +1870,7 @@ def global_init_proj_config():
     parser.add_argument("--resume_from_checkpoint", action="store_true", default=None)
 
     parser.add_argument("--run_mode", type=str, default=None, help="Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]")
+    parser.add_argument("--mlflow_port", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -1890,8 +1891,13 @@ def global_init_proj_config():
 
         if args.resume_from_checkpoint:
             CONFIG["resume_from_checkpoint"] = args.resume_from_checkpoint
+
+        if args.mlflow_port:
+            CONFIG["mlflow_port"] = args.mlflow_port
     else:
         CONFIG["jobid"] = "00000"
+
+    CONFIG["mlflow_url"] = f"{CONFIG['mlflow_url']}:{CONFIG['mlflow_port']}"
 
     output_dirs = CONFIG["output_dir"]
     output_dirs["result"] = os.path.join(output_dirs["result"], CONFIG["output_name"])

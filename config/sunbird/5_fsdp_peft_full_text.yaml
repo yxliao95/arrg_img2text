@@ -12,6 +12,7 @@ data_path:
   interpret: /scratch/c.c21051562/resources/data/interpret-cxr
   interpret-test-public: /scratch/c.c21051562/resources/data/interpret-cxr-test-public
   custom_text: /scratch/c.c21051562/resources/data/interpret_text_exp/interpret_text_findings_effusion
+  text_graph: /scratch/c.c21051562/resources/data/interpret_graph/all
 
 target_section: findings
 
@@ -21,7 +22,9 @@ model_name_or_path:
   rad_dino_maira2: /scratch/c.c21051562/resources/downloaded_models/rad-dino-maira-2
   llama32_1b: /scratch/c.c21051562/resources/downloaded_models/Llama-3.2-1B
 
-mlflow_url: "http://localhost:6006" # mlflow server --host 127.0.0.1 --port 6006
+# final url == http://localhost:6006
+mlflow_url: "http://localhost"
+mlflow_port: 6006
 max_checkpoints_to_keep: 3
 
 # path to checkpoint or, bool;
@@ -49,7 +52,7 @@ pretrain:
   seed: 42
   num_epochs: 1
   batch_size: 1
-  grad_accum_steps:
+  grad_accum_steps: 16
   warmup_proportion: 0.1
 
   lr: 0.00001
@@ -60,7 +63,7 @@ pretrain:
   # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
   ckp_per_steps: 10000 # 550395 / 32 = 17199, 170801 / 8 = 21350
 
-  eval_batch_size: 16
+  eval_batch_size: 32
   max_new_tokens: 512
   print_pred_per_n_steps: 500
 
@@ -73,7 +76,7 @@ finetune:
   seed: 42
   num_epochs: 1
   batch_size: 1
-  grad_accum_steps: 8
+  grad_accum_steps: 16
   warmup_proportion: 0.1
 
   lr: 0.00001
@@ -84,6 +87,6 @@ finetune:
   # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
   ckp_per_steps: 10000 # 550395 / 8 = 68800, 170801 / 8 = 21350
 
-  eval_batch_size: 16
+  eval_batch_size: 32
   max_new_tokens: 512
   print_pred_per_n_steps: 500

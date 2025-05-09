@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=5_finetune_full_text_118_10-5
+#SBATCH --job-name=5_finetune_full_text_1116_10-5
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -16,9 +16,13 @@
 #SBATCH --ntasks=2
 #SBATCH --cpus-per-task=8
 
+mlflow_port=6006
+main_process_port=29557
+
 cuda=CUDA/12.4
 conda=anaconda/2024.06
 env=arrg_img2text
+
 
 module load $cuda
 echo "Loaded $cuda"
@@ -29,7 +33,7 @@ conda activate $env
 echo "Loaded $conda, env: $env"
 nvcc -V
 
-nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
+nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
 echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
@@ -39,12 +43,13 @@ export NCCL_TIMEOUT=1800  # 默认是 1800 秒（30 分钟），你可以设置�
 accelerate launch\
     --multi_gpu \
     --num_processes 2 \
-    --main_process_port 29556 \
+    --main_process_port $main_process_port \
     /scratch/c.c21051562/workspace/arrg_img2text/5_fsdp_peft_full_text.py \
     --from_bash \
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_fsdp_peft_full_text.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
+    --mlflow_port $mlflow_port \
     --run_mode finetune \
     # --resume_from_checkpoint
 echo "Script [finetune] finished."
@@ -52,20 +57,21 @@ echo "Script [finetune] finished."
 accelerate launch\
     --multi_gpu \
     --num_processes 2 \
-    --main_process_port 29556 \
+    --main_process_port $main_process_port \
     /scratch/c.c21051562/workspace/arrg_img2text/5_fsdp_peft_full_text.py \
     --from_bash \
     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_fsdp_peft_full_text.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
+    --mlflow_port $mlflow_port \
     --run_mode eval_finetuned
 echo "Script [eval_finetuned] finished."
 
-# 查找所有运行中的 MLflow 进程
-pids=$(ps aux | grep '[m]lflow' | awk '{print $2}')
-echo "Killing MLflow server processes: $pids" 
+# 查找运行在该端口的 mlflow 进程
+pids=$(lsof -i :$mlflow_port -sTCP:LISTEN -t)
+echo "Killing MLflow server on port $mlflow_port. PIDs: $pids"
 if [ -z "$pids" ]; then
-  echo "No MLflow processes found."
+  echo "No MLflow processes found on port $mlflow_port."
 else
   for pid in $pids; do
     kill $pid
