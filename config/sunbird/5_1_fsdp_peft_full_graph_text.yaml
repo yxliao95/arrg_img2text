@@ -12,6 +12,7 @@ data_path:
   interpret: /scratch/c.c21051562/resources/data/interpret-cxr
   interpret-test-public: /scratch/c.c21051562/resources/data/interpret-cxr-test-public
   custom_text: /scratch/c.c21051562/resources/data/interpret_text_exp/interpret_text_findings_effusion
+  text_graph: /scratch/c.c21051562/resources/data/interpret_graph/all
 
 target_section: findings
 
