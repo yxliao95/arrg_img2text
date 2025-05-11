@@ -16,6 +16,7 @@ import shutil
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from difflib import get_close_matches
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import datasets
@@ -94,6 +95,8 @@ class GlobalVariables:
     peak_mem = 0
     num_image_tokens = 0
     additional_special_tokens = ["<|image_token|>", "<|image_start|>", "<|image_end|>"]
+    ent_type_tokens = ["<Anatomy>", "<Observation-Present>", "<Observation-Absent>", "<Observation-Uncertain>", "<Location-Attribute>"]
+    rel_type_tokens = ["<modify>", "<located_at>", "<suggestive_of>", "<part_of>"]
 
 
 GLOBAL_VARS = GlobalVariables()
@@ -729,8 +732,9 @@ class ImageTextDataset(Dataset):
         return self.samples[index]
 
 
-def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
-    target_section = CONFIG["target_section"]
+def collate_fn(batch_data, img_processor, tokenizer):
+    # 这个方法只处理图像，
+    # 对话数据由于在训练和推理时不同，所以分开进行处理
 
     # 处理图像，因为每个样本的图像数量不一样，所以需要image_indices_map来记录每个样本的图像在batch中的索引
     nested_images = [i["images"] for i in batch_data]  # nested list of imgs: [[img1, img2], [img1], ...]
@@ -744,29 +748,71 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
         image_indices_map.append(list(range(img_count, img_count + num_images)))
         img_count += num_images
 
-    # 处理对话数据
+    return {
+        "batch_data": batch_data,
+        "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
+        "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
+    }
+
+
+def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_map):
+    # training中，多轮对话可以合并为一个input
+    target_section = CONFIG["target_section"]
+
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
     for idx, item in enumerate(batch_data):
         num_images = len(image_indices_map[idx])
-        conversation = [
-            {"role": "system", "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}]},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                    {"type": "text", "text": f"Given the chest X-ray images, generate a description of the {target_section}."},
-                ],
-            },
-        ]
-        if not do_inference:
-            conversation.append(
+
+        graph_str_list = []
+        for graph_repr in item["graph_reprs"]:
+            ent_graph = graph_repr[0]  # [['Bibasal', 'Anatomy', 'NA', 'NA', 'NA'], ['ground-glass opacity', 'Observation-Present', 'NA', 'NA', 'NA']]
+            rel_graph = graph_repr[1]  # [['ground-glass opacity', 'located_at', 'Bibasal']]
+            merge_ent_rel = [f"[{ent[0].lower()}, <{ent[1]}>]" for ent in ent_graph] + [f"[{rel[0].lower()}, <{rel[1]}>, {rel[2].lower()}]" for rel in rel_graph]  # entity text 使用小写
+            graph_str = ", ".join(merge_ent_rel)
+            graph_str_list.append(graph_str)
+
+        # 同一个split sent的grpah之间用", "分隔
+        # 不同的split sent之间的graph用";\n"分隔
+        """ e.g.
+        [Bibasal, Anatomy], [ground-glass opacity, Observation-Present], [ground-glass opacity, located_at, Bibasal];
+        ...
+        [bronchiectasis, Observation-Uncertain];
+        [COVID-19, Observation-Uncertain]
+        """
+        assistant_output_graph_str = ";\n".join(graph_str_list)
+
+        assistaant_output_text = item["section_text"]
+
+        conversations.append(
+            [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
+                        {"type": "text", "text": f"Here's a set of chest X-ray images. Your task is to analyze these images and extract a structured representation consisting of entities and relations.\n\nEach entity should be in the format: [entity_text, entity_type]\nEach relation should be in the format: [object entity_text, relation_type, subject entity_text]\n\nentity_text: the word or phrase associated with the entity.\nentity_type: chosen from the following five types: [Anatomy, Observation-Present, Observation-Absent, Observation-Uncertain, Location-Attribute].\nobject or subject entity_text: chosen from the entity_text of the existing entities.\nrelation_type: chosen from the following four types: [modify, located_at, suggestive_of, part_of].\n\nPlease output your results strictly in the given format. Do not add any additional text or explanation. Do not include any information that is not present in the image. If you cannot find any entities or relations, please output an empty list."},
+                    ],
+                },
                 {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": item["section_text"]}],
-                }
-            )
-        conversations.append(conversation)
+                    "content": [{"type": "text", "text": assistant_output_graph_str}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"According to the given X-ray images and the structured representation you generated, please output a detailed report section for the {target_section}."},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": assistaant_output_text}],
+                },
+            ]
+        )
 
     # See descriptions for assistant_tokens_mask
     # Assistant tokens are the tokens that need to be generated, we use these tokens to compute the loss
@@ -774,14 +820,14 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
 
     tokenizer_kwargs = {"pad_to_multiple_of": 8}
 
-    if do_inference:
-        add_generation_prompt = True
-        return_assistant_tokens_mask = False
-        tokenizer_kwargs["padding_side"] = "left"
-    else:
-        add_generation_prompt = False
-        return_assistant_tokens_mask = True
-        tokenizer_kwargs["padding_side"] = "right"
+    # if do_inference:
+    #     add_generation_prompt = True
+    #     return_assistant_tokens_mask = False
+    #     tokenizer_kwargs["padding_side"] = "left"
+    # else:
+    add_generation_prompt = False
+    return_assistant_tokens_mask = True
+    tokenizer_kwargs["padding_side"] = "right"
 
     input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
 
@@ -792,20 +838,93 @@ def collate_fn(batch_data, img_processor, tokenizer, do_inference=False):
             decoder_assistant_masks = torch.tensor(decoder_assistant_masks)
         decoder_assistant_masks = decoder_assistant_masks.to(DEVICE)
 
-    gold_text_list = None
-    if do_inference:
-        # i["split_sents"] = ['There is no evidence to suggest pleural effusion.']
-        # i["findings"] = 'Lungs are grossly clear. There are no new lung opacities which are of concern. There is no evidence to suggest pleural effusion or pneumothorax. Severe scoliosis is noted. Cardiomediastinal silhouette is unchanged. The nasogastric tube tip is in the stomach and right PICC line is approximately at the mid SVC.'
-        gold_text_list = [i["section_text"] for i in batch_data]
+    # gold_text_list = None
+    # if do_inference:
+    #     # i["split_sents"] = ['There is no evidence to suggest pleural effusion.']
+    #     # i["findings"] = 'Lungs are grossly clear. There are no new lung opacities which are of concern. There is no evidence to suggest pleural effusion or pneumothorax. Severe scoliosis is noted. Cardiomediastinal silhouette is unchanged. The nasogastric tube tip is in the stomach and right PICC line is approximately at the mid SVC.'
+    #     gold_text_list = [i["section_text"] for i in batch_data]
 
     return {
-        "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
+        "pixel_values": pixel_values,  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
         "decoder_input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
         "decoder_attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
         "decoder_assistant_masks": decoder_assistant_masks,
+    }
+
+
+def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_map, assistant_responses, conversations_history):
+    # inference 中，多轮对话需要循环处理
+    # 第一轮 model_response = {"graph": [], "seq": []}
+    # 第二轮 model_response = {"graph": ["graph str", "..."], "seq": []}
+    target_section = CONFIG["target_section"]
+
+    conversations = []
+    num_image_tokens = GLOBAL_VARS.num_image_tokens
+    for idx, item in enumerate(batch_data):
+        num_images = len(image_indices_map[idx])
+        if assistant_responses is None:
+            # 第一轮的用户输入
+            conversation = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
+                        {"type": "text", "text": f"Here's a set of chest X-ray images. Your task is to analyze these images and extract a structured representation consisting of entities and relations.\n\nEach entity should be in the format: [entity_text, entity_type]\nEach relation should be in the format: [object entity_text, relation_type, subject entity_text]\n\nentity_text: the word or phrase associated with the entity.\nentity_type: chosen from the following four types: [Anatomy, Observation-Present, Observation-Absent, Observation-Uncertain, Location-Attribute].\nobject or subject entity_text: chosen from the entity_text of the existing entities.\nrelation_type: chosen from the following three types: [modify, located_at, suggestive_of, part_of].\n\nPlease output your results strictly in the given format. Do not add any additional text or explanation. Do not include any information that is not present in the image. If you cannot find any entities or relations, please output an empty list."},
+                    ],
+                },
+            ]
+        else:
+            # 历史输入 + 第一轮的模型输出 + 第二轮的用户输入
+            conversation = conversations_history[idx]
+            assistant_output_graph_str = assistant_responses[idx]
+            conversation.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": assistant_output_graph_str}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"According to the given X-ray images and the structured representation you generated, please output a detailed report section for the {target_section}."},
+                        ],
+                    },
+                ]
+            )
+
+        conversations.append(conversation)
+
+    # See descriptions for assistant_tokens_mask
+    # Assistant tokens are the tokens that need to be generated, we use these tokens to compute the loss
+    # https://huggingface.co/docs/transformers/internal/tokenization_utils#transformers.PreTrainedTokenizerBase.apply_chat_template.return_assistant_tokens_mask
+    tokenizer_kwargs = {"pad_to_multiple_of": 8}
+
+    add_generation_prompt = True
+    return_assistant_tokens_mask = False
+    tokenizer_kwargs["padding_side"] = "left"
+
+    input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
+
+    # i["split_sents"] = ['There is no evidence to suggest pleural effusion.']
+    # i["findings"] = 'Lungs are grossly clear. There are no new lung opacities which are of concern. There is no evidence to suggest pleural effusion or pneumothorax. Severe scoliosis is noted. Cardiomediastinal silhouette is unchanged. The nasogastric tube tip is in the stomach and right PICC line is approximately at the mid SVC.'
+    gold_graph_list = [i["graph_reprs"] for i in batch_data]
+    gold_text_list = [i["section_text"] for i in batch_data]
+
+    return {
+        "batch_data": batch_data,
+        "pixel_values": pixel_values,  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
+        "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
+        "decoder_input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
+        "decoder_attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
         "data_id_list": [i["data_key"] for i in batch_data],
+        "gold_graph_list": gold_graph_list,
         "gold_text_list": gold_text_list,
+        "conversations_history": conversations,
     }
 
 
@@ -974,6 +1093,10 @@ def train(model, train_dataloader, train_cfg):
             with ACCELERATOR.accumulate(model):
                 # Not necessarily need ACCELERATOR.autocast()
                 # Accelerate enables automatic mixed precision, so autocast() is only needed if there are other mixed precision operations besides those performed on loss by backward() which already handles the scaling.
+
+                # 由于训练和推理时的输入数据不同，所以需要在这里分开处理
+                batch_inputs_dict = get_inputs_for_training(tokenizer=active_dataloader.dataset.tokenizer, **batch_inputs_dict)
+
                 with ACCELERATOR.autocast():
                     model.train()
                     out = model.forward(output_loss=True, **batch_inputs_dict)
@@ -1190,69 +1313,89 @@ def evaluate(model, target_dataloader, output_result=False, **kwargs):
     tokenizer = target_dataloader.dataset.tokenizer
 
     data_ids = []
-    pred_seqs = []
-    gold_seqs = []
+    pred_graphs = []
+    gold_graphs = []
+    pred_text = []
+    gold_text = []
 
     start = time.time()
     model.eval()
     with torch.no_grad():
         for batch_idx, input_tensors_dict in enumerate(target_dataloader):
             # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
-            with ACCELERATOR.autocast():
-                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
-                generation_config = GenerationConfig(
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=tokenizer.pad_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    do_sample=False,
-                    num_beams=3,
-                    return_dict_in_generate=True,
-                    output_logits=True,
-                )
-                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
-                outputs = model.generate(
-                    generation_config=generation_config,
-                    inputs=input_tensors_dict["pixel_values"],
-                    decoder_input_ids=input_tensors_dict["decoder_input_ids"],
-                    decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
-                )
-                check_memory(show_only_if_peak=True)
+            assistant_responses = None
+            conversations_history = None
+            for turn in range(2):
+                # 第一轮生成graph，第二轮生成section
+                input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, batch_data=input_tensors_dict["batch_data"], pixel_values=input_tensors_dict["pixel_values"], image_indices_map=input_tensors_dict["image_indices_map"], assistant_responses=assistant_responses, conversations_history=conversations_history)
 
-            pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
-            pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
-            pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
-            gold_sequences = input_tensors_dict["gold_text_list"]
+                with ACCELERATOR.autocast():
+                    # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
+                    generation_config = GenerationConfig(
+                        max_new_tokens=max_new_tokens,
+                        pad_token_id=tokenizer.pad_token_id,
+                        bos_token_id=tokenizer.bos_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        do_sample=False,
+                        num_beams=3,
+                        return_dict_in_generate=True,
+                        output_logits=True,
+                    )
+                    # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
+                    outputs = model.generate(
+                        generation_config=generation_config,
+                        inputs=input_tensors_dict["pixel_values"],
+                        decoder_input_ids=input_tensors_dict["decoder_input_ids"],
+                        decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
+                    )
+                    check_memory(show_only_if_peak=True)
 
-            # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
+                pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
+                pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
+                pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
+
+                # 用于第二轮生成
+                assistant_responses = pred_sequences
+                conversations_history = input_tensors_dict["conversations_history"]
+
+                # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
+                if turn == 0:
+                    pred_graphs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
+                    gold_graphs.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["gold_graph_list"], use_gather_object=True))
+                elif turn == 1:
+                    pred_text.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
+                    gold_text.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["gold_text_list"], use_gather_object=True))
+
+                if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
+                    LOGGER.info(
+                        "Eval at: p=%s, iter=%d, curr_seq_len=%s, pred_example (%s): %s",
+                        ACCELERATOR.process_index,
+                        batch_idx,
+                        len(pred_text),
+                        "graph" if turn == 0 else "text",
+                        pred_sequences[0],
+                        main_process_only=False,
+                    )
+
             data_ids.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["data_id_list"], use_gather_object=True))
-            pred_seqs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
-            gold_seqs.extend(ACCELERATOR.gather_for_metrics(gold_sequences, use_gather_object=True))
-
-            if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
-                LOGGER.info(
-                    "Eval at: p=%s, iter=%d, curr_seq_len=%s, pred_seq_example=%s",
-                    ACCELERATOR.process_index,
-                    batch_idx,
-                    len(pred_seqs),
-                    pred_sequences[0],
-                    main_process_only=False,
-                )
 
     assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
-    assert len(data_ids) == target_dataloader.total_dataset_length, f"Gathered data size ({len(data_ids)}) should equals to dataset size ({target_dataloader.total_dataset_length})"
+    assert len(data_ids) == len(target_dataloader.dataset), f"Gathered data size ({len(data_ids)}) should equals to dataset size ({len(target_dataloader.dataset)})"
     if output_result:
         with open(f"{CONFIG['output_dir']['result']}/{target_dataloader.dataset.split}_{ACCELERATOR.process_index}.json", "w", encoding="utf-8") as f:
-            f.write(json.dumps({"gold_seqs": gold_seqs, "pred_seqs": pred_seqs}))
+            f.write(json.dumps({"gold_text": gold_text, "pred_text": pred_text, "gold_graphs": gold_graphs, "pred_graphs": pred_graphs, "data_ids": data_ids}))
 
-    # Evaluate the results
-    text_scores_dict = compute_generation_score(gold_text_list=gold_seqs, pred_text_list=pred_seqs)
-    LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict))
+    # Evaluate text results
+    text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
+    LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict, indent=4))
 
-    if STATUS_INFO:
-        for metric_name, metric_val in text_scores_dict.items():
-            k = f"{target_dataloader.dataset.split}_{metric_name}"
-            MLFLOW_TRACKER.log({k: metric_val}, step=STATUS_INFO.global_iters)
+    # Evaluate graph results
+    pred_graph_reprs = []
+    for graph_str in pred_graphs:
+        graph_repr = parse_unquoted_graph_str(graph_str)
+        pred_graph_reprs.append(graph_repr)
+    graph_scores_dict = compute_graph_scores(gold_graphs=gold_graphs, pred_graphs=pred_graph_reprs)
+    LOGGER.info("[GraphMatch]: %s", json.dumps(graph_scores_dict, indent=4))
 
     end = time.time()
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
@@ -1273,6 +1416,175 @@ def compute_generation_score(gold_text_list, pred_text_list):
     # https://github.com/jbdel/vilmedic/blob/main/vilmedic/blocks/scorers/scores.py
     out_dict = compute_scores(use_metrics, refs=refs, hyps=hyps, split=None, seed=None, config=None, epoch=None, logger=LOGGER, dump=False)
     out_dict = {k: float(v) for k, v in out_dict.items()}
+    return out_dict
+
+
+def parse_unquoted_graph_str(assistant_output_graph_str, strict=False):
+    """
+    预期：assistant_output_graph_str='[monitoring, <Observation-Present>], [support, <Observation-Present>], [support, <modify>, devices];\n ...'
+    对于 ent 和 rel 的 type，使用 get_close_matches() 来进行模糊匹配
+    目前ent默认为长度为2的列表，rel默认为长度为3的列表
+    """
+
+    graph_repr = []
+
+    valid_ent_types = GLOBAL_VARS.valid_ent_types
+    valid_rel_types = GLOBAL_VARS.valid_rel_types
+
+    def get_closest_type(t, valid_set):
+        matches = get_close_matches(t, valid_set, n=1, cutoff=0.5)
+        return matches[0] if matches else None
+
+    graph_sections = re.split(r"[;\n]+", assistant_output_graph_str.strip())
+
+    for graph_str in graph_sections:
+        if not graph_str.strip():
+            continue
+
+        ent_graph = []
+        rel_graph = []
+
+        items = re.findall(r"\[(.*?)\]", graph_str)
+        for item in items:
+            parts = [s.strip() for s in item.split(",")]
+            if len(parts) == 2:
+                typ = parts[1]
+                if typ not in valid_ent_types:
+                    if strict:
+                        print(f"Entity type '{typ}' not valid, skipped.")
+                        continue
+                    corrected = get_closest_type(typ, valid_ent_types)
+                    if corrected:
+                        print(f"Entity type '{typ}' corrected to '{corrected}'")
+                        typ = corrected
+                    else:
+                        print(f"Entity type '{typ}' not recognized, skipped.")
+                        continue
+                ent_graph.append([parts[0], typ, "NA", "NA", "NA"])
+
+            elif len(parts) == 3:
+                rel = parts[1]
+                if rel not in valid_rel_types:
+                    if strict:
+                        print(f"Relation type '{rel}' not valid, skipped.")
+                        continue
+                    corrected = get_closest_type(rel, valid_rel_types)
+                    if corrected:
+                        print(f"Relation type '{rel}' corrected to '{corrected}'")
+                        rel = corrected
+                    else:
+                        print(f"Relation type '{rel}' not recognized, skipped.")
+                        continue
+                rel_graph.append([parts[0], rel, parts[2]])
+
+            else:
+                print(f"Skipping badly formatted item: [{item}]")
+                continue
+
+        graph_repr.append([ent_graph, rel_graph])
+
+    return graph_repr
+
+
+def compute_ent_scores(gold_ents_list, pred_ents_list):
+    assert len(gold_ents_list) == len(pred_ents_list), "Mismatched number of samples"
+
+    def to_set(ents, mode):
+        if mode == "text":
+            return set(e[0].lower() for e in ents)
+        elif mode == "text_and_type":
+            return set((e[0].lower(), e[1].lower()) for e in ents)
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+    scores = {}
+
+    for mode in ["text", "text_and_type"]:
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+
+        for gold_ents, pred_ents in zip(gold_ents_list, pred_ents_list):
+            gold_set = to_set(gold_ents, mode)
+            pred_set = to_set(pred_ents, mode)
+
+            tp = len(gold_set & pred_set)
+            fp = len(pred_set - gold_set)
+            fn = len(gold_set - pred_set)
+
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+
+        precision = total_tp / (total_tp + total_fp) if total_tp + total_fp > 0 else 0.0
+        recall = total_tp / (total_tp + total_fn) if total_tp + total_fn > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+
+        scores[mode] = {"precision": round(precision, 4), "recall": round(recall, 4), "f1": round(f1, 4)}
+
+    return scores
+
+
+def compute_rel_scores(gold_rels_list, pred_rels_list):
+    assert len(gold_rels_list) == len(pred_rels_list), "Mismatched number of samples"
+
+    def to_set(rels, mode):
+        if mode == "text":
+            return set((r[0].lower(), r[2].lower()) for r in rels)
+        elif mode == "text_and_type":
+            return set((r[0].lower(), r[1].lower(), r[2].lower()) for r in rels)
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+    scores = {}
+
+    for mode in ["text", "text_and_type"]:
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+
+        for gold_rels, pred_rels in zip(gold_rels_list, pred_rels_list):
+            gold_set = to_set(gold_rels, mode)
+            pred_set = to_set(pred_rels, mode)
+
+            tp = len(gold_set & pred_set)
+            fp = len(pred_set - gold_set)
+            fn = len(gold_set - pred_set)
+
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+
+        precision = total_tp / (total_tp + total_fp) if total_tp + total_fp > 0 else 0.0
+        recall = total_tp / (total_tp + total_fn) if total_tp + total_fn > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+
+        scores[mode] = {"precision": round(precision, 4), "recall": round(recall, 4), "f1": round(f1, 4)}
+
+    return scores
+
+
+def compute_graph_scores(gold_graphs, pred_graphs):
+    # 嵌套列表，每个子列表包含一个文档的所有ent或rel
+    gold_ents_list, pred_ents_list = [], []
+    gold_rels_list, pred_rels_list = [], []
+
+    for gold_graphs_docwise, pred_graphs_docwise in zip(gold_graphs, pred_graphs):
+        # 原本每个文档的ent和rel是按句子分组的，现在需要将其合并，即每个文档的ent合并为一个列表，rel也合并为一个列表
+        gold_ents = [ent for graph in gold_graphs_docwise for ent in graph[0]]
+        gold_rels = [rel for graph in gold_graphs_docwise for rel in graph[1]]
+        pred_ents = [ent for graph in pred_graphs_docwise for ent in graph[0]]
+        pred_rels = [rel for graph in pred_graphs_docwise for rel in graph[1]]
+
+        gold_ents_list.append(gold_ents)
+        gold_rels_list.append(gold_rels)
+        pred_ents_list.append(pred_ents)
+        pred_rels_list.append(pred_rels)
+
+    # 计算ent和rel的f1分数
+    ent_scores = compute_ent_scores(gold_ents_list, pred_ents_list)
+    rel_scores = compute_rel_scores(gold_rels_list, pred_rels_list)
+    out_dict = {"ent_scores": ent_scores, "rel_scores": rel_scores}
     return out_dict
 
 
@@ -1527,8 +1839,6 @@ def load_image_datasets(data_paths):
     LOGGER.info("%s loaded from interpret-test-public", [f"{split}:{len(ds)}" for split, ds in dataset_mimic.items()])
 
     ds_img = DatasetDict({"train": dataset_train_dev["train"], "validation": dataset_train_dev["validation"], "test": dataset_test["test"]})
-    for split in ds_img:
-        ds_img[split] = ds_img[split].add_column("img_id", range(len(ds_img[split])))
     LOGGER.info("Loaded image-report dataset: \n%s", ds_img)
     return ds_img
 
@@ -1546,7 +1856,7 @@ def preprocess_dataset():
 
     ds_dict = {}
     for split in ["train", "validation", "test"]:
-        ds_dict[split] = process_image(img_processor=img_processor, img_dataset=img_dataset[split], data_split=split, shortest_edge=shortest_edge)
+        ds_dict[split] = process_image(img_processor=img_processor, img_dataset=img_dataset[split].select(range(200)), data_split=split, shortest_edge=shortest_edge)
 
     pre_processed_dataset_dict = DatasetDict(ds_dict)
     pre_processed_dataset_dict.save_to_disk(CONFIG["preprocess"]["cache_path"])
@@ -1623,7 +1933,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
                 vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 2, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
             else:
                 vaild_dataset = ImageTextDataset(ds_valid, img_processor=img_processor, tokenizer=tokenizer, split="validation")
-        valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_bsz, drop_last=False)
+        valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_bsz, drop_last=False)
 
     if ds_test:
         with ACCELERATOR.main_process_first():
@@ -1631,14 +1941,51 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
                 test_dataset = ImageTextDataset(ds_test.select(range(len(ds_test) - 5, len(ds_test))), img_processor=img_processor, tokenizer=tokenizer, split="test")
             else:
                 test_dataset = ImageTextDataset(ds_test, img_processor=img_processor, tokenizer=tokenizer, split="test")
-        test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, do_inference=True), batch_size=eval_bsz, drop_last=False)
+        test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_bsz, drop_last=False)
 
     return train_dataloader, valid_dataloader, test_dataloader
 
 
-def load_preprocessed_dataset(ds_path):
-    ds_final = load_from_disk(ds_path)
-    LOGGER.info("Loaded pre_processed dataset dict: \n%s", ds_final)
+def merge_dataset(img_dataset, graph_dataset):
+    imgId_2_graphRowIdx = {}
+    for graph_row_idx, doc_key in enumerate(graph_dataset["doc_key"]):
+        _, img_id, _ = doc_key.split("#")  # doc_key = test#2250#findings
+        imgId_2_graphRowIdx[int(img_id)] = int(graph_row_idx)
+
+    # 如果传入的是 select 后的 img_ds 数据集，那么 img_id 与 img_row_idx 不一定是一一对应的
+    # data_key: test#89
+    imgId_2_imgRowIdx = {}
+    for img_row_idx, img_data_key in enumerate(img_dataset["data_key"]):
+        _, img_id = img_data_key.split("#")  # data_key = test#89
+        imgId_2_imgRowIdx[int(img_id)] = int(img_row_idx)
+
+    # 以数量较少的数据集为基准
+    img_ids_in_img_ds = set(imgId_2_imgRowIdx.keys())
+    img_ids_in_graph_ds = set(imgId_2_graphRowIdx.keys())
+    intersection_ids = img_ids_in_img_ds.intersection(img_ids_in_graph_ds)
+
+    # 按照 img_id 的顺序，将 img_ds 的数据拼接到 graph_ds 的数据中
+    filtered_img_ds = img_dataset.select([imgId_2_imgRowIdx[img_id] for img_id in intersection_ids])
+    filtered_graph_ds = graph_dataset.select([imgId_2_graphRowIdx[img_id] for img_id in intersection_ids])
+    merged_ds = concatenate_datasets([filtered_img_ds, filtered_graph_ds], axis=1)
+    return merged_ds
+
+
+def load_dataset(ds_img_path, ds_graph_path, target_section):
+    # ds_img 是 image + report 数据集，report 包含 findings和impression
+    # ds_graph 是纯文本数据集，是对应特定 target_section，即findings 或impression
+    ds_img = load_from_disk(ds_img_path)
+    LOGGER.info("Loaded pre_processed image dataset from: \n%s \n%s", ds_img_path, ds_img)
+    ds_graph_path = os.path.join(ds_graph_path, f"interpret_graph_{target_section}")
+    ds_graph = load_from_disk(ds_graph_path)
+    LOGGER.info("Loaded pre_processed graph dataset from: \n%s \n%s", ds_graph_path, ds_graph)
+
+    ds_dict = {}
+    for split in ["train", "validation", "test"]:
+        ds_dict[split] = merge_dataset(img_dataset=ds_img[split], graph_dataset=ds_graph[split])
+
+    ds_final = DatasetDict(ds_dict)
+    LOGGER.debug("Merged image-graph dataset: \n%s", ds_final)
     return ds_final
 
 
@@ -1647,10 +1994,13 @@ def post_init_model_and_tokenizer(model, tokenizer):
         LOGGER.info("Decoder token_embedding [%d] and tokenizer [%d] size mismatch", model.config.decoder.vocab_size, len(tokenizer))
         model.decoder.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8, mean_resizing=True)
         LOGGER.info("Decoder token_embedding resized to [%d] (pad_to_multiple_of=8)", model.config.decoder.vocab_size)
-    else:
-        # 检查 tokenizer 的特殊 token 是否存在，用于判断 eval 是否加载了正确的 tokenizer
-        for spec_tok in GLOBAL_VARS.additional_special_tokens:
-            assert spec_tok in tokenizer.special_tokens_map["additional_special_tokens"], f"Missing special token: {spec_tok} in tokenizer, expect: {GLOBAL_VARS.additional_special_tokens}, got: {tokenizer.special_tokens_map['additional_special_tokens']} in tokenizer."
+
+    # 检查 tokenizer 的特殊 token 是否存在，用于判断 eval 是否加载了正确的 tokenizer
+    for spec_tok in GLOBAL_VARS.additional_special_tokens:
+        assert spec_tok in tokenizer.special_tokens_map["additional_special_tokens"], f"Missing special token: {spec_tok} in tokenizer, expect: {GLOBAL_VARS.additional_special_tokens}, got: {tokenizer.special_tokens_map['additional_special_tokens']} in tokenizer."
+    # 检查 tokenizer 是否存在新增的实体和关系 token
+    for ent_tok in GLOBAL_VARS.ent_type_tokens + GLOBAL_VARS.rel_type_tokens:
+        assert ent_tok in tokenizer.get_vocab(), f"Missing entity token: {ent_tok} in tokenizer, expect: {GLOBAL_VARS.ent_type_tokens + GLOBAL_VARS.rel_type_tokens} in tokenizer."
 
     # 用于在 input_ids 中查找需要替换的图像占位符 <|image_token|>
     if not hasattr(model.config, "image_token_index"):
@@ -1688,6 +2038,11 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
     tokenizer = AutoTokenizer.from_pretrained(language_model_path, use_fast=True)
     LOGGER.info("Loaded Tokenizer from: %s", language_model_path)
 
+    LOGGER.info("Adding new tokens for ent/rel types")
+    new_tokens = GLOBAL_VARS.ent_type_tokens + GLOBAL_VARS.rel_type_tokens
+    tokenizer.add_tokens(new_tokens)
+    LOGGER.info("New tokens: %s", [(tok, tokenizer.convert_tokens_to_ids(tok)) for tok in new_tokens])
+
     # Add special tokens
     LOGGER.info("Adding special tokens")
     bos_token = tokenizer.bos_token if tokenizer.bos_token else "<BOS>"
@@ -1697,7 +2052,7 @@ def init_processor(vision_model_path, language_model_path, model_base_cfg):
         "bos_token": bos_token,
         "eos_token": eos_token,
         "pad_token": pad_token,
-        "additional_special_tokens": ["<|image_token|>", "<|image_start|>", "<|image_end|>"],
+        "additional_special_tokens": GLOBAL_VARS.additional_special_tokens,
     }
     tokenizer.add_special_tokens(special_tokens_dict)
     # print special tokens and their ids
@@ -1923,7 +2278,7 @@ def pretrain_model(model_base_cfg, train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
 
     img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
     model = init_model(vision_model_path, language_model_path, model_base_cfg)
@@ -1947,7 +2302,7 @@ def eval_pretrained_model(train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
 
     model = load_model(pretain_model_path)
     img_processor, tokenizer = load_processor(pretain_model_path)
@@ -1979,7 +2334,7 @@ def finetune_model(train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
 
     if train_cfg["use_pretrained"]:
         model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
@@ -1995,10 +2350,12 @@ def finetune_model(train_cfg):
     model.to(DEVICE)
 
     train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    # _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
     start = time.time()
     train(model, train_dataloader, train_cfg=train_cfg)
+    # evaluate(model, test_dataloader, output_result=True, **train_cfg)
     end = time.time()
     LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
@@ -2015,14 +2372,16 @@ def eval_finetuned_model(train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_preprocessed_dataset(CONFIG["preprocess"]["cache_path"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
 
     if train_cfg["use_pretrained"]:
         model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
         img_processor, tokenizer = load_processor(pretain_model_path)
     else:
         model = init_model(vision_model_path, language_model_path, model_base_cfg)
-        img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+        # 理论上，加载processor和init_processor的效果是一样的，tokenizer
+        # img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
+        img_processor, tokenizer = load_processor(peft_model_path)
 
     post_init_model_and_tokenizer(model, tokenizer)
     model = load_peft_model(base_model=model, peft_model_path=peft_model_path)
