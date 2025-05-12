@@ -273,8 +273,8 @@ def get_label_inheritance(cxrgraph_ents):
         return "Observation-Uncertain"
     elif "Observation-Present" in candi_labels:
         return "Observation-Present"
-    elif "Aanatomy" in candi_labels:
-        return "Aanatomy"
+    elif "Anatomy" in candi_labels:
+        return "Anatomy"
     else:
         return "Location-Attribute"
 
