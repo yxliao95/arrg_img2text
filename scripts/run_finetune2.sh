@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=5_finetune_full_text_111_10-4
+#SBATCH --job-name=5_1_finetune_full_graph_text_118_10-4
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -16,8 +16,8 @@
 #SBATCH --ntasks=2
 #SBATCH --cpus-per-task=8
 
-mlflow_port=6006
-main_process_port=29557
+mlflow_port=6016
+main_process_port=29555
 
 cuda=CUDA/12.4
 conda=anaconda/2024.06
@@ -44,9 +44,9 @@ export NCCL_TIMEOUT=1800  # 默认是 1800 秒（30 分钟），你可以设置�
 #     --multi_gpu \
 #     --num_processes 2 \
 #     --main_process_port $main_process_port \
-#     /scratch/c.c21051562/workspace/arrg_img2text/5_fsdp_peft_full_text.py \
+#     /scratch/c.c21051562/workspace/arrg_img2text/5_1_fsdp_peft_full_graph_text.py \
 #     --from_bash \
-#     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_fsdp_peft_full_text.yaml \
+#     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_1_fsdp_peft_full_graph_text.yaml \
 #     --output_name $SLURM_JOB_NAME \
 #     --jobid $SLURM_JOB_ID \
 #     --mlflow_port $mlflow_port \
@@ -58,9 +58,9 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/5_fsdp_peft_full_text.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/5_1_fsdp_peft_full_graph_text.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_fsdp_peft_full_text.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_1_fsdp_peft_full_graph_text.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
@@ -81,7 +81,7 @@ fi
 
 python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Done: $SLURM_JOB_NAME"
 
-# sbatch /scratch/c.c21051562/workspace/arrg_img2text/scripts/run_finetune.sh
+# sbatch /scratch/c.c21051562/workspace/arrg_img2text/scripts/run_finetune2.sh
 # scontrol show job JOBID
 # scontrol show job JOBID | grep NodeList
 # scancel JOBID

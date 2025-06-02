@@ -76,10 +76,10 @@ finetune:
   seed: 42
   num_epochs: 1
   batch_size: 1
-  grad_accum_steps: 16
+  grad_accum_steps: 1
   warmup_proportion: 0.1
 
-  lr: 0.00001
+  lr: 0.0001
   clip_grad_norm: 1.0
   mixed_precision: "bf16" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
@@ -87,6 +87,7 @@ finetune:
   # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
   ckp_per_steps: 10000 # 550395 / 8 = 68800, 170801 / 8 = 21350
 
-  eval_batch_size: 32
+  eval_batch_size: 1
   max_new_tokens: 512
   print_pred_per_n_steps: 500
+  eval_valid_split: False

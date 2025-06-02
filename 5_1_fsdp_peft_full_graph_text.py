@@ -1299,29 +1299,27 @@ def check_results_and_save_model(model, eval_result_dict):
 #############################################
 # Evaluation
 #############################################
-def evaluate(model, target_dataloader, output_result=False, **kwargs):
+def evaluate(model, target_dataloader, **kwargs):
     GLOBAL_VARS.peak_mem = 0
 
     eval_bsz = kwargs["eval_batch_size"]
     max_new_tokens = kwargs["max_new_tokens"]
     print_pred_per_n_steps = kwargs["print_pred_per_n_steps"]
 
+    # 由于评估时间过长，pred结果将被存放到文件中，已经pred过的数据已经提前从dataset中移除
     LOGGER.info("****************************** Evaluation ******************************")
     LOGGER.info("Source = %s", target_dataloader.dataset.src_path)
     LOGGER.info("Batch size = %d", eval_bsz)
     LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
     tokenizer = target_dataloader.dataset.tokenizer
 
-    data_ids = []
-    pred_graphs = []
-    gold_graphs = []
-    pred_text = []
-    gold_text = []
-
+    LOGGER.info("****************************** Model Predicting ******************************")
     start = time.time()
     model.eval()
     with torch.no_grad():
         for batch_idx, input_tensors_dict in enumerate(target_dataloader):
+            data_ids, pred_graphs, gold_graphs, pred_text, gold_text = [], [], [], [], []
+
             # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
             assistant_responses = None
             conversations_history = None
@@ -1360,30 +1358,42 @@ def evaluate(model, target_dataloader, output_result=False, **kwargs):
 
                 # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
                 if turn == 0:
-                    pred_graphs.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
-                    gold_graphs.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["gold_graph_list"], use_gather_object=True))
+                    pred_graphs = pred_sequences
+                    gold_graphs = input_tensors_dict["gold_graph_list"]
                 elif turn == 1:
-                    pred_text.extend(ACCELERATOR.gather_for_metrics(pred_sequences, use_gather_object=True))
-                    gold_text.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["gold_text_list"], use_gather_object=True))
+                    pred_text = pred_sequences
+                    gold_text = input_tensors_dict["gold_text_list"]
 
                 if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
                     LOGGER.info(
-                        "Eval at: p=%s, iter=%d, curr_seq_len=%s, pred_example (%s): %s",
+                        "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example (%s): %s",
                         ACCELERATOR.process_index,
                         batch_idx,
-                        len(pred_text),
+                        batch_idx * eval_bsz,
                         "graph" if turn == 0 else "text",
                         pred_sequences[0],
                         main_process_only=False,
                     )
 
-            data_ids.extend(ACCELERATOR.gather_for_metrics(input_tensors_dict["data_id_list"], use_gather_object=True))
+            data_ids = input_tensors_dict["data_id_list"]
 
-    assert len(data_ids) == len(set(data_ids)), f"Duplicated data exists, please check {data_ids}"
-    assert len(data_ids) == len(target_dataloader.dataset), f"Gathered data size ({len(data_ids)}) should equals to dataset size ({len(target_dataloader.dataset)})"
-    if output_result:
-        with open(f"{CONFIG['output_dir']['result']}/{target_dataloader.dataset.split}_{ACCELERATOR.process_index}.json", "w", encoding="utf-8") as f:
-            f.write(json.dumps({"gold_text": gold_text, "pred_text": pred_text, "gold_graphs": gold_graphs, "pred_graphs": pred_graphs, "data_ids": data_ids}))
+            save_pred_results_per_batch(
+                data_ids=data_ids,
+                pred_text=pred_text,
+                pred_graphs=pred_graphs,
+                gold_text=gold_text,
+                gold_graphs=gold_graphs,
+                data_split=target_dataloader.dataset.split,
+                output_dir=CONFIG["output_dir"]["result"],
+            )
+
+    LOGGER.info("****************************** Computing Scores ******************************")
+    pred_result_dict = load_pred_results(intput_dir=CONFIG["output_dir"]["result"], split=target_dataloader.dataset.split)
+    data_ids = [item["data_id"] for item in pred_result_dict.values()]
+    pred_text = [item["pred_text"] for item in pred_result_dict.values()]
+    pred_graphs = [item["pred_graph"] for item in pred_result_dict.values()]
+    gold_text = [item["gold_text"] for item in pred_result_dict.values()]
+    gold_graphs = [item["gold_graph"] for item in pred_result_dict.values()]
 
     # Evaluate text results
     text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
@@ -1401,6 +1411,46 @@ def evaluate(model, target_dataloader, output_result=False, **kwargs):
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
     check_memory()
     return text_scores_dict
+
+
+def save_pred_results_per_batch(data_ids, pred_text, pred_graphs, gold_text, gold_graphs, data_split, output_dir):
+    """Save at each batch, so that we can use the results for further analysis or debugging."""
+
+    output_file = os.path.join(output_dir, f"{data_split}_{ACCELERATOR.process_index}.json")
+
+    with open(output_file, "a", encoding="utf-8") as f:
+        for data_id, p_text, p_graph, g_text, g_graph in zip(data_ids, pred_text, pred_graphs, gold_text, gold_graphs):
+            out_line = {"data_id": data_id, "pred_text": p_text, "pred_graph": p_graph, "gold_text": g_text, "gold_graph": g_graph}
+            f.write(json.dumps(out_line))
+            f.write("\n")
+
+
+def load_pred_results(intput_dir, split):
+    data_dict = {}  # key=data_id, value={"data_id": , "pred_text": , "pred_graph": , "gold_text": , "gold_graph": }
+
+    # 遍历目录中的所有文件
+    for filename in os.listdir(intput_dir):
+        if filename.startswith(f"{split}_") and filename.endswith(".json"):
+            file_path = os.path.join(intput_dir, filename)
+            LOGGER.info("Loading pred_results from file: \n%s", file_path)
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                # Load each line as a JSON object, and remove duplicate entries
+                for line in f:
+                    if line.strip():
+                        data_item = json.loads(line.strip())
+                        data_id = data_item.get("data_id")
+                        if data_id not in data_dict:
+                            # Only add if the data_id is not already in the dictionary
+                            data_dict[data_id] = data_item
+                        else:
+                            # If the data_id already exists
+                            # Update the existing entry with the new one
+                            LOGGER.info("Duplicate data_id found: %s, \n(Use) %s \n(Drop) %s", data_id, data_item, data_dict[data_id])
+                            data_dict[data_id].update(data_item)
+            LOGGER.info("Loaded pred_results from file: \n%s", file_path)
+
+    return data_dict
 
 
 def compute_generation_score(gold_text_list, pred_text_list):
@@ -1428,8 +1478,8 @@ def parse_unquoted_graph_str(assistant_output_graph_str, strict=False):
 
     graph_repr = []
 
-    valid_ent_types = GLOBAL_VARS.valid_ent_types
-    valid_rel_types = GLOBAL_VARS.valid_rel_types
+    valid_ent_types = GLOBAL_VARS.ent_type_tokens
+    valid_rel_types = GLOBAL_VARS.rel_type_tokens
 
     def get_closest_type(t, valid_set):
         matches = get_close_matches(t, valid_set, n=1, cutoff=0.5)
@@ -1915,6 +1965,18 @@ def load_processor(processor_path):
     return img_processor, tokenizer
 
 
+def filter_dataset_by_data_id(ds, split):
+    # 单次48小时可能不足以完成评估，因此我们将每个batch的预测结果保存到文件中，最后再计算分数
+    # 这里获取已经存在的预测结果文件，避免重复计算
+    pred_result_dict = load_pred_results(intput_dir=CONFIG["output_dir"]["result"], split=split)
+    LOGGER.info("Loaded pred_results of split [%s], total: %d", CONFIG["output_dir"]["result"], len(pred_result_dict))
+    LOGGER.info("Dataset [%s] size before filtering: %d", split, len(ds))
+    data_ids_to_skip = pred_result_dict.keys()
+    ds = ds.filter(lambda x: x["data_key"] not in data_ids_to_skip)
+    LOGGER.info("Dataset [%s] size after filtering: %d", split, len(ds))
+    return ds
+
+
 def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_test=None, train_bsz=1, eval_bsz=1, use_debug_subset=False):
 
     train_dataloader, valid_dataloader, test_dataloader = None, None, None
@@ -1932,6 +1994,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
             if use_debug_subset:
                 vaild_dataset = ImageTextDataset(ds_valid.select(range(len(ds_valid) - 2, len(ds_valid))), img_processor=img_processor, tokenizer=tokenizer, split="validation")
             else:
+                ds_valid = filter_dataset_by_data_id(ds_valid, split="validation")
                 vaild_dataset = ImageTextDataset(ds_valid, img_processor=img_processor, tokenizer=tokenizer, split="validation")
         valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_bsz, drop_last=False)
 
@@ -1940,6 +2003,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
             if use_debug_subset:
                 test_dataset = ImageTextDataset(ds_test.select(range(len(ds_test) - 5, len(ds_test))), img_processor=img_processor, tokenizer=tokenizer, split="test")
             else:
+                ds_test = filter_dataset_by_data_id(ds_test, split="test")
                 test_dataset = ImageTextDataset(ds_test, img_processor=img_processor, tokenizer=tokenizer, split="test")
         test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_bsz, drop_last=False)
 
@@ -2308,18 +2372,18 @@ def eval_pretrained_model(train_cfg):
     img_processor, tokenizer = load_processor(pretain_model_path)
     post_init_model_and_tokenizer(model, tokenizer)
     global_init_accelerator(model, **train_cfg)
-    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
     model.to(DEVICE)
     model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
     check_memory()
 
     start = time.time()
-    evaluate(model, validation_dataloader, output_result=True, **train_cfg)
+    evaluate(model, validation_dataloader, **train_cfg)
     start2 = time.time()
     LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
 
-    evaluate(model, test_dataloader, output_result=True, **train_cfg)
+    evaluate(model, test_dataloader, **train_cfg)
     end = time.time()
     LOGGER.info("Test time: %s", seconds_to_time_str(end - start2))
     LOGGER.info("Total evaluation time: %s", seconds_to_time_str(end - start))
@@ -2355,7 +2419,7 @@ def finetune_model(train_cfg):
 
     start = time.time()
     train(model, train_dataloader, train_cfg=train_cfg)
-    # evaluate(model, test_dataloader, output_result=True, **train_cfg)
+    # evaluate(model, test_dataloader, **train_cfg)
     end = time.time()
     LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
@@ -2388,18 +2452,20 @@ def eval_finetuned_model(train_cfg):
     global_init_accelerator(model, fsdp_no_shard=True, **train_cfg)
     model.to(DEVICE)
 
-    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
     model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
     check_memory()
 
     start = time.time()
-    evaluate(model, validation_dataloader, output_result=True, **train_cfg)
-    start2 = time.time()
-    LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
+    start2 = start
+    if train_cfg["eval_valid_split"]:
+        evaluate(model, validation_dataloader, **train_cfg)
+        start2 = time.time()
+        LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
 
-    evaluate(model, test_dataloader, output_result=True, **train_cfg)
+    evaluate(model, test_dataloader, **train_cfg)
     end = time.time()
     LOGGER.info("Test time: %s", seconds_to_time_str(end - start2))
     LOGGER.info("Total evaluation time: %s", seconds_to_time_str(end - start))
