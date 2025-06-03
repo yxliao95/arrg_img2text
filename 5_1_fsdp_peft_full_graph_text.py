@@ -828,6 +828,8 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
     add_generation_prompt = False
     return_assistant_tokens_mask = True
     tokenizer_kwargs["padding_side"] = "right"
+    
+    import ipdb; ipdb.set_trace()
 
     input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
 

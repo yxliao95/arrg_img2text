@@ -1,0 +1,20 @@
+srun --pty --account=scw2258 --gres=gpu:2 --partition=accel_ai_mig /bin/bash
+
+module load CUDA/12.4
+module load anaconda/2024.06
+source activate
+conda activate arrg_img2text
+nohup mlflow server --host localhost --port 6688 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
+
+python /scratch/c.c21051562/workspace/arrg_img2text/5_1_fsdp_peft_full_graph_text.py --from_bash \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_1_fsdp_peft_full_graph_text.yaml \
+    --output_name test \
+    --jobid 000000 \
+    --mlflow_port 6688 \
+    --run_mode finetune
+    
+
+
+ps aux | grep mlflow
+kill xxx
+exit
