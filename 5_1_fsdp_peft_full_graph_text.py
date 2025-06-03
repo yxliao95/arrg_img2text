@@ -65,9 +65,11 @@ from transformers import (
     AutoTokenizer,
     Dinov2Config,
     Dinov2Model,
+    EosTokenCriteria,
     LlamaConfig,
     PretrainedConfig,
     PreTrainedModel,
+    StoppingCriteriaList,
     VisionEncoderDecoderModel,
     get_cosine_schedule_with_warmup,
 )
@@ -97,6 +99,8 @@ class GlobalVariables:
     additional_special_tokens = ["<|image_token|>", "<|image_start|>", "<|image_end|>"]
     ent_type_tokens = ["<Anatomy>", "<Observation-Present>", "<Observation-Absent>", "<Observation-Uncertain>", "<Location-Attribute>"]
     rel_type_tokens = ["<modify>", "<located_at>", "<suggestive_of>", "<part_of>"]
+    eot_token = "<|eot_id|>"
+    eot_token_id = None
 
 
 GLOBAL_VARS = GlobalVariables()
@@ -828,8 +832,6 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
     add_generation_prompt = False
     return_assistant_tokens_mask = True
     tokenizer_kwargs["padding_side"] = "right"
-    
-    import ipdb; ipdb.set_trace()
 
     input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
 
@@ -1335,15 +1337,17 @@ def evaluate(model, target_dataloader, **kwargs):
                         max_new_tokens=max_new_tokens,
                         pad_token_id=tokenizer.pad_token_id,
                         bos_token_id=tokenizer.bos_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
+                        eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id],
                         do_sample=False,
                         num_beams=3,
                         return_dict_in_generate=True,
                         output_logits=True,
                     )
+                    # stopping_criteria = StoppingCriteriaList([EosTokenCriteria(eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id])])
                     # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
                     outputs = model.generate(
                         generation_config=generation_config,
+                        stopping_criteria=stopping_criteria,
                         inputs=input_tensors_dict["pixel_values"],
                         decoder_input_ids=input_tensors_dict["decoder_input_ids"],
                         decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
@@ -2067,6 +2071,10 @@ def post_init_model_and_tokenizer(model, tokenizer):
     # 检查 tokenizer 是否存在新增的实体和关系 token
     for ent_tok in GLOBAL_VARS.ent_type_tokens + GLOBAL_VARS.rel_type_tokens:
         assert ent_tok in tokenizer.get_vocab(), f"Missing entity token: {ent_tok} in tokenizer, expect: {GLOBAL_VARS.ent_type_tokens + GLOBAL_VARS.rel_type_tokens} in tokenizer."
+
+    eot_token_id = tokenizer.encode(GLOBAL_VARS.eot_token, add_special_tokens=False)
+    assert len(eot_token_id) == 1, f"Expected single token for eot_token: {GLOBAL_VARS.eot_token}, got: {eot_token_id}"
+    GLOBAL_VARS.eot_token_id = eot_token_id[0]
 
     # 用于在 input_ids 中查找需要替换的图像占位符 <|image_token|>
     if not hasattr(model.config, "image_token_index"):
