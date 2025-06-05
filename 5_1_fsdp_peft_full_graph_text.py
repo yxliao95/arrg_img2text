@@ -1347,7 +1347,6 @@ def evaluate(model, target_dataloader, **kwargs):
                     # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
                     outputs = model.generate(
                         generation_config=generation_config,
-                        stopping_criteria=stopping_criteria,
                         inputs=input_tensors_dict["pixel_values"],
                         decoder_input_ids=input_tensors_dict["decoder_input_ids"],
                         decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
@@ -1549,7 +1548,8 @@ def compute_ent_scores(gold_ents_list, pred_ents_list):
         if mode == "text":
             return set(e[0].lower() for e in ents)
         elif mode == "text_and_type":
-            return set((e[0].lower(), e[1].lower()) for e in ents)
+            # pred 中的type是包括尖括号的, e.g. <Anatomy>
+            return set((e[0].lower(), e[1].replace("<", "").replace(">", "").lower()) for e in ents)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
@@ -1588,7 +1588,7 @@ def compute_rel_scores(gold_rels_list, pred_rels_list):
         if mode == "text":
             return set((r[0].lower(), r[2].lower()) for r in rels)
         elif mode == "text_and_type":
-            return set((r[0].lower(), r[1].lower(), r[2].lower()) for r in rels)
+            return set((r[0].lower(), r[1].replace("<", "").replace(">", "").lower(), r[2].lower()) for r in rels)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
