@@ -11,7 +11,7 @@ data_path:
   interpret: /home/yuxiang/liao/resources/datasets/interpret-cxr
   interpret-test-public: /home/yuxiang/liao/resources/datasets/interpret-cxr-test-public
   custom_text: /home/yuxiang/liao/workspace/arrg_preprocessing/outputs/interpret_text_exp/interpret_text_findings_effusion
-  text_graph: /home/yuxiang/liao/workspace/arrg_preprocessing/outputs/interpret_graph/all
+  text_graph: /home/yuxiang/liao/workspace/arrg_preprocessing/outputs/interpret_graph/4_labels
 
 target_section: findings
 
@@ -31,7 +31,7 @@ model_name_or_path:
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 use_debug_subset: True
-run_mode: "eval_finetuned" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+run_mode: "finetune" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 preprocess:
   image_processor: rad_dino_maira2
