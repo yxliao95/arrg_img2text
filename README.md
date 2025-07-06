@@ -43,6 +43,8 @@ Download LLM:
     - Get the access token from: https://huggingface.co/settings/tokens
 - `huggingface-cli download meta-llama/Llama-3.2-1B --local-dir /your/specific/path/Llama-3.2-1B`
 
+## Launch MLflow
+nohup mlflow server --host localhost --port 6026 --backend-store-uri file:/home/yuxiang/liao/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
 
 ## Error
 
@@ -104,3 +106,4 @@ checkpoint = hf_hub_download(repo_id="StanfordAIMI/RRG_scorers", cache_dir=CACHE
 ## Test vilmedic-scorers
 
 Run this script: `path_to_this_repo/arrg_img2text/scorers/scores.py`. Dont forget to change `sys.path.append("path_to_this_repo/arrg_img2text")` on top of the script.
+

@@ -1,9 +1,8 @@
 #############################################
-# 基于5_2修改
-# 多轮对话，先生成full graph，再生成full report。进入graph后，结果变差。怀疑是生成graph时，数据不准确，进而影响到text。因为text是基于graph生成的。
-# 这里尝试使用另一种graph表示方式，即把graph分为 normal abnormal absent uncertain
-# 在此基础上，对ent和rel增加了一个前缀标签，让graph更加明确
-# 启用了 img enc的lora， r=32
+# 基于5_3修改
+# 从使用完整的报告的图，改为使用单个疾病，目前是effu
+# 对于独立疾病，如果radlex没有对应的node，那么该split sent就不会被引入 （但被radlex 关联的 split sent还是会被引入）。
+# 在这种条件下，引入的数据集大小会更小，且
 #############################################
 import argparse
 import datetime
@@ -928,7 +927,7 @@ def get_gold_labels(batch_data):
         absent_str = ", ".join(graph_str_dict["absent"]) if graph_str_dict["absent"] else "None"
 
         assistant_output_graph_str = f"<normal>: {normal_str}\n<abnormal>: {abnormal_str}\n<uncertain>: {uncertain_str}\n<absent>: {absent_str}"
-        assistaant_output_text = item["section_text"]
+        assistaant_output_text = item["split_sents"]
 
         gold_graph_list.append(assistant_output_graph_str)
         gold_text_list.append(assistaant_output_text)
@@ -2048,12 +2047,12 @@ def merge_dataset(img_dataset, graph_dataset):
     return merged_ds
 
 
-def load_dataset(ds_img_path, ds_graph_path, target_section):
+def load_dataset(ds_img_path, ds_graph_path, target_section, target_entity):
     # ds_img 是 image + report 数据集，report 包含 findings和impression
     # ds_graph 是纯文本数据集，是对应特定 target_section，即findings 或impression
     ds_img = load_from_disk(ds_img_path)
     LOGGER.info("Loaded pre_processed image dataset from: \n%s \n%s", ds_img_path, ds_img)
-    ds_graph_path = os.path.join(ds_graph_path, f"interpret_graph_{target_section}")
+    ds_graph_path = os.path.join(ds_graph_path, target_entity, f"interpret_graph_{target_section}_{target_entity}")
     ds_graph = load_from_disk(ds_graph_path)
     LOGGER.info("Loaded pre_processed graph dataset from: \n%s \n%s", ds_graph_path, ds_graph)
 
@@ -2313,7 +2312,7 @@ def global_init_proj_config():
     if args.from_bash:
         file_path = args.config_file
     else:
-        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/5_fsdp_peft_full_text.yaml"
+        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/6_effu.yaml"
 
     with open(file_path, "r", encoding="utf-8") as f:
         CONFIG = yaml.safe_load(f)
@@ -2359,7 +2358,7 @@ def pretrain_model(model_base_cfg, train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"], target_entity=CONFIG["target_entity"])
 
     img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
     model = init_model(vision_model_path, language_model_path, model_base_cfg)
@@ -2383,7 +2382,7 @@ def eval_pretrained_model(train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"], target_entity=CONFIG["target_entity"])
 
     model = load_model(pretain_model_path)
     img_processor, tokenizer = load_processor(pretain_model_path)
@@ -2415,7 +2414,7 @@ def finetune_model(train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"], target_entity=CONFIG["target_entity"])
 
     if train_cfg["use_pretrained"]:
         model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
@@ -2453,7 +2452,7 @@ def eval_finetuned_model(train_cfg):
 
     # Train and test
     set_seed(train_cfg["seed"])
-    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
+    ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"], target_entity=CONFIG["target_entity"])
 
     if train_cfg["use_pretrained"]:
         model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
