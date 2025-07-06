@@ -32,7 +32,7 @@ model_name_or_path:
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 use_debug_subset: True
-use_graph: True # if True, then use both text and graph data for training and evaluation.
+use_graph: False # if True, then use both text and graph data for training and evaluation.
 run_mode: "finetune" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 preprocess:

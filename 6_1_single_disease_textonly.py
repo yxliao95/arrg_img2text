@@ -788,7 +788,7 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
                         "role": "user",
                         "content": [
                             {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                            {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and output your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
+                            {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and describe your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
                         ],
                     },
                     {
@@ -798,7 +798,7 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please output a detailed narrative report."},
+                            {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please describe your observations."},
                         ],
                     },
                     {
@@ -817,7 +817,8 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "According to the given X-ray images, please output a detailed narrative report."},
+                            {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
+                            {"type": "text", "text": "According to the given X-ray images, please describe your observations."},
                         ],
                     },
                     {
@@ -878,7 +879,7 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
                         "role": "user",
                         "content": [
                             {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                            {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and output your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
+                            {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and describe your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
                         ],
                     },
                 ]
@@ -895,7 +896,7 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please output a detailed narrative report."},
+                                {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please describe your observations."},
                             ],
                         },
                     ]
@@ -912,7 +913,7 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
                     "role": "user",
                     "content": [
                         {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                        {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please output a detailed narrative report."},
+                        {"type": "text", "text": "According to the given X-ray images, please describe your observations."},
                     ],
                 },
             ]
