@@ -963,7 +963,7 @@ def get_gold_labels(batch_data):
         absent_str = ", ".join(graph_str_dict["absent"]) if graph_str_dict["absent"] else "None"
 
         assistant_output_graph_str = f"<normal>: {normal_str}\n<abnormal>: {abnormal_str}\n<uncertain>: {uncertain_str}\n<absent>: {absent_str}"
-        assistaant_output_text = item["split_sents"]
+        assistaant_output_text = " ".join(item["split_sents"])
 
         gold_graph_list.append(assistant_output_graph_str)
         gold_text_list.append(assistaant_output_text)
