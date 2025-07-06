@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=5_1_finetune_full_graph_text_111_10-4
+#SBATCH --job-name=5_3_fsdp_peft_4label_with_ent_rel_labels_111_10-4_r32_add_enc_lora
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -33,6 +33,8 @@ conda activate $env
 echo "Loaded $conda, env: $env"
 nvcc -V
 
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Start: $SLURM_JOB_NAME"
+
 nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
 echo "MLflow server started"
 
@@ -40,32 +42,33 @@ echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
 export TORCH_DISTRIBUTED_DEBUG=OFF # OFF, INFO, or DETAIL
 export NCCL_TIMEOUT=1800  # 默认是 1800 秒（30 分钟），你可以设置更大，比如 3600
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # 避免碎片化
-# accelerate launch\
-#     --multi_gpu \
-#     --num_processes 2 \
-#     --main_process_port $main_process_port \
-#     /scratch/c.c21051562/workspace/arrg_img2text/5_1_fsdp_peft_full_graph_text.py \
-#     --from_bash \
-#     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_1_fsdp_peft_full_graph_text.yaml \
-#     --output_name $SLURM_JOB_NAME \
-#     --jobid $SLURM_JOB_ID \
-#     --mlflow_port $mlflow_port \
-#     --run_mode finetune \
-#     --resume_from_checkpoint
-# echo "Script [finetune] finished."
 
 accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/5_1_fsdp_peft_full_graph_text.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/5_3_fsdp_peft_4label_with_ent_rel_labels.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_1_fsdp_peft_full_graph_text.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_3_fsdp_peft_4label_with_ent_rel_labels.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
-    --run_mode eval_finetuned
-echo "Script [eval_finetuned] finished."
+    --run_mode finetune \
+    --resume_from_checkpoint
+echo "Script [finetune] finished."
+
+# accelerate launch\
+#     --multi_gpu \
+#     --num_processes 2 \
+#     --main_process_port $main_process_port \
+#     /scratch/c.c21051562/workspace/arrg_img2text/5_3_fsdp_peft_4label_with_ent_rel_labels.py \
+#     --from_bash \
+#     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_3_fsdp_peft_4label_with_ent_rel_labels.yaml \
+#     --output_name $SLURM_JOB_NAME \
+#     --jobid $SLURM_JOB_ID \
+#     --mlflow_port $mlflow_port \
+#     --run_mode eval_finetuned
+# echo "Script [eval_finetuned] finished."
 
 # 查找运行在该端口的 mlflow 进程
 pids=$(lsof -i :$mlflow_port -sTCP:LISTEN -t)
