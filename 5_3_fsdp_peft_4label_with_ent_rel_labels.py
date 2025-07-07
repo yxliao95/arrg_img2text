@@ -1326,7 +1326,7 @@ def evaluate(model, target_dataloader, **kwargs):
     model.eval()
     with torch.no_grad():
         for batch_idx, input_tensors_dict in enumerate(target_dataloader):
-            if input_tensors_dict["batch_data"]:
+            if len(input_tensors_dict["batch_data"]) == 0:
                 LOGGER.info("No data remain unpredicted, stop model inference")
                 break
 

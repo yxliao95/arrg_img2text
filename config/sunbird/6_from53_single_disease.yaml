@@ -32,6 +32,7 @@ max_checkpoints_to_keep: 1
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 use_debug_subset: False
+use_graph: False # if True, then use both text and graph data for training and evaluation, else use text only
 run_mode: "finetune" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 # Resize the image to according to the encoder processor, this can speed up the training

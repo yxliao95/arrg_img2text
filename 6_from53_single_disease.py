@@ -777,35 +777,56 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
         assistant_output_graph_str = gold_graph_list[idx]
         assistaant_output_text = gold_text_list[idx]
 
-        conversations.append(
-            [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                        {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and output your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": assistant_output_graph_str}],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please output a detailed narrative report."},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": assistaant_output_text}],
-                },
-            ]
-        )
+        if CONFIG["use_graph"]:
+            conversations.append(
+                [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
+                            {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and describe your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": assistant_output_graph_str}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please describe your observations."},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": assistaant_output_text}],
+                    },
+                ]
+            )
+        else:
+            conversations.append(
+                [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
+                            {"type": "text", "text": "According to the given X-ray images, please describe your observations."},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": assistaant_output_text}],
+                    },
+                ]
+            )
 
     # See descriptions for assistant_tokens_mask
     # Assistant tokens are the tokens that need to be generated, we use these tokens to compute the loss
@@ -846,8 +867,43 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
     for idx, item in enumerate(batch_data):
         num_images = len(image_indices_map[idx])
 
-        if assistant_responses is None:
-            # 第一轮的用户输入
+        if CONFIG["use_graph"]:
+            if assistant_responses is None:
+                # 第一轮的用户输入
+                conversation = [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
+                            {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and describe your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
+                        ],
+                    },
+                ]
+            else:
+                # 历史输入 + 第一轮的模型输出 + 第二轮的用户输入
+                conversation = conversations_history[idx]
+                assistant_output_graph_str = assistant_responses[idx]
+                conversation.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": assistant_output_graph_str}],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please describe your observations."},
+                            ],
+                        },
+                    ]
+                )
+        else:
+            # 只有第一轮的用户输入
+            assert assistant_responses is None
             conversation = [
                 {
                     "role": "system",
@@ -857,29 +913,10 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
                     "role": "user",
                     "content": [
                         {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                        {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and output your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
+                        {"type": "text", "text": "According to the given X-ray images, please describe your observations."},
                     ],
                 },
             ]
-        else:
-            # 历史输入 + 第一轮的模型输出 + 第二轮的用户输入
-            conversation = conversations_history[idx]
-            assistant_output_graph_str = assistant_responses[idx]
-            conversation.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": assistant_output_graph_str}],
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": f"According to the given X-ray images and the structured report you just generated, please output a detailed narrative report."},
-                        ],
-                    },
-                ]
-            )
-
         conversations.append(conversation)
 
     # See descriptions for assistant_tokens_mask
@@ -927,7 +964,7 @@ def get_gold_labels(batch_data):
         absent_str = ", ".join(graph_str_dict["absent"]) if graph_str_dict["absent"] else "None"
 
         assistant_output_graph_str = f"<normal>: {normal_str}\n<abnormal>: {abnormal_str}\n<uncertain>: {uncertain_str}\n<absent>: {absent_str}"
-        assistaant_output_text = item["split_sents"]
+        assistaant_output_text = " ".join(item["split_sents"])
 
         gold_graph_list.append(assistant_output_graph_str)
         gold_text_list.append(assistaant_output_text)
@@ -1325,7 +1362,7 @@ def evaluate(model, target_dataloader, **kwargs):
     model.eval()
     with torch.no_grad():
         for batch_idx, input_tensors_dict in enumerate(target_dataloader):
-            if input_tensors_dict["batch_data"]:
+            if len(input_tensors_dict["batch_data"]) == 0:
                 LOGGER.info("No data remain unpredicted, stop model inference")
                 break
 
@@ -1335,6 +1372,10 @@ def evaluate(model, target_dataloader, **kwargs):
             assistant_responses = None
             conversations_history = None
             for turn in range(2):
+                if not CONFIG["use_graph"] and turn == 1:
+                    # 如果不使用graph，则只需要生成text，不需要生成graph
+                    break
+
                 # 第一轮生成graph，第二轮生成section
                 input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, batch_data=input_tensors_dict["batch_data"], pixel_values=input_tensors_dict["pixel_values"], image_indices_map=input_tensors_dict["image_indices_map"], assistant_responses=assistant_responses, conversations_history=conversations_history)
 
@@ -1365,20 +1406,32 @@ def evaluate(model, target_dataloader, **kwargs):
                 conversations_history = input_tensors_dict["conversations_history"]
 
                 # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
-                if turn == 0:
-                    pred_graphs = pred_sequences
-                    gold_graphs = input_tensors_dict["gold_graph_list"]
-                elif turn == 1:
+                # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
+                if CONFIG["use_graph"]:
+                    if turn == 0:
+                        pred_graphs = pred_sequences
+                        gold_graphs = input_tensors_dict["gold_graph_list"]
+                    elif turn == 1:
+                        pred_text = pred_sequences
+                        gold_text = input_tensors_dict["gold_text_list"]
+                else:
+                    # 如果不使用graph，则只需要生成text，不需要生成graph
                     pred_text = pred_sequences
                     gold_text = input_tensors_dict["gold_text_list"]
+                    gold_graphs = input_tensors_dict["gold_graph_list"]
 
                 if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
+                    pred_example_type = None
+                    if CONFIG["use_graph"]:
+                        pred_example_type = "graph" if turn == 0 else "text"
+                    else:
+                        pred_example_type = "text"
                     LOGGER.info(
                         "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example (%s): %s",
                         ACCELERATOR.process_index,
                         batch_idx,
                         batch_idx * eval_bsz,
-                        "graph" if turn == 0 else "text",
+                        pred_example_type,
                         pred_sequences[0],
                         main_process_only=False,
                     )
@@ -1407,9 +1460,10 @@ def evaluate(model, target_dataloader, **kwargs):
     text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
     LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict, indent=4))
 
-    # Evaluate graph results
-    text_scores_dict = compute_generation_score(gold_text_list=gold_graphs, pred_text_list=pred_graphs)
-    LOGGER.info("[GraphTextGen]: %s", json.dumps(text_scores_dict, indent=4))
+    if CONFIG["use_graph"]:
+        # Evaluate graph results
+        text_scores_dict = compute_generation_score(gold_text_list=gold_graphs, pred_text_list=pred_graphs)
+        LOGGER.info("[GraphTextGen]: %s", json.dumps(text_scores_dict, indent=4))
 
     # pred_graph_reprs = []
     # for graph_str in pred_graphs:
@@ -2306,6 +2360,10 @@ def global_init_proj_config():
 
     parser.add_argument("--run_mode", type=str, default=None, help="Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]")
     parser.add_argument("--mlflow_port", type=str, default=None)
+    
+    
+    parser.add_argument("--use_graph", action="store_true", default=None)
+    parser.add_argument("--use_text_only", action="store_true", default=None)
 
     args = parser.parse_args()
 
@@ -2329,6 +2387,13 @@ def global_init_proj_config():
 
         if args.mlflow_port:
             CONFIG["mlflow_port"] = args.mlflow_port
+            
+        if args.use_graph:
+            CONFIG["use_graph"] = True
+        
+        if args.use_text_only:
+            CONFIG["use_graph"] = False
+            
     else:
         CONFIG["jobid"] = "00000"
 
