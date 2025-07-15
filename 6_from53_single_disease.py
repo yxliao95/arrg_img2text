@@ -1418,6 +1418,7 @@ def evaluate(model, target_dataloader, **kwargs):
                     # 如果不使用graph，则只需要生成text，不需要生成graph
                     pred_text = pred_sequences
                     gold_text = input_tensors_dict["gold_text_list"]
+                    pred_graphs = [""] * len(pred_sequences)
                     gold_graphs = input_tensors_dict["gold_graph_list"]
 
                 if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
@@ -1481,6 +1482,8 @@ def evaluate(model, target_dataloader, **kwargs):
 def save_pred_results_per_batch(data_ids, pred_text, pred_graphs, gold_text, gold_graphs, data_split, output_dir):
     """Save at each batch, so that we can use the results for further analysis or debugging."""
 
+    assert len(data_ids) == len(pred_text) == len(pred_graphs) == len(gold_text) == len(gold_graphs), f"All lists must have the same length: [data_ids: {len(data_ids)}, pred_text: {len(pred_text)}, pred_graphs: {len(pred_graphs)}, gold_text: {len(gold_text)}, gold_graphs: {len(gold_graphs)}]"
+    
     output_file = os.path.join(output_dir, f"{data_split}_{ACCELERATOR.process_index}.json")
 
     with open(output_file, "a", encoding="utf-8") as f:
@@ -2361,9 +2364,14 @@ def global_init_proj_config():
     parser.add_argument("--run_mode", type=str, default=None, help="Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]")
     parser.add_argument("--mlflow_port", type=str, default=None)
     
-    
     parser.add_argument("--use_graph", action="store_true", default=None)
     parser.add_argument("--use_text_only", action="store_true", default=None)
+    
+    parser.add_argument("--num_epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--grad_accum_steps", type=int, default=None)
+    parser.add_argument("--lr", type=int, default=None)
+    
 
     args = parser.parse_args()
 
@@ -2390,9 +2398,24 @@ def global_init_proj_config():
             
         if args.use_graph:
             CONFIG["use_graph"] = True
-        
         if args.use_text_only:
             CONFIG["use_graph"] = False
+        
+        run_mode = None
+        if "finetune" in CONFIG["run_mode"]:
+            run_mode = "finetune"
+        elif "pretrain" in CONFIG["run_mode"]:
+            run_mode = "pretrain"
+            
+        if run_mode:
+            if args.num_epochs:
+                CONFIG[run_mode]["num_epochs"] = args.num_epochs
+            if args.batch_size:
+                CONFIG[run_mode]["batch_size"] = args.batch_size
+            if args.grad_accum_steps:
+                CONFIG[run_mode]["grad_accum_steps"] = args.grad_accum_steps
+            if args.lr:
+                CONFIG[run_mode]["lr"] = args.lr
             
     else:
         CONFIG["jobid"] = "00000"
