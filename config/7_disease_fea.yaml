@@ -1,0 +1,97 @@
+output_name: test_000
+
+output_dir:
+  result: /home/yuxiang/liao/workspace/arrg_img2text/outputs/results
+  model: /home/yuxiang/liao/workspace/arrg_img2text/outputs/models
+  checkpoint: /home/yuxiang/liao/workspace/arrg_img2text/outputs/checkpoints
+  log: /home/yuxiang/liao/workspace/arrg_img2text/outputs/logs
+
+data_path:
+  mimic: /home/yuxiang/liao/resources/datasets/mimic-cxr
+  interpret: /home/yuxiang/liao/resources/datasets/interpret-cxr
+  interpret-test-public: /home/yuxiang/liao/resources/datasets/interpret-cxr-test-public
+  text_graph: /home/yuxiang/liao/workspace/arrg_preprocessing/outputs/interpret_disease/42_diseases
+
+target_section: findings
+# ['effusion', 'pneumothorax', 'opacity', 'normal', 'consolidation', 'edema', 'atelectasis', 'tube', 'clear', 'catheter', 'pneumonia', 'infiltrate', 'pathophysiologic finding', 'infection', 'congestion', 'enlargement', 'wire', 'degeneration', 'fracture', 'thickening', 'pacemaker', 'emphysema', 'surgical drain', 'surgical clip', 'medical device', 'scoliosis', 'valve', 'chronic obstructive pulmonary disease', 'calcification', 'cirrhosis-associated nodules', 'atherosclerosis', 'calcifications', 'deformity', 'hernia', 'scar', 'pulmonary nodule', 'granuloma', 'automated implantable cardiac defibrillator', 'prosthesis', 'collapse', 'reticular pattern', 'heart failure']
+target_observation: ["effusion", "pneumothorax", "opacity", "normal"]
+use_text_only: False
+
+# final url == http://localhost:6006
+# nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/home/yuxiang/liao/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
+mlflow_url: "http://localhost"
+mlflow_port: 6006
+max_checkpoints_to_keep: 3
+
+model_name_or_path:
+  clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
+  swinv2: /home/yuxiang/liao/resources/downloaded_models/swinv2-base-patch4-window8-256
+  rad_dino_maira2: /home/yuxiang/liao/resources/downloaded_models/rad-dino-maira-2
+  llama32_1b: /home/yuxiang/liao/resources/downloaded_models/Llama-3.2-1B
+
+# path to checkpoint or, bool;
+# if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
+resume_from_checkpoint: False
+# if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
+use_debug_subset: False
+run_mode: "pretrain" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+
+preprocess:
+  image_processor: rad_dino_maira2
+  text_processor: llama32_1b
+  cache_path: /home/yuxiang/liao/workspace/arrg_img2text/dataset_cache/interpretcxr_full_text_img512
+  batched: True
+  batch_size: 32
+  num_proc: 12
+
+model:
+  vision_model: rad_dino_maira2
+  language_model: llama32_1b
+  chat_template: /home/yuxiang/liao/workspace/arrg_img2text/llama3_chat_template.jinja
+  num_observations: 42
+  num_cls_labels: 3
+  classifier_dropout: 0.1
+
+pretrain:
+  seed: 42
+  num_epochs: 1
+  batch_size: 2
+  grad_accum_steps: 1
+  warmup_proportion: 0.1
+
+  lr: 0.0001
+  clip_grad_norm: 1.0
+  mixed_precision: "bf16" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
+
+  print_loss_per_n_steps: 1 # logging loss on .log file
+  # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
+  ckp_per_steps: 1 # 550395 / 32 = 17199, 170801 / 8 = 21350
+
+  eval_batch_size: 1
+  max_new_tokens: 512
+  print_pred_per_n_steps: 1
+
+finetune:
+  # if use pretrained=True, then load the pretrained img_projector weights from path,
+  # else init the img_projector with random weights
+  use_pretrained: False
+  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/4_1_fsdo_peft_test_pretrain
+
+  seed: 42
+  num_epochs: 1
+  batch_size: 1
+  grad_accum_steps: 1
+  warmup_proportion: 0.1
+
+  lr: 0.0001
+  clip_grad_norm: 1.0
+  mixed_precision: "bf16" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
+
+  print_loss_per_n_steps: 1 # logging loss on .log file
+  # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
+  ckp_per_steps: 2 # 550395 / 32 = 17199, 170801 / 8 = 21350
+
+  eval_batch_size: 2
+  max_new_tokens: 10
+  print_pred_per_n_steps: 1
+  eval_valid_split: False
