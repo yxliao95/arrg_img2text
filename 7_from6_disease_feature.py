@@ -306,20 +306,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
 
         return decoder_inputs_embeds
 
-    def _inject_features_by_order(self, input_ids, decoder_inputs_embeds, target_token_id, target_features):
-        # replace img features with the <|image_token|> placeholder token in the input text
-        special_image_mask = (input_ids == target_token_id).unsqueeze(-1)  # torch.Size([bsz, seq_len, 1])
-        special_image_mask = special_image_mask.expand_as(decoder_inputs_embeds).to(decoder_inputs_embeds.device)  # torch.Size([bsz, seq_len, dec_dim])
-
-        # 保证所有 target_features 都能够被复制到 decoder_inputs_embeds 中
-        assert special_image_mask.sum() == target_features.numel(), f"special_image_mask.sum()={special_image_mask.sum()}, target_features.numel()={target_features.numel()}, should be equal to guarantee that all image features are copied to decoder_inputs_embeds"
-
-        target_features = target_features.to(decoder_inputs_embeds.device, decoder_inputs_embeds.dtype)
-        # decoder_inputs_embeds 和 special_image_mask 的形状相同，target_features 与 special_image_mask True 的数量相同，会按顺序替换 True 位置的特征
-        decoder_inputs_embeds = decoder_inputs_embeds.masked_scatter(special_image_mask, target_features)
-
-        return decoder_inputs_embeds
-
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
@@ -496,7 +482,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
             image_hidden_states=image_features if pixel_values is not None else None,
             gen_loss=gen_loss,  # for logging purposes
             cls_loss=cls_loss,  # for logging purposes
-            cls_logits=classifier_outputs.logits,  # for evaluation
         )
 
     @torch.no_grad()
@@ -1574,12 +1559,14 @@ def evaluate(model, target_dataloader, **kwargs):
     eval_bsz = kwargs["eval_batch_size"]
     max_new_tokens = kwargs["max_new_tokens"]
     print_pred_per_n_steps = kwargs["print_pred_per_n_steps"]
+    num_beams = kwargs["num_beams"]
 
     # 由于评估时间过长，pred结果将被存放到文件中，已经pred过的数据已经提前从dataset中移除
     LOGGER.info("****************************** Evaluation ******************************")
     LOGGER.info("Source = %s", target_dataloader.dataset.src_path)
     LOGGER.info("Batch size = %d", eval_bsz)
     LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
+    LOGGER.info("Max new tokens = %d, Num beams = %d", max_new_tokens, num_beams)
     tokenizer = target_dataloader.dataset.tokenizer
 
     LOGGER.info("****************************** Model Predicting ******************************")
@@ -1598,7 +1585,7 @@ def evaluate(model, target_dataloader, **kwargs):
             with ACCELERATOR.autocast():
                 # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
                 # 防重复设置
-                generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=3, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
+                generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=num_beams, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
                 # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
                 # If the model is an encoder-decoder model, encoder specific kwargs should not be prefixed and forward specific kwargs should be prefixed with decoder_.
                 outputs, extra_outputs = model.generate(
@@ -1609,7 +1596,7 @@ def evaluate(model, target_dataloader, **kwargs):
                     decoder_extra_inputs={
                         "image_indices_map": input_tensors_dict["image_indices_map"],
                         "obs_ids": input_tensors_dict["obs_ids"],
-                        "num_beams": 3,
+                        "num_beams": num_beams,
                     },
                     decoder_extra_outputs={"cls_logits": None},
                 )
