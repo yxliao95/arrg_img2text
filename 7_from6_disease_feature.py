@@ -16,7 +16,7 @@ import random
 import re
 import shutil
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from difflib import get_close_matches
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -151,10 +151,13 @@ class VisionClassifier(nn.Module):
         super().__init__()
 
         # 可学习的标签嵌入（每个标签一个向量）
-        self.obs_embeddings = nn.Embedding(config.num_obs_embeddings, config.decoder_hidden_size)
+        self.obs_embeddings = nn.Embedding(config.num_obs_embeddings, config.encoder_hidden_size)
 
         # 注意力模块（标签为 query，图像为 key 和 value）
-        self.attn = nn.MultiheadAttention(embed_dim=config.decoder_hidden_size, num_heads=8, batch_first=True)
+        self.attn = nn.MultiheadAttention(embed_dim=config.encoder_hidden_size, num_heads=8, batch_first=True)
+
+        # 注意力投影层：将注意力输出的维度投影到 decoder_hidden_size
+        self.hidden_proj = nn.Linear(config.encoder_hidden_size, config.decoder_hidden_size, bias=True)
 
         # 分类器：对每个标签嵌入进行分类
         self.classifier = nn.Linear(config.decoder_hidden_size, config.num_classes)
@@ -163,35 +166,29 @@ class VisionClassifier(nn.Module):
         """
         等价于用 sum 和 stack 来合并 logits，但这个方法更高效
         obs_tensor: [img_bsz, num_obs, dim] 可以是 特征向量 或者是 logits
-        image_indices_map: List[List[int]] of length output_bsz, [[0, 1], [2], ...]，每个子列表对应一个样本
+        image_indices_map: # tensor([0, 0, 1, 2, 2, ...]), img0 img1 -> sample0, img2 -> sample1 ...
+        如果当前处于pred， image_indices_map 的长度会变成 img_bsz * num_beams ，此时image_indices_map应该是类似于tensor([0,1,2, 0,1,2, 3,4,5, 6,7,8, 6,7,8, ...])，因为图像特征会在dim0上，每个样本都重复 num_beams 次
         Returns:
             merged_obs_tensor: [output_bsz, num_obs, 3]
         """
         device = obs_tensor.device
-        img_bsz, num_obs, num_classes = obs_tensor.shape
-        output_bsz = len(image_indices_map)
-
-        # 展平后的 index 列表, image_indices_map = [[0, 1], [2], ...]，每个子列表对应一个样本
-        flat_output_indices = []
-        for output_idx, img_indices in enumerate(image_indices_map):
-            flat_output_indices.extend([output_idx] * len(img_indices))
-
-        flat_output_indices = torch.tensor(flat_output_indices, dtype=torch.long, device=device)  # tensor([0, 0, 1])
+        img_bsz, num_obs, dim = obs_tensor.shape
+        output_bsz = int(torch.max(image_indices_map).item()) + 1
 
         # 初始化输出张量
-        merged_obs_tensor = torch.zeros(output_bsz, num_obs, num_classes, dtype=obs_tensor.dtype, device=device)  # torch.Size([output_bsz, num_obs, 3])
+        merged_obs_tensor = torch.zeros(output_bsz, num_obs, dim, dtype=obs_tensor.dtype, device=device)  # torch.Size([output_bsz, num_obs, 3])
 
         # scatter_add 累加对应位置
-        # index_add: flat_output_indices.shape == obs_tensor.shape
-        # 按照 flat_output_indices 的值，将 obs_tensor 累加到 merged_obs_tensor 的对应位置，比如 dim=0, flat_output_indices = [0, 0, 1]
+        # index_add: image_indices_map.shape == obs_tensor.shape
+        # 按照 image_indices_map 的值，将 obs_tensor 累加到 merged_obs_tensor 的对应位置，比如 dim=0, image_indices_map = [0, 0, 1]
         # 则 obs_tensor[0] 和 obs_tensor[1] 累加到 merged_obs_tensor[0]，obs_tensor[2] 累加到 merged_obs_tensor[1]
-        merged_obs_tensor = merged_obs_tensor.index_add(0, flat_output_indices, obs_tensor)
+        merged_obs_tensor = merged_obs_tensor.index_add(0, image_indices_map, obs_tensor)
 
         if mean_pooling:
             # 统计每个样本对应的图像数量，用于平均池化
             counts = torch.zeros(output_bsz, 1, 1, dtype=obs_tensor.dtype, device=device)  # [output_bsz, 1, 1]
-            ones = torch.ones_like(flat_output_indices, dtype=obs_tensor.dtype, device=device)  # shape: [N_total]
-            counts = counts.index_add(0, flat_output_indices, ones.unsqueeze(-1).unsqueeze(-1))  # broadcast to [N_total, 1, 1]
+            ones = torch.ones_like(image_indices_map, dtype=obs_tensor.dtype, device=device)  # shape: [N_total]
+            counts = counts.index_add(0, image_indices_map, ones.unsqueeze(-1).unsqueeze(-1))  # broadcast to [N_total, 1, 1]
 
             if (counts == 0).any():
                 raise ValueError("Found zero-count sample in image_indices_map")
@@ -204,9 +201,8 @@ class VisionClassifier(nn.Module):
         """
         img_features: [img_bsz, num_fea, fea_dim] 图像 encoder 输出
 
-        image_indices_map: [[0], [1], [2, 3], ...] 其中 len(image_indices_map) == output_bsz；嵌套list中的索引对应 img_features 的索引，即 img_bsz
-        例如：[[0], [1], [2, 3]] 表示第一个样本使用 img_features[0]，第二个样本使用 img_features[1]，第三个样本使用 img_features[2] 和 img_features[3]
-        如果某个样本对应两个图像，则需要对 self.attn 输出的特征进行相加
+        image_indices_map: 长度为 img_bsz 的列表，每个元素对应一个 img_feature，元素值为 output batch 中的样本索引
+        如果某个样本对应两个图像，则需要对 self.attn 输出的特征进行融合
 
         obs_ids: 长度为num_obs, id取值范围为 [0, 41]， 对应 obs_embeddings 的索引
         obs_labels: 长度为num_obs, 标签取值范围为 [0, 2]，对应分类器的输出类别
@@ -216,12 +212,14 @@ class VisionClassifier(nn.Module):
         img_bsz = img_features.size(0)
 
         label_ids = obs_ids.unsqueeze(0).expand(img_bsz, -1)  # [num_obs] -> [img_bsz, num_obs]
-        label_embed = self.obs_embeddings(label_ids)  # [img_bsz, num_obs, dim]
+        label_embed = self.obs_embeddings(label_ids)  # [img_bsz, num_obs, enc_dim]
 
-        # 注意力交互（Q=label, K=img, V=img），输出 shape: [img_bsz, num_obs, dim]
+        # 注意力交互（Q=label, K=img, V=img），输出 shape: [img_bsz, num_obs, enc_dim]
         attn_output, _ = self.attn(query=label_embed, key=img_features, value=img_features)
+        # 注意力输出投影到 decoder_hidden_size
+        attn_output = self.hidden_proj(attn_output)  # [img_bsz, num_obs, dec_dim]
 
-        # 特征层融合 输出 shape: [output_bsz, num_obs, dim]
+        # 特征层融合 输出 shape: [output_bsz, num_obs, dec_dim]
         fused_attn_output = self.merge_obs_tensor_by_indices(obs_tensor=attn_output, image_indices_map=image_indices_map, mean_pooling=True)
         features_fused_logits = self.classifier(fused_attn_output)
 
@@ -267,17 +265,57 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
 
         self.config.num_obs_embeddings = num_observations
         self.config.num_classes = num_cls_labels
-        self.classifier = VisionClassifier(self.config)
+        self.obs_classifier = VisionClassifier(self.config)
 
-    def _inject_features(self, input_ids, decoder_inputs_embeds, target_token_id, target_features):
+    def _expand_image_indices_map_generation(self, image_indices_map, expand_size):
+        # [0, 0, 1] -> [0, 0, 0, 0, 0, 0, 1, 1, 1]
+        expanded_map = image_indices_map.repeat_interleave(expand_size, dim=0)
+        # 每组 image 的 index 偏移为 0~expand_size-1
+        local_offsets = torch.arange(expand_size, device=image_indices_map.device).repeat(len(image_indices_map))
+        # [0, 0, 0, 0, 0, 0, 1, 1, 1] * 3 + [0, 1, 2, 0, 1, 2, 0, 1, 2]
+        # -> [0, 1, 2, 0, 1, 2, 3, 4, 5]
+        image_indices_map = expanded_map * expand_size + local_offsets
+        return image_indices_map
+
+    def _inject_features(self, input_ids, decoder_inputs_embeds, target_token_id, target_features, image_indices_map=None):
+        """
+        image_indices_map (torch.Tensor): 指示了每个图像特征应放置到的目标批次索引。
+        """
         # replace img features with the <|image_token|> placeholder token in the input text
-        special_image_mask = (input_ids == target_token_id).unsqueeze(-1)
-        special_image_mask = special_image_mask.expand_as(decoder_inputs_embeds).to(decoder_inputs_embeds.device)
+        special_image_mask = (input_ids == target_token_id).unsqueeze(-1)  # torch.Size([bsz, seq_len, 1])
+        special_image_mask = special_image_mask.expand_as(decoder_inputs_embeds).to(decoder_inputs_embeds.device)  # torch.Size([bsz, seq_len, dec_dim])
+
+        # 在pred阶段使用，以解决 beam search 时图像特征与文本特征的对应偏差问题
+        # 在train阶段，图像特征与文本特征是按顺序对应的，只需要按顺序将图像特征注入到文本特征中即可， 如果一个文本样本对应2个图像时，文本样本中的 <|image_token|> 数量会正确反映出所需的图像特征。
+        # 但是在pred阶段，图像和文本在 generate() 方法中会被扩展为多个 beam，但是扩展后的图像与文本的映射是错误的，比如原本 [img0, img1, img2] 分别对应 [sample0, sample0, sample1]
+        # 扩展后变成 图像[img0beam0, img0beam1, img0beam2, img1beam0, img1beam1, img1beam2, img2beam0, img2beam1, img2beam2] 和 文本[sample0beam0, sample0beam1, sample0beam2, sample1beam0, sample1beam1, sample1beam2]
+        # 默认的注入顺序会变成 img0beam0, img0beam1 -> sample0beam0，而正确的映射应该是 img0beam0, img1beam0 -> sample0beam0
+        # 因此需要使用 image_indices_map 来重新映射图像特征到文本特征中
+        if image_indices_map is not None:
+            # 按 image_indices_map 的值排序
+            sorted_indices = torch.argsort(image_indices_map)
+            # 重新排序 target_features
+            target_features = target_features[sorted_indices]
 
         # 保证所有 target_features 都能够被复制到 decoder_inputs_embeds 中
         assert special_image_mask.sum() == target_features.numel(), f"special_image_mask.sum()={special_image_mask.sum()}, target_features.numel()={target_features.numel()}, should be equal to guarantee that all image features are copied to decoder_inputs_embeds"
 
         target_features = target_features.to(decoder_inputs_embeds.device, decoder_inputs_embeds.dtype)
+        # decoder_inputs_embeds 和 special_image_mask 的形状相同，target_features 与 special_image_mask True 的数量相同，会按顺序替换 True 位置的特征
+        decoder_inputs_embeds = decoder_inputs_embeds.masked_scatter(special_image_mask, target_features)
+
+        return decoder_inputs_embeds
+
+    def _inject_features_by_order(self, input_ids, decoder_inputs_embeds, target_token_id, target_features):
+        # replace img features with the <|image_token|> placeholder token in the input text
+        special_image_mask = (input_ids == target_token_id).unsqueeze(-1)  # torch.Size([bsz, seq_len, 1])
+        special_image_mask = special_image_mask.expand_as(decoder_inputs_embeds).to(decoder_inputs_embeds.device)  # torch.Size([bsz, seq_len, dec_dim])
+
+        # 保证所有 target_features 都能够被复制到 decoder_inputs_embeds 中
+        assert special_image_mask.sum() == target_features.numel(), f"special_image_mask.sum()={special_image_mask.sum()}, target_features.numel()={target_features.numel()}, should be equal to guarantee that all image features are copied to decoder_inputs_embeds"
+
+        target_features = target_features.to(decoder_inputs_embeds.device, decoder_inputs_embeds.dtype)
+        # decoder_inputs_embeds 和 special_image_mask 的形状相同，target_features 与 special_image_mask True 的数量相同，会按顺序替换 True 位置的特征
         decoder_inputs_embeds = decoder_inputs_embeds.masked_scatter(special_image_mask, target_features)
 
         return decoder_inputs_embeds
@@ -300,6 +338,8 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_loss: Optional[bool] = False,
+        decoder_extra_inputs: Optional[Dict[str, Any]] = None,  # 用于传递不希望被generate处理的输入参数，目前是用于动态分配图像和用于分类器的参数
+        decoder_extra_outputs: Optional[Dict[str, Any]] = None,  # 用于传递分类器输出到generate方法中，作为pred输出的一部分，包含 "cls_logits" 键
         **kwargs,
     ) -> Union[Tuple, Vision2LanguageOutputWithPast]:
         """Additional args:
@@ -310,6 +350,9 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         And the `decoder_assistant_masks` should be provided to compute the loss.
         `decoder_assistant_masks` is provided by `tokenizer.apply_chat_template`.
         `decoder_assistant_masks` is a tensor with the same shape as decoder_input_ids, and the value is 0 or 1. 0: system/user tokens, 1: assistant tokens, which is the tokens that need to be generated.
+
+        `decoder_extra_inputs`
+        `decoder_extra_outputs`
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -340,18 +383,45 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         # inference all rounds 会提供 encoder_outputs，而pixel_values=None；在first round时，past_key_values=None，后续为past_key_values=DynamicCache()
         if encoder_outputs is not None and past_key_values is None:
             image_features = encoder_outputs.last_hidden_state  # torch.Size([4, 1370, enc_dim])
-            # project image features
-            image_features = self.v2l_projector(image_features)  # torch.Size([2, 1370, 2048])
 
-            # img cls
-            classifier_outputs = self.classifier(
+            image_indices_map = decoder_extra_inputs["image_indices_map"]
+            if "num_beams" in decoder_extra_inputs:
+                # 说明是 pred, 从 generate() 方法中调用的，需要扩展 image_indices_map，
+                # 原本一个元素表示一个图像，元素值表示样本索引
+                # [0, 0, 1] 表示 [img0, img0, img1]
+                # img0 + img1 -> sample0,
+                # img2 -> sample1
+                # 扩展后，每个图像会被重复 num_beams 次, 值对应于扩展后的样本(decoder_input_ids)的索引
+                # [0, 1, 2, 0, 1, 2, 3, 4, 5] 表示 [img0beam0, img0beam1, img0beam2, img1beam0, img1beam1, img1beam2, img2beam0, img2beam1, img2beam2]
+                # img0beam0 + img1bema0 -> sample0beam0,
+                # img0beam1 + img1beam1 -> sample0beam1,
+                # img0beam2 + img1beam2 -> sample0beam2,
+                # img2beam0 -> sample1beam0, img2beam1 -> sample1beam1, img2beam2 -> sample1beam2
+                image_indices_map = self._expand_image_indices_map_generation(image_indices_map=decoder_extra_inputs["image_indices_map"], expand_size=decoder_extra_inputs["num_beams"])
+
+            # img clssifier
+            classifier_outputs = self.obs_classifier(
                 img_features=image_features,
-                image_indices_map=kwargs["image_indices_map"],
-                obs_ids=kwargs["obs_ids"],
-                obs_labels=kwargs["obs_labels"],
+                image_indices_map=image_indices_map,
+                obs_ids=decoder_extra_inputs["obs_ids"],
+                obs_labels=decoder_extra_inputs.get("obs_labels", None),  # 如果是pred，则不会传入 obs_labels
                 output_loss=output_loss,
             )
-            label_features = classifier_outputs.hidden_states  # torch.Size([2, num_obs, dec_dim])
+            label_features = classifier_outputs.hidden_states  # torch.Size([2, num_obs, dec_dim])，如果是pred，则是 [num_beams * bsz, num_obs, dec_dim]；在pred阶段，label_features 跟 decoder_input_ids 是一一对应的，不需要进行额外处理
+
+            # pred时，将logits传递到 generate() 方法中
+            if decoder_extra_outputs is not None:
+                if "num_beams" in decoder_extra_inputs:
+                    # 在pred阶段，cls_logits 是被 expand 的， 我们只需要每 expand_size 个元素取第一个
+                    expand_size = decoder_extra_inputs["num_beams"]
+                    cls_logits = classifier_outputs.logits
+                    cls_logits = cls_logits[::expand_size, :, :]
+                    decoder_extra_outputs["cls_logits"] = cls_logits
+                else:
+                    decoder_extra_outputs["cls_logits"] = classifier_outputs.logits  # torch.Size([2, num_obs, 3])；
+
+            # project image features
+            image_features = self.v2l_projector(image_features)  # torch.Size([2, 1370, 2048])
 
             # inject image features into text embeddings
             decoder_inputs_embeds = self._inject_features(
@@ -359,8 +429,11 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 decoder_inputs_embeds=decoder_inputs_embeds,
                 target_token_id=self.config.image_token_index,
                 target_features=image_features,
+                image_indices_map=image_indices_map,
             )
+
             # inject observation label features into text embeddings
+            # 无论是 train 还是 pred 阶段，label_features 与 decoder_inputs_embeds 的每个样本都是对齐的，只需要按照顺序注入即可
             decoder_inputs_embeds = self._inject_features(
                 input_ids=decoder_input_ids,
                 decoder_inputs_embeds=decoder_inputs_embeds,
@@ -791,7 +864,12 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         # Convert to legacy cache format if requested
         if generation_config.return_legacy_cache is True and not tf_generation_utils.is_torchdynamo_compiling() and hasattr(result, "past_key_values") and getattr(result.past_key_values, "to_legacy_cache") is not None:
             result.past_key_values = result.past_key_values.to_legacy_cache()
-        return result
+
+        extra_outputs = None
+        if "decoder_extra_outputs" in kwargs:
+            extra_outputs = kwargs["decoder_extra_outputs"]
+
+        return (result, extra_outputs)
 
     def _prepare_decoder_input_ids_for_generation(
         self,
@@ -852,6 +930,37 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
 
         return decoder_input_ids, model_kwargs
 
+    @staticmethod
+    def _expand_inputs_for_generation(
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        input_ids: Optional[torch.LongTensor] = None,
+        **model_kwargs,
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        """Expands tensors from [batch_size, ...] to [batch_size * expand_size, ...]"""
+        # Do not call torch.repeat_interleave if expand_size is 1 because it clones
+        # the input tensor and thus requires more memory although no change is applied
+        if expand_size == 1:
+            return input_ids, model_kwargs
+
+        def _expand_dict_for_generation(dict_to_expand):
+            for key in dict_to_expand:
+                if key != "cache_position" and dict_to_expand[key] is not None and isinstance(dict_to_expand[key], torch.Tensor):
+                    dict_to_expand[key] = dict_to_expand[key].repeat_interleave(expand_size, dim=0)
+            return dict_to_expand
+
+        if input_ids is not None:
+            input_ids = input_ids.repeat_interleave(expand_size, dim=0)
+
+        model_kwargs = _expand_dict_for_generation(model_kwargs)
+
+        if is_encoder_decoder:
+            if model_kwargs.get("encoder_outputs") is None:
+                raise ValueError("If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined.")
+            model_kwargs["encoder_outputs"] = _expand_dict_for_generation(model_kwargs["encoder_outputs"])
+
+        return input_ids, model_kwargs
+
 
 class ImageTextDataset(Dataset):
     def __init__(self, hf_dataset, img_processor, tokenizer, split):
@@ -896,13 +1005,12 @@ def collate_fn(batch_data, img_processor, tokenizer, target_obs=None):
     nested_images = [i["images"] for i in batch_data]  # nested list of imgs: [[img1, img2], [img1], ...]
     piexl_values_tensor = img_processor(images=[img for imgs in nested_images for img in imgs], return_tensors="pt", do_convert_rgb=True).pixel_values
 
-    img_count = 0
-    image_indices_map = []  # e.g. [[0], [1], [2, 3], ...]
+    image_idx_to_batch_idx = []  # e.g. [0, 0, 1, ...] 位置表示每个图像在 encoder_input 中的索引，值表示该图像在 decoder_input的索引 （属于哪个样本）
     for item_idx, item_images in enumerate(nested_images):
         num_images = len(item_images)
         assert num_images <= 2, f"num_images should be less equal than 2, but got {num_images}"
-        image_indices_map.append(list(range(img_count, img_count + num_images)))
-        img_count += num_images
+        image_idx_to_batch_idx.extend([item_idx] * num_images)
+    image_indices_map = torch.tensor(image_idx_to_batch_idx, dtype=torch.long)  # torch.Size([bsz < x < 2*bsz])
 
     # 我们使用分类器时的分类目标，预训练时使用所有类别；微调时可以指定target_obs
     obs2id_map = ["effusion", "pneumothorax", "opacity", "normal", "consolidation", "edema", "atelectasis", "tube", "clear", "catheter", "pneumonia", "infiltrate", "pathophysiologic finding", "infection", "congestion", "enlargement", "wire", "degeneration", "fracture", "thickening", "pacemaker", "emphysema", "surgical drain", "surgical clip", "medical device", "scoliosis", "valve", "chronic obstructive pulmonary disease", "calcification", "cirrhosis-associated nodules", "atherosclerosis", "calcifications", "deformity", "hernia", "scar", "pulmonary nodule", "granuloma", "automated implantable cardiac defibrillator", "prosthesis", "collapse", "reticular pattern", "heart failure"]
@@ -936,7 +1044,7 @@ def collate_fn(batch_data, img_processor, tokenizer, target_obs=None):
     return {
         "batch_data": batch_data,
         "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
-        "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
+        "image_indices_map": image_indices_map.to(DEVICE),  # torch.Size([bsz < x < 2*bsz]), # e.g. [0, 0, 1, 2, 2, ...]
         "obs_labels": obs_labels.to(DEVICE),  # torch.Size([bsz, num_obs]),
         "obs_ids": obs_ids.to(DEVICE),  # torch.Size([num_obs]),
     }
@@ -953,7 +1061,7 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
     for idx, item in enumerate(batch_data):
-        num_images = len(image_indices_map[idx])
+        num_images = len(item["images"])
 
         assistaant_output_text = gold_text_list[idx]
 
@@ -1008,55 +1116,23 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
     }
 
 
-def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_map, assistant_responses, conversations_history):
+def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_map, obs_labels, obs_ids):
     # inference 中，多轮对话需要循环处理
     # 第一轮 model_response = {"graph": [], "seq": []}
     # 第二轮 model_response = {"graph": ["graph str", "..."], "seq": []}
     target_section = CONFIG["target_section"]
 
+    gold_text_list = [" ".join(item["split_sents"]) for item in batch_data]
+    gold_labeldict_list = [item["radlex_types"] for item in batch_data]
+    label_name_list = list(gold_labeldict_list[0].keys())
+
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
     for idx, item in enumerate(batch_data):
-        num_images = len(image_indices_map[idx])
+        num_images = len(item["images"])
 
-        if CONFIG["use_graph"]:
-            if assistant_responses is None:
-                # 第一轮的用户输入
-                conversation = [
-                    {
-                        "role": "system",
-                        "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                            {"type": "text", "text": "Here's a set of chest X-ray images. Your task is to analyze these input radiological image and describe your observations in a structured format. Classify each observation as one of the following categories: [<normal>, <abnormal>, <uncertain>, or <absent>]. When applicable, also include relational information using <suggestive_of> and <located_at>.\nPlease follow this output format exactly:\n\n<normal>:\n<abnormal>:\n<uncertain>:\n<absent>: \n\nNow, analyze the input image and report the findings in this format."},
-                        ],
-                    },
-                ]
-            else:
-                # 历史输入 + 第一轮的模型输出 + 第二轮的用户输入
-                conversation = conversations_history[idx]
-                assistant_output_graph_str = assistant_responses[idx]
-                conversation.extend(
-                    [
-                        {
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": assistant_output_graph_str}],
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "According to the given X-ray images and the structured report you just generated, please describe your observations."},
-                            ],
-                        },
-                    ]
-                )
-        else:
-            # 只有第一轮的用户输入
-            assert assistant_responses is None
-            conversation = [
+        conversations.append(
+            [
                 {
                     "role": "system",
                     "content": [{"type": "text", "text": "You are an expert radiology assistant tasked with interpreting a chest X-ray study."}],
@@ -1065,11 +1141,12 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
                     "role": "user",
                     "content": [
                         {"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens},
-                        {"type": "text", "text": "According to the given X-ray images, please describe your observations."},
+                        {"type": "label", "obs_labels": label_name_list},
+                        {"type": "text", "text": "Based on the provided chest X-ray images and the preliminary key radiological findings, please verify the findings on the images and generate an accurate report accordingly."},
                     ],
                 },
             ]
-        conversations.append(conversation)
+        )
 
     # See descriptions for assistant_tokens_mask
     # Assistant tokens are the tokens that need to be generated, we use these tokens to compute the loss
@@ -1082,18 +1159,16 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
 
     input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
 
-    gold_graph_list, gold_text_list = get_gold_labels(batch_data)
-
     return {
         "batch_data": batch_data,
         "pixel_values": pixel_values,  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
-        "image_indices_map": image_indices_map,  # [[0], [1], [2, 3], ...]
+        "image_indices_map": image_indices_map,  # [0, 0, 1, 2, 2, ...]
         "decoder_input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
         "decoder_attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
         "data_id_list": [i["data_key"] for i in batch_data],
-        "gold_graph_list": gold_graph_list,
         "gold_text_list": gold_text_list,
-        "conversations_history": conversations,
+        "obs_labels": obs_labels,
+        "obs_ids": obs_ids,
     }
 
 
@@ -1116,7 +1191,7 @@ class StatusInfo:
     batch_cls_loss: float = field(default=0.0)
     batch_trained_examples: int = field(default=0)
 
-    run_id: dict = field(default="")
+    run_id: str = field(default="")
 
     grad_accum_eval_mark: int = field(default=0)
     train_print_loss_mark: int = field(default=0)
@@ -1270,7 +1345,18 @@ def train(model, train_dataloader, train_cfg):
 
                 with ACCELERATOR.autocast():
                     model.train()
-                    out = model.forward(output_loss=True, **batch_inputs_dict)
+                    out = model.forward(
+                        pixel_values=batch_inputs_dict["pixel_values"],
+                        decoder_input_ids=batch_inputs_dict["decoder_input_ids"],
+                        decoder_attention_mask=batch_inputs_dict["decoder_attention_mask"],
+                        decoder_assistant_masks=batch_inputs_dict["decoder_assistant_masks"],
+                        decoder_extra_inputs={
+                            "image_indices_map": batch_inputs_dict["image_indices_map"],
+                            "obs_labels": batch_inputs_dict["obs_labels"],
+                            "obs_ids": batch_inputs_dict["obs_ids"],
+                        },
+                        output_loss=True,
+                    )
                     loss = out.loss
 
                 ACCELERATOR.backward(loss)
@@ -1282,7 +1368,7 @@ def train(model, train_dataloader, train_cfg):
                 optimizer.zero_grad()
 
                 check_memory(show_only_if_peak=True)
-                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["decoder_input_ids"].size(0), lr=scheduler.get_last_lr()[0], train_cfg=train_cfg, gen_loss=out.gen_loss, cls_loss=out.cls_loss)
+                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["decoder_input_ids"].size(0), lr=scheduler.get_last_lr()[0], train_cfg=train_cfg, gen_loss=out.gen_loss.item(), cls_loss=out.cls_loss.item())
 
                 # we dont do validation, as it cost too much time
                 check_and_save_checkpoint(max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
@@ -1302,12 +1388,13 @@ def prepare_optimizer_grouped_parameters(model_params, train_cfg):
         encoder_params = [(n, p) for n, p in model_params if n.startswith("encoder")]
         decoder_params = [(n, p) for n, p in model_params if n.startswith("decoder")]
         adaptor_params = [(n, p) for n, p in model_params if n.startswith("v2l_projector")]
-        assert encoder_params and decoder_params and adaptor_params
+        classifier_params = [(n, p) for n, p in model_params if n.startswith("obs_classifier")]
+        assert encoder_params and decoder_params and adaptor_params and classifier_params
 
         # 冻结 encoder, decoder，训练 v2l_projector
         for n, p in encoder_params + decoder_params:
             p.requires_grad = False
-        for n, p in adaptor_params:
+        for n, p in adaptor_params + classifier_params:
             p.requires_grad = True
 
         # no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
@@ -1388,7 +1475,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr, train_cfg, gen_l
             STATUS_INFO.global_update_steps,
             avg_loss,
             gen_loss if gen_loss is not None else 0.0,
-            clss_loss if clss_loss is not None else 0.0,
+            cls_loss if cls_loss is not None else 0.0,
             main_process_only=True,
         )
         STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
@@ -1504,85 +1591,74 @@ def evaluate(model, target_dataloader, **kwargs):
                 LOGGER.info("No data remain unpredicted, stop model inference")
                 break
 
-            data_ids, pred_graphs, gold_graphs, pred_text, gold_text = [], [], [], [], []
+            data_ids, pred_labels, gold_labels, pred_text, gold_text = [], [], [], [], []
 
-            # Model inference, check args in https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin
-            assistant_responses = None
-            conversations_history = None
-            for turn in range(2):
-                if not CONFIG["use_graph"] and turn == 1:
-                    # 如果不使用graph，则只需要生成text，不需要生成graph
-                    break
+            input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, **input_tensors_dict)
 
-                # 第一轮生成graph，第二轮生成section
-                input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, batch_data=input_tensors_dict["batch_data"], pixel_values=input_tensors_dict["pixel_values"], image_indices_map=input_tensors_dict["image_indices_map"], assistant_responses=assistant_responses, conversations_history=conversations_history)
+            with ACCELERATOR.autocast():
+                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
+                # 防重复设置
+                generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=3, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
+                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
+                # If the model is an encoder-decoder model, encoder specific kwargs should not be prefixed and forward specific kwargs should be prefixed with decoder_.
+                outputs, extra_outputs = model.generate(
+                    generation_config=generation_config,
+                    inputs=input_tensors_dict["pixel_values"],
+                    decoder_input_ids=input_tensors_dict["decoder_input_ids"],
+                    decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
+                    decoder_extra_inputs={
+                        "image_indices_map": input_tensors_dict["image_indices_map"],
+                        "obs_ids": input_tensors_dict["obs_ids"],
+                        "num_beams": 3,
+                    },
+                    decoder_extra_outputs={"cls_logits": None},
+                )
+                check_memory(show_only_if_peak=True)
 
-                with ACCELERATOR.autocast():
-                    # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
-                    if turn == 0:
-                        # 生成graph的防重复设置
-                        generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=3, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
-                    elif turn == 1:
-                        # 生成text的防重复设置
-                        generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=3, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
-                    # stopping_criteria = StoppingCriteriaList([EosTokenCriteria(eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id])])
-                    # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
-                    outputs = model.generate(
-                        generation_config=generation_config,
-                        inputs=input_tensors_dict["pixel_values"],
-                        decoder_input_ids=input_tensors_dict["decoder_input_ids"],
-                        decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
-                    )
-                    check_memory(show_only_if_peak=True)
+            pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
+            pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
+            pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
 
-                pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
-                pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
-                pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
-
-                # 用于第二轮生成
-                assistant_responses = pred_sequences
-                conversations_history = input_tensors_dict["conversations_history"]
-
-                # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
-                # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
-                if CONFIG["use_graph"]:
-                    if turn == 0:
-                        pred_graphs = pred_sequences
-                        gold_graphs = input_tensors_dict["gold_graph_list"]
-                    elif turn == 1:
-                        pred_text = pred_sequences
-                        gold_text = input_tensors_dict["gold_text_list"]
-                else:
-                    # 如果不使用graph，则只需要生成text，不需要生成graph
+            # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
+            # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
+            if CONFIG["use_graph"]:
+                if turn == 0:
+                    pred_labels = pred_sequences
+                    gold_labels = input_tensors_dict["gold_graph_list"]
+                elif turn == 1:
                     pred_text = pred_sequences
                     gold_text = input_tensors_dict["gold_text_list"]
-                    pred_graphs = [""] * len(pred_sequences)
-                    gold_graphs = input_tensors_dict["gold_graph_list"]
+            else:
+                # 如果不使用graph，则只需要生成text，不需要生成graph
+                pred_text = pred_sequences
+                gold_text = input_tensors_dict["gold_text_list"]
+                pred_labels = [""] * len(pred_sequences)
+                gold_labels = input_tensors_dict["gold_graph_list"]
 
-                if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
-                    pred_example_type = None
-                    if CONFIG["use_graph"]:
-                        pred_example_type = "graph" if turn == 0 else "text"
-                    else:
-                        pred_example_type = "text"
-                    LOGGER.info(
-                        "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example (%s): %s",
-                        ACCELERATOR.process_index,
-                        batch_idx,
-                        batch_idx * eval_bsz,
-                        pred_example_type,
-                        pred_sequences[0],
-                        main_process_only=False,
-                    )
+            if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
+                pred_example_type = None
+                if CONFIG["use_graph"]:
+                    pred_example_type = "graph" if turn == 0 else "text"
+                else:
+                    pred_example_type = "text"
+                LOGGER.info(
+                    "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example (%s): %s",
+                    ACCELERATOR.process_index,
+                    batch_idx,
+                    batch_idx * eval_bsz,
+                    pred_example_type,
+                    pred_sequences[0],
+                    main_process_only=False,
+                )
 
             data_ids = input_tensors_dict["data_id_list"]
 
             save_pred_results_per_batch(
                 data_ids=data_ids,
                 pred_text=pred_text,
-                pred_graphs=pred_graphs,
+                pred_labels=pred_labels,
                 gold_text=gold_text,
-                gold_graphs=gold_graphs,
+                gold_labels=gold_labels,
                 data_split=target_dataloader.dataset.split,
                 output_dir=CONFIG["output_dir"]["result"],
             )
@@ -1591,9 +1667,9 @@ def evaluate(model, target_dataloader, **kwargs):
     pred_result_dict = load_pred_results(intput_dir=CONFIG["output_dir"]["result"], split=target_dataloader.dataset.split)
     data_ids = [item["data_id"] for item in pred_result_dict.values()]
     pred_text = [item["pred_text"] for item in pred_result_dict.values()]
-    pred_graphs = [item["pred_graph"] for item in pred_result_dict.values()]
+    pred_labels = [item["pred_graph"] for item in pred_result_dict.values()]
     gold_text = [item["gold_text"] for item in pred_result_dict.values()]
-    gold_graphs = [item["gold_graph"] for item in pred_result_dict.values()]
+    gold_labels = [item["gold_graph"] for item in pred_result_dict.values()]
 
     # Evaluate text results
     text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
@@ -1601,7 +1677,7 @@ def evaluate(model, target_dataloader, **kwargs):
 
     if CONFIG["use_graph"]:
         # Evaluate graph results
-        text_scores_dict = compute_generation_score(gold_text_list=gold_graphs, pred_text_list=pred_graphs)
+        text_scores_dict = compute_generation_score(gold_text_list=gold_labels, pred_text_list=pred_labels)
         LOGGER.info("[GraphTextGen]: %s", json.dumps(text_scores_dict, indent=4))
 
     end = time.time()
@@ -1610,15 +1686,15 @@ def evaluate(model, target_dataloader, **kwargs):
     return text_scores_dict
 
 
-def save_pred_results_per_batch(data_ids, pred_text, pred_graphs, gold_text, gold_graphs, data_split, output_dir):
+def save_pred_results_per_batch(data_ids, pred_text, pred_labels, gold_text, gold_labels, data_split, output_dir):
     """Save at each batch, so that we can use the results for further analysis or debugging."""
 
-    assert len(data_ids) == len(pred_text) == len(pred_graphs) == len(gold_text) == len(gold_graphs), f"All lists must have the same length: [data_ids: {len(data_ids)}, pred_text: {len(pred_text)}, pred_graphs: {len(pred_graphs)}, gold_text: {len(gold_text)}, gold_graphs: {len(gold_graphs)}]"
+    assert len(data_ids) == len(pred_text) == len(pred_labels) == len(gold_text) == len(gold_labels), f"All lists must have the same length: [data_ids: {len(data_ids)}, pred_text: {len(pred_text)}, pred_labels: {len(pred_labels)}, gold_text: {len(gold_text)}, gold_labels: {len(gold_labels)}]"
 
     output_file = os.path.join(output_dir, f"{data_split}_{ACCELERATOR.process_index}.json")
 
     with open(output_file, "a", encoding="utf-8") as f:
-        for data_id, p_text, p_graph, g_text, g_graph in zip(data_ids, pred_text, pred_graphs, gold_text, gold_graphs):
+        for data_id, p_text, p_graph, g_text, g_graph in zip(data_ids, pred_text, pred_labels, gold_text, gold_labels):
             out_line = {"data_id": data_id, "pred_text": p_text, "pred_graph": p_graph, "gold_text": g_text, "gold_graph": g_graph}
             f.write(json.dumps(out_line))
             f.write("\n")
@@ -1747,17 +1823,17 @@ def compute_rel_scores(gold_rels_list, pred_rels_list):
     return scores
 
 
-def compute_graph_scores(gold_graphs, pred_graphs):
+def compute_graph_scores(gold_labels, pred_labels):
     # 嵌套列表，每个子列表包含一个文档的所有ent或rel
     gold_ents_list, pred_ents_list = [], []
     gold_rels_list, pred_rels_list = [], []
 
-    for gold_graphs_docwise, pred_graphs_docwise in zip(gold_graphs, pred_graphs):
+    for gold_labels_docwise, pred_labels_docwise in zip(gold_labels, pred_labels):
         # 原本每个文档的ent和rel是按句子分组的，现在需要将其合并，即每个文档的ent合并为一个列表，rel也合并为一个列表
-        gold_ents = [ent for graph in gold_graphs_docwise for ent in graph[0]]
-        gold_rels = [rel for graph in gold_graphs_docwise for rel in graph[1]]
-        pred_ents = [ent for graph in pred_graphs_docwise for ent in graph[0]]
-        pred_rels = [rel for graph in pred_graphs_docwise for rel in graph[1]]
+        gold_ents = [ent for graph in gold_labels_docwise for ent in graph[0]]
+        gold_rels = [rel for graph in gold_labels_docwise for rel in graph[1]]
+        pred_ents = [ent for graph in pred_labels_docwise for ent in graph[0]]
+        pred_rels = [rel for graph in pred_labels_docwise for rel in graph[1]]
 
         gold_ents_list.append(gold_ents)
         gold_rels_list.append(gold_rels)
@@ -2117,7 +2193,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
     if ds_train:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
             if use_debug_subset:
-                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 20, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
+                train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 6, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
             else:
                 train_dataset = ImageTextDataset(ds_train, img_processor=img_processor, tokenizer=tokenizer, split="train")
         train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_bsz, drop_last=True)
@@ -2288,7 +2364,7 @@ def apply_peft_to_model(model):
     target_modules = ["query", "value", "fc1", "fc2", "embed_tokens", "q_proj", "v_proj", "lm_head"]  # 需要注入 LoRA 的模块。
     # List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
     # e.g. Transformers adds a randomly initialized classification head on top of the model. If you do not add this layer to modules_to_save, the classification head won’t be saved. The next time you load the model, you’ll get a different randomly initialized classification head, resulting in completely different results.
-    modules_to_save = ["v2l_projector"]  # 没注入LoRA 但又需要训练和保存的模块。添加模块后，peft会包装一个一模一样的模块，并将requires_grad 会被设置为 True。原模块不变。
+    modules_to_save = ["v2l_projector", "obs_classifier"]  # 没注入LoRA 但又需要训练和保存的模块。添加模块后，peft会包装一个一模一样的模块，并将requires_grad 会被设置为 True。原模块不变。
     lora_config = LoraConfig(
         target_modules=target_modules,
         modules_to_save=modules_to_save,
@@ -2323,7 +2399,7 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
         for name, module in model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding, lora.Embedding, lora.Linear)):
                 ignored_modules.append(module)
-        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector"]
+        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector", "VisionClassifier"]
         # sharding_strategy = "NO_SHARD", state_dict_type = "FULL_STATE_DICT"，用这套配置可以解决加载checkpoint后，在optimizer.step()时的报错 RuntimeError: torch function 'lerp_', with args: (ShardedTensor(ShardedTensorMetadata(sha ... and kwargs: None not supported for ShardedTensor!
         sharding_strategy = "NO_SHARD"
         state_dict_type = "FULL_STATE_DICT"
@@ -2334,7 +2410,7 @@ def global_init_accelerator(model, fsdp_no_shard=False, **kwargs):
         for name, module in model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Embedding, Dinov2Model, LlamaRMSNorm, LlamaRotaryEmbedding)):
                 ignored_modules.append(module)
-        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector"]
+        transformer_cls_names_to_wrap = ["LlamaDecoderLayer", "Dinov2Layer", "VisionLanguageProjector", "VisionClassifier"]
         sharding_strategy = "NO_SHARD"
         state_dict_type = "FULL_STATE_DICT"
 
@@ -2541,6 +2617,9 @@ def pretrain_model(model_base_cfg, train_cfg):
 
 def eval_pretrained_model(train_cfg):
     pretain_model_path = CONFIG["output_dir"]["model"]
+    model_base_cfg = CONFIG["model"]
+    vision_model_path = CONFIG["model_name_or_path"][model_base_cfg["vision_model"]]
+    language_model_path = CONFIG["model_name_or_path"][model_base_cfg["language_model"]]
 
     # Train and test
     set_seed(train_cfg["seed"])
@@ -2550,18 +2629,23 @@ def eval_pretrained_model(train_cfg):
     img_processor, tokenizer = load_processor(pretain_model_path)
     post_init_model_and_tokenizer(model, tokenizer)
     global_init_accelerator(model, **train_cfg)
-    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    # _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
     model.to(DEVICE)
-    model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
+    # model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
+    model, train_dataloader = ACCELERATOR.prepare(model, train_dataloader)
     check_memory()
 
     start = time.time()
-    evaluate(model, validation_dataloader, **train_cfg)
-    start2 = time.time()
-    LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
+    start2 = start
+    if train_cfg["eval_valid_split"]:
+        evaluate(model, validation_dataloader, **train_cfg)
+        start2 = time.time()
+        LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
 
-    evaluate(model, test_dataloader, **train_cfg)
+    # evaluate(model, test_dataloader, **train_cfg)
+    evaluate(model, train_dataloader, **train_cfg)
     end = time.time()
     LOGGER.info("Test time: %s", seconds_to_time_str(end - start2))
     LOGGER.info("Total evaluation time: %s", seconds_to_time_str(end - start))

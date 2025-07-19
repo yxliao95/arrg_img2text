@@ -21,7 +21,7 @@ use_text_only: False
 # nohup mlflow server --host localhost --port 6006 --backend-store-uri file:/home/yuxiang/liao/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
 mlflow_url: "http://localhost"
 mlflow_port: 6006
-max_checkpoints_to_keep: 3
+max_checkpoints_to_keep: 2
 
 model_name_or_path:
   clip: /home/yuxiang/liao/resources/downloaded_models/clip-vit-base-patch32
@@ -33,8 +33,8 @@ model_name_or_path:
 # if True, then use the latest checkpoint from `output_dir.checkpoint/output_name`
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
-use_debug_subset: False
-run_mode: "pretrain" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+use_debug_subset: True
+run_mode: "eval_pretrained" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 preprocess:
   image_processor: rad_dino_maira2
@@ -47,7 +47,7 @@ preprocess:
 model:
   vision_model: rad_dino_maira2
   language_model: llama32_1b
-  chat_template: /home/yuxiang/liao/workspace/arrg_img2text/llama3_chat_template.jinja
+  chat_template: /home/yuxiang/liao/workspace/arrg_img2text/llama3_chat_template7.jinja
   num_observations: 42
   num_cls_labels: 3
   classifier_dropout: 0.1
@@ -65,11 +65,12 @@ pretrain:
 
   print_loss_per_n_steps: 1 # logging loss on .log file
   # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
-  ckp_per_steps: 1 # 550395 / 32 = 17199, 170801 / 8 = 21350
+  ckp_per_steps: 3 # 550395 / 32 = 17199, 170801 / 8 = 21350
 
-  eval_batch_size: 1
-  max_new_tokens: 512
+  eval_batch_size: 2
+  max_new_tokens: 10
   print_pred_per_n_steps: 1
+  eval_valid_split: False
 
 finetune:
   # if use pretrained=True, then load the pretrained img_projector weights from path,
