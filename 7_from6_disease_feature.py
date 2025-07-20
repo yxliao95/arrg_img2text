@@ -102,6 +102,11 @@ class GlobalVariables:
     eot_token = "<|eot_id|>"
     eot_token_id = None
 
+    obs_name2id_dict = {}  # e.g. {"effusion": 0, ...}
+    obs_id2name_dict = {}  # e.g. {0: "effusion", ...}
+    obs_cls2id_dict = {}  # e.g. {"": 0, "mentioned": 1, "absent": 2}
+    obs_id2cls_dict = {}  # e.g. {0: "", 1: "mentioned", 2: "absent"}
+
 
 GLOBAL_VARS = GlobalVariables()
 
@@ -998,32 +1003,29 @@ def collate_fn(batch_data, img_processor, tokenizer, target_obs=None):
     image_indices_map = torch.tensor(image_idx_to_batch_idx, dtype=torch.long)  # torch.Size([bsz < x < 2*bsz])
 
     # 我们使用分类器时的分类目标，预训练时使用所有类别；微调时可以指定target_obs
-    obs2id_map = ["effusion", "pneumothorax", "opacity", "normal", "consolidation", "edema", "atelectasis", "tube", "clear", "catheter", "pneumonia", "infiltrate", "pathophysiologic finding", "infection", "congestion", "enlargement", "wire", "degeneration", "fracture", "thickening", "pacemaker", "emphysema", "surgical drain", "surgical clip", "medical device", "scoliosis", "valve", "chronic obstructive pulmonary disease", "calcification", "cirrhosis-associated nodules", "atherosclerosis", "calcifications", "deformity", "hernia", "scar", "pulmonary nodule", "granuloma", "automated implantable cardiac defibrillator", "prosthesis", "collapse", "reticular pattern", "heart failure"]
+    obs_name2id_dict = GLOBAL_VARS.obs_name2id_dict  # e.g. {'effusion': 0, ...}
     obs_id_list = []  # e.g. [0, 1, 2, 7, 8, ...] 每个值是一个类别的id
     if target_obs:
-        obs_id_list = [obs2id_map.index(obs) for obs in target_obs]
+        obs_id_list = [obs_name2id_dict[obs_name] for obs_name in target_obs]
     else:
-        obs_id_list = list(range(len(obs2id_map)))
+        obs_id_list = list(obs_name2id_dict.values())
     obs_ids = torch.tensor(obs_id_list, dtype=torch.long)
 
     # 多任务多分类标签
+    obs_cls2id_dict = GLOBAL_VARS.obs_cls2id_dict  # e.g. {'mentioned': 1, 'absent': 2, '': 0}
     obs_label_list = []
     for obs_label_dict in [data_item["radlex_types"] for data_item in batch_data]:
-        obs_label_values = []  # [0, 2, 1, ..., 1] 每个值是一个类别的三分类标签
-        for obs_label_name, obs_label_value in obs_label_dict.items():
+        obs_cls_ids = []  # [0, 2, 1, ..., 1] 每个值是一个类别的三分类标签
+        for obs_name, obs_cls_name in obs_label_dict.items():
             # 如果指定了target_obs，则只保留target_obs中的标签
-            if target_obs and (obs_label_name not in target_obs):
+            if target_obs and (obs_name not in target_obs):
                 continue
-            if obs_label_value == "mentioned":
-                obs_label_values.append(1)
-            elif obs_label_value == "absent":
-                obs_label_values.append(2)
-            elif obs_label_value == "":
-                obs_label_values.append(0)
+            if obs_cls_name in obs_cls2id_dict:
+                obs_cls_ids.append(obs_cls2id_dict[obs_cls_name])
             else:
-                raise ValueError(f"Invalid observation label value: [{obs_label_value}] for [{obs_label_name}]")
-        obs_label_list.append(obs_label_values)
-        assert len(obs_label_values) == len(obs_ids), f"obs_label_values should have the same length as obs_ids, but got {len(obs_label_values)} vs {len(obs_ids)}"
+                raise ValueError(f"Invalid observation label value: [{obs_cls_name}] for [{obs_name}]")
+        obs_label_list.append(obs_cls_ids)
+        assert len(obs_cls_ids) == len(obs_ids), f"obs_cls_ids should have the same length as obs_ids, but got {len(obs_cls_ids)} vs {len(obs_ids)}"
     obs_labels = torch.tensor(obs_label_list, dtype=torch.long)  # torch.Size([bsz, num_obs])
 
     return {
@@ -1571,101 +1573,101 @@ def evaluate(model, target_dataloader, **kwargs):
 
     LOGGER.info("****************************** Model Predicting ******************************")
     start = time.time()
-    model.eval()
-    with torch.no_grad():
-        for batch_idx, input_tensors_dict in enumerate(target_dataloader):
-            if len(input_tensors_dict["batch_data"]) == 0:
-                LOGGER.info("No data remain unpredicted, stop model inference")
-                break
+    # model.eval()
+    # with torch.no_grad():
+    #     for batch_idx, input_tensors_dict in enumerate(target_dataloader):
+    #         if len(input_tensors_dict["batch_data"]) == 0:
+    #             LOGGER.info("No data remain unpredicted, stop model inference")
+    #             break
 
-            data_ids, pred_labels, gold_labels, pred_text, gold_text = [], [], [], [], []
+    #         input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, **input_tensors_dict)
 
-            input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, **input_tensors_dict)
+    #         data_ids = input_tensors_dict["data_id_list"]
+    #         pred_labels, gold_labels, pred_text, gold_text = [], [], [], []
 
-            with ACCELERATOR.autocast():
-                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
-                # 防重复设置
-                generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=num_beams, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
-                # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
-                # If the model is an encoder-decoder model, encoder specific kwargs should not be prefixed and forward specific kwargs should be prefixed with decoder_.
-                outputs, extra_outputs = model.generate(
-                    generation_config=generation_config,
-                    inputs=input_tensors_dict["pixel_values"],
-                    decoder_input_ids=input_tensors_dict["decoder_input_ids"],
-                    decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
-                    decoder_extra_inputs={
-                        "image_indices_map": input_tensors_dict["image_indices_map"],
-                        "obs_ids": input_tensors_dict["obs_ids"],
-                        "num_beams": num_beams,
-                    },
-                    decoder_extra_outputs={"cls_logits": None},
-                )
-                check_memory(show_only_if_peak=True)
+    #         with ACCELERATOR.autocast():
+    #             # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
+    #             # 防重复设置
+    #             generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=num_beams, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
+    #             # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
+    #             # If the model is an encoder-decoder model, encoder specific kwargs should not be prefixed and forward specific kwargs should be prefixed with decoder_.
+    #             outputs, extra_outputs = model.generate(
+    #                 generation_config=generation_config,
+    #                 inputs=input_tensors_dict["pixel_values"],
+    #                 decoder_input_ids=input_tensors_dict["decoder_input_ids"],
+    #                 decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
+    #                 decoder_extra_inputs={
+    #                     "image_indices_map": input_tensors_dict["image_indices_map"],
+    #                     "obs_ids": input_tensors_dict["obs_ids"],
+    #                     "num_beams": num_beams,
+    #                 },
+    #                 decoder_extra_outputs={"cls_logits": None},
+    #             )
+    #             check_memory(show_only_if_peak=True)
 
-            pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
-            pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
-            pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
+    #         pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
+    #         pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
+    #         pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
 
-            # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
-            # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
-            if CONFIG["use_graph"]:
-                if turn == 0:
-                    pred_labels = pred_sequences
-                    gold_labels = input_tensors_dict["gold_graph_list"]
-                elif turn == 1:
-                    pred_text = pred_sequences
-                    gold_text = input_tensors_dict["gold_text_list"]
-            else:
-                # 如果不使用graph，则只需要生成text，不需要生成graph
-                pred_text = pred_sequences
-                gold_text = input_tensors_dict["gold_text_list"]
-                pred_labels = [""] * len(pred_sequences)
-                gold_labels = input_tensors_dict["gold_graph_list"]
+    #         pred_obs_logits = extra_outputs["cls_logits"]  # torch.Size([bsz, num_obs, 3])
+    #         pred_obs_labels = pred_obs_logits.argmax(dim=-1)
 
-            if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
-                pred_example_type = None
-                if CONFIG["use_graph"]:
-                    pred_example_type = "graph" if turn == 0 else "text"
-                else:
-                    pred_example_type = "text"
-                LOGGER.info(
-                    "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example (%s): %s",
-                    ACCELERATOR.process_index,
-                    batch_idx,
-                    batch_idx * eval_bsz,
-                    pred_example_type,
-                    pred_sequences[0],
-                    main_process_only=False,
-                )
+    #         # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
+    #         # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
+    #         pred_text = pred_sequences
+    #         gold_text = input_tensors_dict["gold_text_list"]
+    #         pred_label_ids = pred_obs_labels.tolist()
+    #         gold_label_ids = input_tensors_dict["obs_labels"].tolist()
 
-            data_ids = input_tensors_dict["data_id_list"]
+    #         assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
+    #         for i in range(len(pred_label_ids)):
+    #             pred_labels_inbatch, gold_labels_inbatch = {}, {}
+    #             for obs_id, pred_label_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), pred_label_ids[i], gold_label_ids[i]):
+    #                 obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
+    #                 pred_cls_label = GLOBAL_VARS.obs_id2cls_dict[pred_label_id]
+    #                 gold_cls_label = GLOBAL_VARS.obs_id2cls_dict[gold_label_id]
+    #                 pred_labels_inbatch[obs_name] = pred_cls_label
+    #                 gold_labels_inbatch[obs_name] = gold_cls_label
+    #             pred_labels.append(pred_labels_inbatch)
+    #             gold_labels.append(gold_labels_inbatch)
 
-            save_pred_results_per_batch(
-                data_ids=data_ids,
-                pred_text=pred_text,
-                pred_labels=pred_labels,
-                gold_text=gold_text,
-                gold_labels=gold_labels,
-                data_split=target_dataloader.dataset.split,
-                output_dir=CONFIG["output_dir"]["result"],
-            )
+    #         if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
+    #             LOGGER.info(
+    #                 "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example: \n[text]: %s \n[obs_label] %s",
+    #                 ACCELERATOR.process_index,
+    #                 batch_idx,
+    #                 batch_idx * eval_bsz,
+    #                 pred_sequences[0],
+    #                 {k: v for k, v in pred_labels[0].items() if v != ""},
+    #                 main_process_only=False,
+    #             )
+
+    #         data_ids = input_tensors_dict["data_id_list"]
+
+    #         save_pred_results_per_batch(
+    #             data_ids=data_ids,
+    #             pred_text=pred_text,
+    #             pred_labels=pred_labels,
+    #             gold_text=gold_text,
+    #             gold_labels=gold_labels,
+    #             data_split=target_dataloader.dataset.split,
+    #             output_dir=CONFIG["output_dir"]["result"],
+    #         )
 
     LOGGER.info("****************************** Computing Scores ******************************")
     pred_result_dict = load_pred_results(intput_dir=CONFIG["output_dir"]["result"], split=target_dataloader.dataset.split)
     data_ids = [item["data_id"] for item in pred_result_dict.values()]
     pred_text = [item["pred_text"] for item in pred_result_dict.values()]
-    pred_labels = [item["pred_graph"] for item in pred_result_dict.values()]
+    pred_labels = [item["pred_label"] for item in pred_result_dict.values()]
     gold_text = [item["gold_text"] for item in pred_result_dict.values()]
-    gold_labels = [item["gold_graph"] for item in pred_result_dict.values()]
+    gold_labels = [item["gold_label"] for item in pred_result_dict.values()]
+
+    label_scores_dict = compute_multilabel_multiclass_scores(gold_labels_list=gold_labels, pred_labels_list=pred_labels, obs_names=list(GLOBAL_VARS.obs_name2id_dict.keys()), obs_labels=list(GLOBAL_VARS.obs_cls2id_dict.keys()))
+    LOGGER.info("[ClsPred]: %s", json.dumps(label_scores_dict, indent=4))
 
     # Evaluate text results
     text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
     LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict, indent=4))
-
-    if CONFIG["use_graph"]:
-        # Evaluate graph results
-        text_scores_dict = compute_generation_score(gold_text_list=gold_labels, pred_text_list=pred_labels)
-        LOGGER.info("[GraphTextGen]: %s", json.dumps(text_scores_dict, indent=4))
 
     end = time.time()
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
@@ -1681,8 +1683,8 @@ def save_pred_results_per_batch(data_ids, pred_text, pred_labels, gold_text, gol
     output_file = os.path.join(output_dir, f"{data_split}_{ACCELERATOR.process_index}.json")
 
     with open(output_file, "a", encoding="utf-8") as f:
-        for data_id, p_text, p_graph, g_text, g_graph in zip(data_ids, pred_text, pred_labels, gold_text, gold_labels):
-            out_line = {"data_id": data_id, "pred_text": p_text, "pred_graph": p_graph, "gold_text": g_text, "gold_graph": g_graph}
+        for data_id, p_text, p_label, g_text, g_label in zip(data_ids, pred_text, pred_labels, gold_text, gold_labels):
+            out_line = {"data_id": data_id, "pred_text": p_text, "pred_label": p_label, "gold_text": g_text, "gold_label": g_label}
             f.write(json.dumps(out_line))
             f.write("\n")
 
@@ -1715,6 +1717,118 @@ def load_pred_results(intput_dir, split):
     return data_dict
 
 
+def compute_multilabel_multiclass_scores(gold_labels_list, pred_labels_list, obs_names, obs_labels):
+    assert len(gold_labels_list) == len(pred_labels_list), "Mismatched number of samples"
+
+    scores = {"overall": {}}  # 让 overall 排在最前面，便于log打印观察
+
+    # 用于计算总 micro
+    total_tp = defaultdict(int)
+    total_fp = defaultdict(int)
+    total_fn = defaultdict(int)
+
+    # 每个 obs 的宏平均指标（用于最终宏平均）
+    macro_precisions = []
+    macro_recalls = []
+    macro_f1s = []
+
+    for obs in obs_names:
+        tp = defaultdict(int)
+        fp = defaultdict(int)
+        fn = defaultdict(int)
+
+        for gold_dict, pred_dict in zip(gold_labels_list, pred_labels_list):
+            gold = gold_dict.get(obs)
+            pred = pred_dict.get(obs)
+
+            for label in obs_labels:
+                if pred == label and gold == label:
+                    tp[label] += 1
+                    total_tp[label] += 1
+                elif pred == label and gold != label:
+                    fp[label] += 1
+                    total_fp[label] += 1
+                elif pred != label and gold == label:
+                    fn[label] += 1
+                    total_fn[label] += 1
+
+        # 计算 per-label 指标
+        obs_result = {}
+        obs_p_list = []
+        obs_r_list = []
+        obs_f1_list = []
+
+        for label in obs_labels:
+            p = tp[label] / (tp[label] + fp[label]) if (tp[label] + fp[label]) > 0 else 0.0
+            r = tp[label] / (tp[label] + fn[label]) if (tp[label] + fn[label]) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+            obs_result[label] = {
+                "precision": round(p, 4),
+                "recall": round(r, 4),
+                "f1": round(f1, 4),
+                "tp": tp[label],
+                "fp": fp[label],
+                "fn": fn[label],
+            }
+            obs_p_list.append(p)
+            obs_r_list.append(r)
+            obs_f1_list.append(f1)
+
+        # 每个 obs 的 micro/macro 平均
+        micro_tp = sum(tp.values())
+        micro_fp = sum(fp.values())
+        micro_fn = sum(fn.values())
+        micro_p = micro_tp / (micro_tp + micro_fp) if (micro_tp + micro_fp) > 0 else 0.0
+        micro_r = micro_tp / (micro_tp + micro_fn) if (micro_tp + micro_fn) > 0 else 0.0
+        micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
+
+        scores[obs] = {
+            "per_class": obs_result,
+            "micro": {
+                "precision": round(micro_p, 4),
+                "recall": round(micro_r, 4),
+                "f1": round(micro_f1, 4),
+            },
+            "macro": {
+                "precision": round(sum(obs_p_list) / len(obs_p_list), 4),
+                "recall": round(sum(obs_r_list) / len(obs_r_list), 4),
+                "f1": round(sum(obs_f1_list) / len(obs_f1_list), 4),
+            },
+        }
+
+        macro_precisions.append(sum(obs_p_list) / len(obs_p_list))
+        macro_recalls.append(sum(obs_r_list) / len(obs_r_list))
+        macro_f1s.append(sum(obs_f1_list) / len(obs_f1_list))
+
+    # 所有标签的 micro 总体指标
+    total_tp_sum = sum(total_tp.values())
+    total_fp_sum = sum(total_fp.values())
+    total_fn_sum = sum(total_fn.values())
+
+    overall_micro_p = total_tp_sum / (total_tp_sum + total_fp_sum) if (total_tp_sum + total_fp_sum) > 0 else 0.0
+    overall_micro_r = total_tp_sum / (total_tp_sum + total_fn_sum) if (total_tp_sum + total_fn_sum) > 0 else 0.0
+    overall_micro_f1 = 2 * overall_micro_p * overall_micro_r / (overall_micro_p + overall_micro_r) if (overall_micro_p + overall_micro_r) > 0 else 0.0
+
+    overall_macro_p = sum(macro_precisions) / len(macro_precisions)
+    overall_macro_r = sum(macro_recalls) / len(macro_recalls)
+    overall_macro_f1 = sum(macro_f1s) / len(macro_f1s)
+
+    scores["overall"] = {
+        "micro": {
+            "precision": round(overall_micro_p, 4),
+            "recall": round(overall_micro_r, 4),
+            "f1": round(overall_micro_f1, 4),
+        },
+        "macro": {
+            "precision": round(overall_macro_p, 4),
+            "recall": round(overall_macro_r, 4),
+            "f1": round(overall_macro_f1, 4),
+        },
+    }
+
+    return scores
+
+
 def compute_generation_score(gold_text_list, pred_text_list):
     """Based on the script from https://vilmedic.app/misc/bionlp24/leaderboard#anchor-baseline"""
     if DEVICE.type == "cpu":
@@ -1728,109 +1842,6 @@ def compute_generation_score(gold_text_list, pred_text_list):
     # https://github.com/jbdel/vilmedic/blob/main/vilmedic/blocks/scorers/scores.py
     out_dict = compute_scores(use_metrics, refs=refs, hyps=hyps, split=None, seed=None, config=None, epoch=None, logger=LOGGER, dump=False)
     out_dict = {k: float(v) for k, v in out_dict.items()}
-    return out_dict
-
-
-def compute_ent_scores(gold_ents_list, pred_ents_list):
-    assert len(gold_ents_list) == len(pred_ents_list), "Mismatched number of samples"
-
-    def to_set(ents, mode):
-        if mode == "text":
-            return set(e[0].lower() for e in ents)
-        elif mode == "text_and_type":
-            # pred 中的type是包括尖括号的, e.g. <Anatomy>
-            return set((e[0].lower(), e[1].replace("<", "").replace(">", "").lower()) for e in ents)
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
-
-    scores = {}
-
-    for mode in ["text", "text_and_type"]:
-        total_tp = 0
-        total_fp = 0
-        total_fn = 0
-
-        for gold_ents, pred_ents in zip(gold_ents_list, pred_ents_list):
-            gold_set = to_set(gold_ents, mode)
-            pred_set = to_set(pred_ents, mode)
-
-            tp = len(gold_set & pred_set)
-            fp = len(pred_set - gold_set)
-            fn = len(gold_set - pred_set)
-
-            total_tp += tp
-            total_fp += fp
-            total_fn += fn
-
-        precision = total_tp / (total_tp + total_fp) if total_tp + total_fp > 0 else 0.0
-        recall = total_tp / (total_tp + total_fn) if total_tp + total_fn > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
-
-        scores[mode] = {"precision": round(precision, 4), "recall": round(recall, 4), "f1": round(f1, 4)}
-
-    return scores
-
-
-def compute_rel_scores(gold_rels_list, pred_rels_list):
-    assert len(gold_rels_list) == len(pred_rels_list), "Mismatched number of samples"
-
-    def to_set(rels, mode):
-        if mode == "text":
-            return set((r[0].lower(), r[2].lower()) for r in rels)
-        elif mode == "text_and_type":
-            return set((r[0].lower(), r[1].replace("<", "").replace(">", "").lower(), r[2].lower()) for r in rels)
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
-
-    scores = {}
-
-    for mode in ["text", "text_and_type"]:
-        total_tp = 0
-        total_fp = 0
-        total_fn = 0
-
-        for gold_rels, pred_rels in zip(gold_rels_list, pred_rels_list):
-            gold_set = to_set(gold_rels, mode)
-            pred_set = to_set(pred_rels, mode)
-
-            tp = len(gold_set & pred_set)
-            fp = len(pred_set - gold_set)
-            fn = len(gold_set - pred_set)
-
-            total_tp += tp
-            total_fp += fp
-            total_fn += fn
-
-        precision = total_tp / (total_tp + total_fp) if total_tp + total_fp > 0 else 0.0
-        recall = total_tp / (total_tp + total_fn) if total_tp + total_fn > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
-
-        scores[mode] = {"precision": round(precision, 4), "recall": round(recall, 4), "f1": round(f1, 4)}
-
-    return scores
-
-
-def compute_graph_scores(gold_labels, pred_labels):
-    # 嵌套列表，每个子列表包含一个文档的所有ent或rel
-    gold_ents_list, pred_ents_list = [], []
-    gold_rels_list, pred_rels_list = [], []
-
-    for gold_labels_docwise, pred_labels_docwise in zip(gold_labels, pred_labels):
-        # 原本每个文档的ent和rel是按句子分组的，现在需要将其合并，即每个文档的ent合并为一个列表，rel也合并为一个列表
-        gold_ents = [ent for graph in gold_labels_docwise for ent in graph[0]]
-        gold_rels = [rel for graph in gold_labels_docwise for rel in graph[1]]
-        pred_ents = [ent for graph in pred_labels_docwise for ent in graph[0]]
-        pred_rels = [rel for graph in pred_labels_docwise for rel in graph[1]]
-
-        gold_ents_list.append(gold_ents)
-        gold_rels_list.append(gold_rels)
-        pred_ents_list.append(pred_ents)
-        pred_rels_list.append(pred_rels)
-
-    # 计算ent和rel的f1分数
-    ent_scores = compute_ent_scores(gold_ents_list, pred_ents_list)
-    rel_scores = compute_rel_scores(gold_rels_list, pred_rels_list)
-    out_dict = {"ent_scores": ent_scores, "rel_scores": rel_scores}
     return out_dict
 
 
@@ -2301,8 +2312,8 @@ def init_model(vision_model_path, language_model_path, model_base_cfg):
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(
         encoder_pretrained_model_name_or_path=vision_model_path,
         decoder_pretrained_model_name_or_path=language_model_path,
-        num_observations=model_base_cfg["num_observations"],
-        num_cls_labels=model_base_cfg["num_cls_labels"],
+        num_observations=len(GLOBAL_VARS.obs_map_dict),
+        num_cls_labels=len(GLOBAL_VARS.cls_map_dict),
     )
     LOGGER.info("Initialized vision language mode from: \n%s\n%s", vision_model_path, language_model_path)
     return model
@@ -2486,7 +2497,7 @@ def global_init_logger(log_level=logging.DEBUG, base_log_level=logging.WARNING, 
 
 
 def global_init_proj_config():
-    global CONFIG
+    global CONFIG, GLOBAL_VARS
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--from_bash", action="store_true")
@@ -2556,6 +2567,11 @@ def global_init_proj_config():
         CONFIG["jobid"] = "00000"
 
     CONFIG["mlflow_url"] = f"{CONFIG['mlflow_url']}:{CONFIG['mlflow_port']}"
+
+    GLOBAL_VARS.obs_name2id_dict = {obs_name: idx for idx, obs_name in enumerate(CONFIG["observation_map"])}
+    GLOBAL_VARS.obs_id2name_dict = {idx: obs_name for obs_name, idx in GLOBAL_VARS.obs_name2id_dict.items()}
+    GLOBAL_VARS.obs_cls2id_dict = {cls_name: idx for idx, cls_name in enumerate(CONFIG["obs_classification_map"])}
+    GLOBAL_VARS.obs_id2cls_dict = {idx: cls_name for cls_name, idx in GLOBAL_VARS.obs_cls2id_dict.items()}
 
     output_dirs = CONFIG["output_dir"]
     output_dirs["result"] = os.path.join(output_dirs["result"], CONFIG["output_name"])

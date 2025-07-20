@@ -48,8 +48,6 @@ model:
   vision_model: rad_dino_maira2
   language_model: llama32_1b
   chat_template: /home/yuxiang/liao/workspace/arrg_img2text/llama3_chat_template7.jinja
-  num_observations: 42
-  num_cls_labels: 3
   classifier_dropout: 0.1
 
 pretrain:
@@ -97,3 +95,51 @@ finetune:
   max_new_tokens: 10
   print_pred_per_n_steps: 1
   eval_valid_split: False
+
+observation_map:
+  [
+    "effusion",
+    "pneumothorax",
+    "opacity",
+    "normal",
+    "consolidation",
+    "edema",
+    "atelectasis",
+    "tube",
+    "clear",
+    "catheter",
+    "pneumonia",
+    "infiltrate",
+    "pathophysiologic finding",
+    "infection",
+    "congestion",
+    "enlargement",
+    "wire",
+    "degeneration",
+    "fracture",
+    "thickening",
+    "pacemaker",
+    "emphysema",
+    "surgical drain",
+    "surgical clip",
+    "medical device",
+    "scoliosis",
+    "valve",
+    "chronic obstructive pulmonary disease",
+    "calcification",
+    "cirrhosis-associated nodules",
+    "atherosclerosis",
+    "calcifications",
+    "deformity",
+    "hernia",
+    "scar",
+    "pulmonary nodule",
+    "granuloma",
+    "automated implantable cardiac defibrillator",
+    "prosthesis",
+    "collapse",
+    "reticular pattern",
+    "heart failure",
+  ]
+
+obs_classification_map: ["", "mentioned", "absent"]
