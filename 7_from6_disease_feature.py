@@ -162,7 +162,7 @@ class VisionClassifier(nn.Module):
         self.attn = nn.MultiheadAttention(embed_dim=config.encoder_hidden_size, num_heads=8, batch_first=True)
 
         # 注意力投影层：将注意力输出的维度投影到 decoder_hidden_size
-        self.hidden_proj = nn.Linear(config.encoder_hidden_size, config.decoder_hidden_size, bias=True)
+        self.hidden_proj = nn.Linear(config.encoder_hidden_size, config.decoder_hidden_size)
 
         # 分类器：对每个标签嵌入进行分类
         self.classifier = nn.Linear(config.decoder_hidden_size, config.num_classes)
@@ -258,15 +258,21 @@ class VisionClassifier(nn.Module):
 
 
 class Vision2LanguageModel(VisionEncoderDecoderModel):
-    def __init__(self, config=None, encoder=None, decoder=None, num_observations=42, num_cls_labels=3):
+    def __init__(self, config=None, encoder=None, decoder=None, num_observations=42, num_cls_labels=3, classification_only=False):
 
         super().__init__(config=config, encoder=encoder, decoder=decoder)
         # replace enc_to_dec_proj with VisionLanguageProjector
         self.config.encoder_hidden_size = self.encoder.config.hidden_size
         self.config.decoder_hidden_size = self.decoder.config.hidden_size
+        self.config.classification_only = classification_only
+
         self.v2l_projector = VisionLanguageProjector(self.config)
         if hasattr(self, "enc_to_dec_proj"):
             del self.enc_to_dec_proj  # 移除投影层
+
+        if self.config.classification_only:
+            del self.decoder  # 移除语言解码器
+            del self.v2l_projector  # 移除图像到语言的投影层
 
         self.config.num_obs_embeddings = num_observations
         self.config.num_classes = num_cls_labels
@@ -410,6 +416,18 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                     decoder_extra_outputs["cls_logits"] = cls_logits
                 else:
                     decoder_extra_outputs["cls_logits"] = classifier_outputs.logits  # torch.Size([2, num_obs, 3])；
+
+            # 如果是 classification_only 模式，则只返回分类器的输出就可以结束，后面的组件已经被移除
+            if self.config.classification_only:
+                return Vision2LanguageOutputWithPast(
+                    loss=classifier_outputs.loss,
+                    logits=classifier_outputs.logits,
+                    hidden_states=classifier_outputs.hidden_states,
+                    past_key_values=None,  # classification_only 时不需要 past_key_values
+                    image_hidden_states=None,  # 返回图像特征
+                    gen_loss=None,  # for logging purposes
+                    cls_loss=classifier_outputs.loss,  # for logging purposes
+                )
 
             # project image features
             image_features = self.v2l_projector(image_features)  # torch.Size([2, 1370, 2048])
@@ -1562,6 +1580,7 @@ def evaluate(model, target_dataloader, **kwargs):
     max_new_tokens = kwargs["max_new_tokens"]
     print_pred_per_n_steps = kwargs["print_pred_per_n_steps"]
     num_beams = kwargs["num_beams"]
+    classification_only = kwargs.get("classification_only", False)
 
     # 由于评估时间过长，pred结果将被存放到文件中，已经pred过的数据已经提前从dataset中移除
     LOGGER.info("****************************** Evaluation ******************************")
@@ -1569,90 +1588,129 @@ def evaluate(model, target_dataloader, **kwargs):
     LOGGER.info("Batch size = %d", eval_bsz)
     LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
     LOGGER.info("Max new tokens = %d, Num beams = %d", max_new_tokens, num_beams)
+    LOGGER.info("Classification only = %s", classification_only)
     tokenizer = target_dataloader.dataset.tokenizer
 
     LOGGER.info("****************************** Model Predicting ******************************")
     start = time.time()
-    # model.eval()
-    # with torch.no_grad():
-    #     for batch_idx, input_tensors_dict in enumerate(target_dataloader):
-    #         if len(input_tensors_dict["batch_data"]) == 0:
-    #             LOGGER.info("No data remain unpredicted, stop model inference")
-    #             break
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, input_tensors_dict in enumerate(target_dataloader):
+            if len(input_tensors_dict["batch_data"]) == 0:
+                LOGGER.info("No data remain unpredicted, stop model inference")
+                break
 
-    #         input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, **input_tensors_dict)
+            input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, **input_tensors_dict)
 
-    #         data_ids = input_tensors_dict["data_id_list"]
-    #         pred_labels, gold_labels, pred_text, gold_text = [], [], [], []
+            data_ids = input_tensors_dict["data_id_list"]
+            pred_labels, gold_labels, pred_text, gold_text = [], [], [], []
 
-    #         with ACCELERATOR.autocast():
-    #             # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
-    #             # 防重复设置
-    #             generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=num_beams, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
-    #             # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
-    #             # If the model is an encoder-decoder model, encoder specific kwargs should not be prefixed and forward specific kwargs should be prefixed with decoder_.
-    #             outputs, extra_outputs = model.generate(
-    #                 generation_config=generation_config,
-    #                 inputs=input_tensors_dict["pixel_values"],
-    #                 decoder_input_ids=input_tensors_dict["decoder_input_ids"],
-    #                 decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
-    #                 decoder_extra_inputs={
-    #                     "image_indices_map": input_tensors_dict["image_indices_map"],
-    #                     "obs_ids": input_tensors_dict["obs_ids"],
-    #                     "num_beams": num_beams,
-    #                 },
-    #                 decoder_extra_outputs={"cls_logits": None},
-    #             )
-    #             check_memory(show_only_if_peak=True)
+            if classification_only:
+                with ACCELERATOR.autocast():
+                    outputs = model.forward(
+                        pixel_values=input_tensors_dict["pixel_values"],
+                        decoder_input_ids=input_tensors_dict["decoder_input_ids"],
+                        decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
+                        decoder_extra_inputs={
+                            "image_indices_map": input_tensors_dict["image_indices_map"],
+                            "obs_ids": input_tensors_dict["obs_ids"],
+                        },
+                        output_loss=True,
+                    )
+                pred_obs_logits = outputs.logits  # torch.Size([bsz, num_obs, 3])
+                pred_obs_labels = pred_obs_logits.argmax(dim=-1)
+                pred_label_ids = pred_obs_labels.tolist()
+                gold_label_ids = input_tensors_dict["obs_labels"].tolist()
 
-    #         pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
-    #         pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
-    #         pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
+                assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
 
-    #         pred_obs_logits = extra_outputs["cls_logits"]  # torch.Size([bsz, num_obs, 3])
-    #         pred_obs_labels = pred_obs_logits.argmax(dim=-1)
+                for i in range(len(pred_label_ids)):
+                    pred_labels_inbatch, gold_labels_inbatch = {}, {}
+                    for obs_id, pred_label_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), pred_label_ids[i], gold_label_ids[i]):
+                        obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
+                        pred_cls_label = GLOBAL_VARS.obs_id2cls_dict[pred_label_id]
+                        gold_cls_label = GLOBAL_VARS.obs_id2cls_dict[gold_label_id]
+                        pred_labels_inbatch[obs_name] = pred_cls_label
+                        gold_labels_inbatch[obs_name] = gold_cls_label
+                    pred_labels.append(pred_labels_inbatch)
+                    gold_labels.append(gold_labels_inbatch)
 
-    #         # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
-    #         # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
-    #         pred_text = pred_sequences
-    #         gold_text = input_tensors_dict["gold_text_list"]
-    #         pred_label_ids = pred_obs_labels.tolist()
-    #         gold_label_ids = input_tensors_dict["obs_labels"].tolist()
+                if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
+                    LOGGER.info(
+                        "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example: \n[obs_label] %s",
+                        ACCELERATOR.process_index,
+                        batch_idx,
+                        batch_idx * eval_bsz,
+                        {k: v for k, v in pred_labels[0].items() if v != ""},
+                        main_process_only=False,
+                    )
+            else:
+                with ACCELERATOR.autocast():
+                    # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationConfig
+                    # 防重复设置
+                    generation_config = GenerationConfig(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id, bos_token_id=tokenizer.bos_token_id, eos_token_id=[tokenizer.eos_token_id, GLOBAL_VARS.eot_token_id], do_sample=False, num_beams=num_beams, return_dict_in_generate=True, output_logits=True, no_repeat_ngram_size=4, temperature=0.9, top_k=50, top_p=0.9)
+                    # https://huggingface.co/docs/transformers/v4.51.1/en/main_classes/text_generation#transformers.GenerationMixin
+                    # If the model is an encoder-decoder model, encoder specific kwargs should not be prefixed and forward specific kwargs should be prefixed with decoder_.
+                    outputs, extra_outputs = model.generate(
+                        generation_config=generation_config,
+                        inputs=input_tensors_dict["pixel_values"],
+                        decoder_input_ids=input_tensors_dict["decoder_input_ids"],
+                        decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
+                        decoder_extra_inputs={
+                            "image_indices_map": input_tensors_dict["image_indices_map"],
+                            "obs_ids": input_tensors_dict["obs_ids"],
+                            "num_beams": num_beams,
+                        },
+                        decoder_extra_outputs={"cls_logits": None},
+                    )
+                    check_memory(show_only_if_peak=True)
 
-    #         assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
-    #         for i in range(len(pred_label_ids)):
-    #             pred_labels_inbatch, gold_labels_inbatch = {}, {}
-    #             for obs_id, pred_label_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), pred_label_ids[i], gold_label_ids[i]):
-    #                 obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
-    #                 pred_cls_label = GLOBAL_VARS.obs_id2cls_dict[pred_label_id]
-    #                 gold_cls_label = GLOBAL_VARS.obs_id2cls_dict[gold_label_id]
-    #                 pred_labels_inbatch[obs_name] = pred_cls_label
-    #                 gold_labels_inbatch[obs_name] = gold_cls_label
-    #             pred_labels.append(pred_labels_inbatch)
-    #             gold_labels.append(gold_labels_inbatch)
+                pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
+                pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
+                pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
 
-    #         if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
-    #             LOGGER.info(
-    #                 "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example: \n[text]: %s \n[obs_label] %s",
-    #                 ACCELERATOR.process_index,
-    #                 batch_idx,
-    #                 batch_idx * eval_bsz,
-    #                 pred_sequences[0],
-    #                 {k: v for k, v in pred_labels[0].items() if v != ""},
-    #                 main_process_only=False,
-    #             )
+                pred_obs_logits = extra_outputs["cls_logits"]  # torch.Size([bsz, num_obs, 3])
+                pred_obs_labels = pred_obs_logits.argmax(dim=-1)
 
-    #         data_ids = input_tensors_dict["data_id_list"]
+                # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
+                # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
+                pred_text = pred_sequences
+                gold_text = input_tensors_dict["gold_text_list"]
+                pred_label_ids = pred_obs_labels.tolist()
+                gold_label_ids = input_tensors_dict["obs_labels"].tolist()
 
-    #         save_pred_results_per_batch(
-    #             data_ids=data_ids,
-    #             pred_text=pred_text,
-    #             pred_labels=pred_labels,
-    #             gold_text=gold_text,
-    #             gold_labels=gold_labels,
-    #             data_split=target_dataloader.dataset.split,
-    #             output_dir=CONFIG["output_dir"]["result"],
-    #         )
+                assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
+                for i in range(len(pred_label_ids)):
+                    pred_labels_inbatch, gold_labels_inbatch = {}, {}
+                    for obs_id, pred_label_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), pred_label_ids[i], gold_label_ids[i]):
+                        obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
+                        pred_cls_label = GLOBAL_VARS.obs_id2cls_dict[pred_label_id]
+                        gold_cls_label = GLOBAL_VARS.obs_id2cls_dict[gold_label_id]
+                        pred_labels_inbatch[obs_name] = pred_cls_label
+                        gold_labels_inbatch[obs_name] = gold_cls_label
+                    pred_labels.append(pred_labels_inbatch)
+                    gold_labels.append(gold_labels_inbatch)
+
+                if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
+                    LOGGER.info(
+                        "Eval at: p=%s, iter=%d, finished_samples=%s, pred_example: \n[text]: %s \n[obs_label] %s",
+                        ACCELERATOR.process_index,
+                        batch_idx,
+                        batch_idx * eval_bsz,
+                        pred_sequences[0],
+                        {k: v for k, v in pred_labels[0].items() if v != ""},
+                        main_process_only=False,
+                    )
+
+            save_pred_results_per_batch(
+                data_ids=data_ids,
+                pred_text=pred_text,
+                pred_labels=pred_labels,
+                gold_text=gold_text,
+                gold_labels=gold_labels,
+                data_split=target_dataloader.dataset.split,
+                output_dir=CONFIG["output_dir"]["result"],
+            )
 
     LOGGER.info("****************************** Computing Scores ******************************")
     pred_result_dict = load_pred_results(intput_dir=CONFIG["output_dir"]["result"], split=target_dataloader.dataset.split)
@@ -1662,17 +1720,17 @@ def evaluate(model, target_dataloader, **kwargs):
     gold_text = [item["gold_text"] for item in pred_result_dict.values()]
     gold_labels = [item["gold_label"] for item in pred_result_dict.values()]
 
-    label_scores_dict = compute_multilabel_multiclass_scores(gold_labels_list=gold_labels, pred_labels_list=pred_labels, obs_names=list(GLOBAL_VARS.obs_name2id_dict.keys()), obs_labels=list(GLOBAL_VARS.obs_cls2id_dict.keys()))
-    LOGGER.info("[ClsPred]: %s", json.dumps(label_scores_dict, indent=4))
-
     # Evaluate text results
-    text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
-    LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict, indent=4))
+    if not classification_only:
+        text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
+        LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict, indent=4))
+
+    label_scores_dict = compute_multilabel_multiclass_scores(gold_labels_list=gold_labels, pred_labels_list=pred_labels, obs_names=list(GLOBAL_VARS.obs_name2id_dict.keys()), obs_labels=list(GLOBAL_VARS.obs_cls2id_dict.keys()))
+    LOGGER.info("[ClsPred]: %s", custom_dumps(label_scores_dict, max_indent_level=2, indent=4))
 
     end = time.time()
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
     check_memory()
-    return text_scores_dict
 
 
 def save_pred_results_per_batch(data_ids, pred_text, pred_labels, gold_text, gold_labels, data_split, output_dir):
@@ -1690,7 +1748,7 @@ def save_pred_results_per_batch(data_ids, pred_text, pred_labels, gold_text, gol
 
 
 def load_pred_results(intput_dir, split):
-    data_dict = {}  # key=data_id, value={"data_id": , "pred_text": , "pred_graph": , "gold_text": , "gold_graph": }
+    data_dict = {}  # key=data_id, value={"data_id": , "pred_text": , "gold_text": ,...}
 
     # 遍历目录中的所有文件
     for filename in os.listdir(intput_dir):
@@ -1717,7 +1775,7 @@ def load_pred_results(intput_dir, split):
     return data_dict
 
 
-def compute_multilabel_multiclass_scores(gold_labels_list, pred_labels_list, obs_names, obs_labels):
+def compute_multilabel_multiclass_scores(gold_labels_list, pred_labels_list, obs_names, obs_labels, round_digits=5):
     assert len(gold_labels_list) == len(pred_labels_list), "Mismatched number of samples"
 
     scores = {"overall": {}}  # 让 overall 排在最前面，便于log打印观察
@@ -1763,9 +1821,9 @@ def compute_multilabel_multiclass_scores(gold_labels_list, pred_labels_list, obs
             r = tp[label] / (tp[label] + fn[label]) if (tp[label] + fn[label]) > 0 else 0.0
             f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
             obs_result[label] = {
-                "precision": round(p, 4),
-                "recall": round(r, 4),
-                "f1": round(f1, 4),
+                "precision": round(p, round_digits),
+                "recall": round(r, round_digits),
+                "f1": round(f1, round_digits),
                 "tp": tp[label],
                 "fp": fp[label],
                 "fn": fn[label],
@@ -1785,14 +1843,14 @@ def compute_multilabel_multiclass_scores(gold_labels_list, pred_labels_list, obs
         scores[obs] = {
             "per_class": obs_result,
             "micro": {
-                "precision": round(micro_p, 4),
-                "recall": round(micro_r, 4),
-                "f1": round(micro_f1, 4),
+                "precision": round(micro_p, round_digits),
+                "recall": round(micro_r, round_digits),
+                "f1": round(micro_f1, round_digits),
             },
             "macro": {
-                "precision": round(sum(obs_p_list) / len(obs_p_list), 4),
-                "recall": round(sum(obs_r_list) / len(obs_r_list), 4),
-                "f1": round(sum(obs_f1_list) / len(obs_f1_list), 4),
+                "precision": round(sum(obs_p_list) / len(obs_p_list), round_digits),
+                "recall": round(sum(obs_r_list) / len(obs_r_list), round_digits),
+                "f1": round(sum(obs_f1_list) / len(obs_f1_list), round_digits),
             },
         }
 
@@ -1815,14 +1873,14 @@ def compute_multilabel_multiclass_scores(gold_labels_list, pred_labels_list, obs
 
     scores["overall"] = {
         "micro": {
-            "precision": round(overall_micro_p, 4),
-            "recall": round(overall_micro_r, 4),
-            "f1": round(overall_micro_f1, 4),
+            "precision": round(overall_micro_p, round_digits),
+            "recall": round(overall_micro_r, round_digits),
+            "f1": round(overall_micro_f1, round_digits),
         },
         "macro": {
-            "precision": round(overall_macro_p, 4),
-            "recall": round(overall_macro_r, 4),
-            "f1": round(overall_macro_f1, 4),
+            "precision": round(overall_macro_p, round_digits),
+            "recall": round(overall_macro_r, round_digits),
+            "f1": round(overall_macro_f1, round_digits),
         },
     }
 
@@ -1843,6 +1901,28 @@ def compute_generation_score(gold_text_list, pred_text_list):
     out_dict = compute_scores(use_metrics, refs=refs, hyps=hyps, split=None, seed=None, config=None, epoch=None, logger=LOGGER, dump=False)
     out_dict = {k: float(v) for k, v in out_dict.items()}
     return out_dict
+
+
+import json
+
+
+def custom_dumps(obj, level=0, max_indent_level=2, indent=4):
+    if isinstance(obj, dict):
+        if level >= max_indent_level:
+            return json.dumps(obj, separators=(",", ":"))
+        items = []
+        for key, value in obj.items():
+            items.append(" " * indent * (level + 1) + json.dumps(key) + ": " + custom_dumps(value, level + 1, max_indent_level, indent))
+        return "{\n" + ",\n".join(items) + "\n" + " " * indent * level + "}"
+    elif isinstance(obj, list):
+        if level >= max_indent_level:
+            return json.dumps(obj, separators=(",", ":"))
+        items = []
+        for value in obj:
+            items.append(" " * indent * (level + 1) + custom_dumps(value, level + 1, max_indent_level, indent))
+        return "[\n" + ",\n".join(items) + "\n" + " " * indent * level + "]"
+    else:
+        return json.dumps(obj)
 
 
 #############################################
@@ -2314,6 +2394,7 @@ def init_model(vision_model_path, language_model_path, model_base_cfg):
         decoder_pretrained_model_name_or_path=language_model_path,
         num_observations=len(GLOBAL_VARS.obs_map_dict),
         num_cls_labels=len(GLOBAL_VARS.cls_map_dict),
+        classification_only=model_base_cfg["classification_only"],
     )
     LOGGER.info("Initialized vision language mode from: \n%s\n%s", vision_model_path, language_model_path)
     return model

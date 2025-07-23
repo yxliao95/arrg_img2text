@@ -51,6 +51,9 @@ model:
   classifier_dropout: 0.1
 
 pretrain:
+  # if classification_only=True, the language decoder and v2l_projector will be removed from pretraining.
+  classification_only: True
+
   seed: 42
   num_epochs: 1
   batch_size: 2
