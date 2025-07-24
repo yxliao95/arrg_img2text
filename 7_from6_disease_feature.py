@@ -156,7 +156,7 @@ class VisionClassifier(nn.Module):
         super().__init__()
 
         # 可学习的标签嵌入（每个标签一个向量）
-        self.obs_embeddings = nn.Embedding(config.num_obs_embeddings, config.encoder_hidden_size)
+        self.obs_embeddings = nn.Embedding(config.num_observations, config.encoder_hidden_size)
 
         # 注意力模块（标签为 query，图像为 key 和 value）
         self.attn = nn.MultiheadAttention(embed_dim=config.encoder_hidden_size, num_heads=8, batch_first=True)
@@ -165,7 +165,7 @@ class VisionClassifier(nn.Module):
         self.hidden_proj = nn.Linear(config.encoder_hidden_size, config.decoder_hidden_size)
 
         # 分类器：对每个标签嵌入进行分类
-        self.classifier = nn.Linear(config.decoder_hidden_size, config.num_classes)
+        self.classifier = nn.Linear(config.decoder_hidden_size, config.num_cls_labels)
 
     def merge_obs_tensor_by_indices(self, obs_tensor, image_indices_map, mean_pooling=False):
         """
@@ -258,20 +258,18 @@ class VisionClassifier(nn.Module):
 
 
 class Vision2LanguageModel(VisionEncoderDecoderModel):
-    def __init__(self, config=None, encoder=None, decoder=None, num_observations=42, num_cls_labels=3, classification_only=False):
-
+    def __init__(self, config=None, encoder=None, decoder=None):
+        # 通过 from_encoder_decoder_pretrained 加载模型时的额外传入参数都会被加入到config中
         super().__init__(config=config, encoder=encoder, decoder=decoder)
         # replace enc_to_dec_proj with VisionLanguageProjector
         self.config.encoder_hidden_size = self.encoder.config.hidden_size
         self.config.decoder_hidden_size = self.decoder.config.hidden_size
-        self.config.classification_only = classification_only
+        assert "classification_only" in config, "config should have 'classification_only' key"
 
         self.v2l_projector = VisionLanguageProjector(self.config)
         if hasattr(self, "enc_to_dec_proj"):
             del self.enc_to_dec_proj  # 移除投影层
 
-        self.config.num_obs_embeddings = num_observations
-        self.config.num_classes = num_cls_labels
         self.obs_classifier = VisionClassifier(self.config)
 
     def _expand_image_indices_map_generation(self, image_indices_map, expand_size):
@@ -1370,7 +1368,10 @@ def train(model, train_dataloader, train_cfg):
                 optimizer.zero_grad()
 
                 check_memory(show_only_if_peak=True)
-                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["decoder_input_ids"].size(0), lr=scheduler.get_last_lr()[0], train_cfg=train_cfg, gen_loss=out.gen_loss.item(), cls_loss=out.cls_loss.item())
+
+                gen_loss = out.gen_loss.item() if out.gen_loss is not None else 0.0
+                cls_loss = out.cls_loss.item() if out.cls_loss is not None else 0.0
+                log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["decoder_input_ids"].size(0), lr=scheduler.get_last_lr()[0], train_cfg=train_cfg, gen_loss=gen_loss, cls_loss=cls_loss)
 
                 # we dont do validation, as it cost too much time
                 check_and_save_checkpoint(max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
@@ -1620,7 +1621,7 @@ def evaluate(model, target_dataloader, **kwargs):
                 pred_label_ids = pred_obs_labels.tolist()
                 gold_label_ids = input_tensors_dict["obs_labels"].tolist()
 
-                assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
+                assert len(pred_label_ids) == len(gold_label_ids), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}]"
 
                 for i in range(len(pred_label_ids)):
                     pred_labels_inbatch, gold_labels_inbatch = {}, {}
@@ -1678,6 +1679,7 @@ def evaluate(model, target_dataloader, **kwargs):
                 gold_label_ids = input_tensors_dict["obs_labels"].tolist()
 
                 assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
+
                 for i in range(len(pred_label_ids)):
                     pred_labels_inbatch, gold_labels_inbatch = {}, {}
                     for obs_id, pred_label_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), pred_label_ids[i], gold_label_ids[i]):
@@ -1734,7 +1736,10 @@ def evaluate(model, target_dataloader, **kwargs):
 def save_pred_results_per_batch(data_ids, pred_text, pred_labels, gold_text, gold_labels, data_split, output_dir):
     """Save at each batch, so that we can use the results for further analysis or debugging."""
 
-    assert len(data_ids) == len(pred_text) == len(pred_labels) == len(gold_text) == len(gold_labels), f"All lists must have the same length: [data_ids: {len(data_ids)}, pred_text: {len(pred_text)}, pred_labels: {len(pred_labels)}, gold_text: {len(gold_text)}, gold_labels: {len(gold_labels)}]"
+    if len(pred_text) != 0:
+        assert len(data_ids) == len(pred_labels) == len(gold_labels) == len(gold_text) == len(pred_text), f"All lists must have the same length: [data_ids: {len(data_ids)}, pred_text: {len(pred_text)}, pred_labels: {len(pred_labels)}, gold_text: {len(gold_text)}, gold_labels: {len(gold_labels)}]"
+    else:
+        assert len(data_ids) == len(pred_labels) == len(gold_labels), f"All lists must have the same length: [data_ids: {len(data_ids)}, pred_labels: {len(pred_labels)}, gold_labels: {len(gold_labels)}]"
 
     output_file = os.path.join(output_dir, f"{data_split}_{ACCELERATOR.process_index}.json")
 
@@ -2206,20 +2211,20 @@ def load_peft_model(base_model, peft_model_path):
     return peft_model
 
 
-def load_module_state_dict_from(model_path, target_module_prefix):
+def load_module_state_dict_from(model_path, target_module_prefixs):
     index_file_path = os.path.join(model_path, "model.safetensors.index.json")
     with open(index_file_path, "r", encoding="utf-8") as f:
         sd_index = json.load(f)
 
     target_model_file_paths = set()
     for key, file_name in sd_index["weight_map"].items():
-        if key.startswith(target_module_prefix):
+        if any(key.startswith(prefix) for prefix in target_module_prefixs):
             target_model_file_paths.add(os.path.join(model_path, file_name))
 
     target_state_dict = {}
     for model_file_path in target_model_file_paths:
         for name, param in load_file(model_file_path).items():
-            if name.startswith(target_module_prefix):
+            if any(name.startswith(prefix) for prefix in target_module_prefixs):
                 target_state_dict[name] = param
 
     LOGGER.info("Loaded pretrained params: [%s] from: \n%s", target_state_dict.keys(), model_path)
@@ -2325,13 +2330,13 @@ def load_dataset(ds_img_path, ds_graph_path, target_section):
     # ds_graph 是纯文本数据集，是对应特定 target_section，即findings 或impression
 
     # TODO 在linux上debug时，加载原始图像数据集
-    # ds_img = load_image_datasets(data_paths=CONFIG["data_path"])
-    # for data_split in ["train", "validation", "test"]:
-    #     img_dataset = ds_img[data_split]
-    #     img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}" for idx in range(len(img_dataset))])
-    #     ds_img[data_split] = img_dataset
+    ds_img = load_image_datasets(data_paths=CONFIG["data_path"])
+    for data_split in ["train", "validation", "test"]:
+        img_dataset = ds_img[data_split]
+        img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}" for idx in range(len(img_dataset))])
+        ds_img[data_split] = img_dataset
 
-    ds_img = load_from_disk(ds_img_path)
+    # ds_img = load_from_disk(ds_img_path)
     LOGGER.info("Loaded pre_processed image dataset from: \n%s \n%s", ds_img_path, ds_img)
     ds_graph_path = os.path.join(ds_graph_path, f"interpret_disease_{target_section}")
     ds_graph = load_from_disk(ds_graph_path)
@@ -2373,19 +2378,21 @@ def post_init_model_and_tokenizer(model, tokenizer):
     GLOBAL_VARS.num_image_tokens = num_image_tokens
 
 
-def init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector"):
+def init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefixs=["v2l_projector"]):
     # 重新初始化模型，在后续再单独加载预训练的 img_projector，避免OOM的问题（不知道为什么会出现这个问题）
     base_model = init_model(vision_model_path, language_model_path, model_base_cfg)
     # Load only img_projector state_dict to the base model
     # 如果直接加载整个 pre_trained 模型，会导致训练时OOM，但只加载 img_projector 到base_model则不会
     # 有点担心的是 decoder embedding 重新初始化，是否会导致其与 img_projector 的不匹配
-    target_state_dict = load_module_state_dict_from(model_path=pretain_model_path, target_module_prefix=target_module_prefix)
+    target_state_dict = load_module_state_dict_from(model_path=pretain_model_path, target_module_prefixs=target_module_prefixs)
     model = load_state_dict_to_model(base_model=base_model, target_state_dict=target_state_dict)
-    LOGGER.info("Initialized model with pretrained weights %s", target_module_prefix)
+    LOGGER.info("Initialized model with pretrained weights: %s", target_module_prefixs)
     return model
 
 
 def init_model(vision_model_path, language_model_path, model_base_cfg, classification_only=False):
+    # cls(encoder=encoder, decoder=decoder, config=config)，
+    # 使用 from_encoder_decoder_pretrained 方法初始化模型时，额外的方法参数会被加入到init的config里，不需要额外定义
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(
         encoder_pretrained_model_name_or_path=vision_model_path,
         decoder_pretrained_model_name_or_path=language_model_path,
@@ -2744,7 +2751,11 @@ def finetune_model(train_cfg):
     ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
 
     if train_cfg["use_pretrained"]:
-        model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
+        if CONFIG["pretrain"]["classification_only"]:
+            target_module_prefixs = ["obs_classifier"]
+        else:
+            target_module_prefixs = ["v2l_projector", "obs_classifier"]
+        model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefixs=target_module_prefixs)
         img_processor, tokenizer = load_processor(pretain_model_path)
     else:
         model = init_model(vision_model_path, language_model_path, model_base_cfg)
@@ -2782,7 +2793,11 @@ def eval_finetuned_model(train_cfg):
     ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
 
     if train_cfg["use_pretrained"]:
-        model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefix="v2l_projector")
+        if CONFIG["pretrain"]["classification_only"]:
+            target_module_prefixs = ["obs_classifier"]
+        else:
+            target_module_prefixs = ["v2l_projector", "obs_classifier"]
+        model = init_model_with_pretrained_weights(model_base_cfg, vision_model_path, language_model_path, pretain_model_path, target_module_prefixs=target_module_prefixs)
         img_processor, tokenizer = load_processor(pretain_model_path)
     else:
         model = init_model(vision_model_path, language_model_path, model_base_cfg)

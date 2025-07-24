@@ -33,7 +33,7 @@ model_name_or_path:
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 use_debug_subset: True
-run_mode: "eval_pretrained" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+run_mode: "finetune" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 preprocess:
   image_processor: rad_dino_maira2
@@ -76,8 +76,8 @@ pretrain:
 finetune:
   # if use pretrained=True, then load the pretrained img_projector weights from path,
   # else init the img_projector with random weights
-  use_pretrained: False
-  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/4_1_fsdo_peft_test_pretrain
+  use_pretrained: True
+  pretain_model_path: /home/yuxiang/liao/workspace/arrg_img2text/outputs/models/test_000
 
   seed: 42
   num_epochs: 1
