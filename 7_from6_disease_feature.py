@@ -270,10 +270,6 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         if hasattr(self, "enc_to_dec_proj"):
             del self.enc_to_dec_proj  # 移除投影层
 
-        if self.config.classification_only:
-            del self.decoder  # 移除语言解码器
-            del self.v2l_projector  # 移除图像到语言的投影层
-
         self.config.num_obs_embeddings = num_observations
         self.config.num_classes = num_cls_labels
         self.obs_classifier = VisionClassifier(self.config)
@@ -1325,6 +1321,7 @@ def train(model, train_dataloader, train_cfg):
     LOGGER.info("Total optimization steps = %d", total_num_steps)
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
     LOGGER.info("Accelerator mixed_precision = %s", ACCELERATOR.mixed_precision)
+    LOGGER.info("Classification only = %s", train_cfg["classification_only"])
     check_memory()
 
     model.zero_grad()
@@ -1613,6 +1610,7 @@ def evaluate(model, target_dataloader, **kwargs):
                         decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
                         decoder_extra_inputs={
                             "image_indices_map": input_tensors_dict["image_indices_map"],
+                            "obs_labels": input_tensors_dict["obs_labels"],
                             "obs_ids": input_tensors_dict["obs_ids"],
                         },
                         output_loss=True,
@@ -2326,15 +2324,14 @@ def load_dataset(ds_img_path, ds_graph_path, target_section):
     # ds_img 是 image + report 数据集，report 包含 findings和impression
     # ds_graph 是纯文本数据集，是对应特定 target_section，即findings 或impression
 
-    # TODO
-    ds_img = load_image_datasets(data_paths=CONFIG["data_path"])
-    for data_split in ["train", "validation", "test"]:
-        img_dataset = ds_img[data_split]
-        img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}" for idx in range(len(img_dataset))])
-        ds_img[data_split] = img_dataset
+    # TODO 在linux上debug时，加载原始图像数据集
+    # ds_img = load_image_datasets(data_paths=CONFIG["data_path"])
+    # for data_split in ["train", "validation", "test"]:
+    #     img_dataset = ds_img[data_split]
+    #     img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}" for idx in range(len(img_dataset))])
+    #     ds_img[data_split] = img_dataset
 
-    # ds_img = load_from_disk(ds_img_path)
-
+    ds_img = load_from_disk(ds_img_path)
     LOGGER.info("Loaded pre_processed image dataset from: \n%s \n%s", ds_img_path, ds_img)
     ds_graph_path = os.path.join(ds_graph_path, f"interpret_disease_{target_section}")
     ds_graph = load_from_disk(ds_graph_path)
@@ -2388,13 +2385,13 @@ def init_model_with_pretrained_weights(model_base_cfg, vision_model_path, langua
     return model
 
 
-def init_model(vision_model_path, language_model_path, model_base_cfg):
+def init_model(vision_model_path, language_model_path, model_base_cfg, classification_only=False):
     model = Vision2LanguageModel.from_encoder_decoder_pretrained(
         encoder_pretrained_model_name_or_path=vision_model_path,
         decoder_pretrained_model_name_or_path=language_model_path,
-        num_observations=len(GLOBAL_VARS.obs_map_dict),
-        num_cls_labels=len(GLOBAL_VARS.cls_map_dict),
-        classification_only=model_base_cfg["classification_only"],
+        num_observations=len(GLOBAL_VARS.obs_id2name_dict),
+        num_cls_labels=len(GLOBAL_VARS.obs_cls2id_dict),
+        classification_only=classification_only,
     )
     LOGGER.info("Initialized vision language mode from: \n%s\n%s", vision_model_path, language_model_path)
     return model
@@ -2592,7 +2589,7 @@ def global_init_proj_config():
     parser.add_argument("--mlflow_port", type=str, default=None)
 
     parser.add_argument("--target_observation", type=str, default=None, help="A string representation of a list, e.g. \"['effusion', 'pneumothorax']\"")
-    parser.add_argument("--use_text_only", action="store_true", default=None)
+    parser.add_argument("--classification_only", action="store_true", default=None)
 
     parser.add_argument("--num_epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -2622,8 +2619,8 @@ def global_init_proj_config():
         if args.mlflow_port:
             CONFIG["mlflow_port"] = args.mlflow_port
 
-        if args.use_text_only:
-            CONFIG["use_text_only"] = True
+        if args.classification_only:
+            CONFIG["classification_only"] = True
 
         if args.target_observation:
             CONFIG["target_observation"] = ast.literal_eval(args.target_observation)
@@ -2681,7 +2678,7 @@ def pretrain_model(model_base_cfg, train_cfg):
     set_seed(train_cfg["seed"])
     ds_final = load_dataset(ds_img_path=CONFIG["preprocess"]["cache_path"], ds_graph_path=CONFIG["data_path"]["text_graph"], target_section=CONFIG["target_section"])
 
-    model = init_model(vision_model_path, language_model_path, model_base_cfg)
+    model = init_model(vision_model_path, language_model_path, model_base_cfg, classification_only=train_cfg["classification_only"])
     img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
 
     post_init_model_and_tokenizer(model, tokenizer)

@@ -33,7 +33,7 @@ conda activate $env
 echo "Loaded $conda, env: $env"
 nvcc -V
 
-python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Start: $SLURM_JOB_NAME"
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Sunbird Start】: $SLURM_JOB_NAME"
 
 nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
 echo "MLflow server started"
@@ -88,7 +88,7 @@ else
   done
 fi
 
-python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "Sunbird Done: $SLURM_JOB_NAME"
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【unbird Done】: $SLURM_JOB_NAME"
 
 # sbatch /scratch/c.c21051562/workspace/arrg_img2text/scripts/run_finetune2.sh
 # scontrol show job JOBID
