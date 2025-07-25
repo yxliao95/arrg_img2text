@@ -15,7 +15,7 @@ data_path:
 
 target_section: findings
 # ['effusion', 'pneumothorax', 'opacity', 'normal', 'consolidation', 'edema', 'atelectasis', 'tube', 'clear', 'catheter', 'pneumonia', 'infiltrate', 'pathophysiologic finding', 'infection', 'congestion', 'enlargement', 'wire', 'degeneration', 'fracture', 'thickening', 'pacemaker', 'emphysema', 'surgical drain', 'surgical clip', 'medical device', 'scoliosis', 'valve', 'chronic obstructive pulmonary disease', 'calcification', 'cirrhosis-associated nodules', 'atherosclerosis', 'calcifications', 'deformity', 'hernia', 'scar', 'pulmonary nodule', 'granuloma', 'automated implantable cardiac defibrillator', 'prosthesis', 'collapse', 'reticular pattern', 'heart failure']
-target_observation: ["effusion", "pneumothorax", "opacity", "normal"]
+target_observation: ["effusion"]
 
 model_name_or_path:
   clip: /scratch/c.c21051562/resources/downloaded_models/clip-vit-base-patch32

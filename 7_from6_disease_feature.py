@@ -1296,7 +1296,7 @@ def train(model, train_dataloader, train_cfg):
     # hyperparameters
     model_params = list(model.named_parameters())
     optimizer_grouped_parameters = prepare_optimizer_grouped_parameters(model_params, train_cfg)
-    # LOGGER.debug("Model trainable params:\n%s", "\n".join([n for n, p in model.named_parameters() if p.requires_grad]))
+    LOGGER.info("Model trainable params:\n%s", "\n".join([n for n, p in model.named_parameters() if p.requires_grad]))
 
     optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
     total_num_steps = len(train_dataloader) // train_cfg["grad_accum_steps"] * train_cfg["num_epochs"]
@@ -1395,13 +1395,13 @@ def prepare_optimizer_grouped_parameters(model_params, train_cfg):
         assert encoder_params and decoder_params and adaptor_params and classifier_params
 
         # 冻结 encoder, decoder，训练 v2l_projector
-        for n, p in encoder_params + decoder_params:
+        for n, p in decoder_params:
             p.requires_grad = False
-        for n, p in adaptor_params + classifier_params:
+        for n, p in encoder_params + adaptor_params + classifier_params:
             p.requires_grad = True
 
         # no_decay_names = ["bias", "norm1.weight", "norm2.weight", "layernorm.weight", "layer_scale"]
-        optimizer_grouped_parameters.append({"params": [p for n, p in adaptor_params], "lr": train_cfg["lr"], "weight_decay": 0.0})
+        optimizer_grouped_parameters.append({"params": [p for n, p in model_params if p.requires_grad], "lr": train_cfg["lr"], "weight_decay": 0.0})
 
     elif CONFIG["run_mode"] == "finetune":
         # When using peft, params requires_grad are set during initialization of PeftModel. See `apply_peft_to_model()`.
@@ -1482,6 +1482,7 @@ def log_and_update_status(curr_epoch, curr_iter, loss, bsz, lr, train_cfg, gen_l
             main_process_only=True,
         )
         STATUS_INFO.batch_loss, STATUS_INFO.batch_trained_examples = 0, 0
+        STATUS_INFO.batch_gen_loss, STATUS_INFO.batch_cls_loss = 0, 0
         STATUS_INFO.train_print_loss_mark = STATUS_INFO.global_update_steps
 
 
@@ -2330,13 +2331,13 @@ def load_dataset(ds_img_path, ds_graph_path, target_section):
     # ds_graph 是纯文本数据集，是对应特定 target_section，即findings 或impression
 
     # TODO 在linux上debug时，加载原始图像数据集
-    ds_img = load_image_datasets(data_paths=CONFIG["data_path"])
-    for data_split in ["train", "validation", "test"]:
-        img_dataset = ds_img[data_split]
-        img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}" for idx in range(len(img_dataset))])
-        ds_img[data_split] = img_dataset
+    # ds_img = load_image_datasets(data_paths=CONFIG["data_path"])
+    # for data_split in ["train", "validation", "test"]:
+    #     img_dataset = ds_img[data_split]
+    #     img_dataset = img_dataset.add_column("data_key", [f"{data_split}#{idx}" for idx in range(len(img_dataset))])
+    #     ds_img[data_split] = img_dataset
 
-    # ds_img = load_from_disk(ds_img_path)
+    ds_img = load_from_disk(ds_img_path)
     LOGGER.info("Loaded pre_processed image dataset from: \n%s \n%s", ds_img_path, ds_img)
     ds_graph_path = os.path.join(ds_graph_path, f"interpret_disease_{target_section}")
     ds_graph = load_from_disk(ds_graph_path)
