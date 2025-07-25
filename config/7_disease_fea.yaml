@@ -33,7 +33,7 @@ model_name_or_path:
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 use_debug_subset: True
-run_mode: "finetune" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+run_mode: "eval_pretrained" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 preprocess:
   image_processor: rad_dino_maira2
@@ -50,7 +50,8 @@ model:
   classifier_dropout: 0.1
 
 pretrain:
-  # if classification_only=True, the language decoder and v2l_projector will be removed from pretraining.
+  # 当 classification_only=True 时，使用 eval_per_steps 在 training 过程中进行验证和保存
+  # 当 classification_only=False 时，不进行验证， 使用 ckp_per_steps 保存检查点
   classification_only: True
 
   seed: 42
@@ -64,10 +65,10 @@ pretrain:
   mixed_precision: "bf16" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
   print_loss_per_n_steps: 1 # logging loss on .log file
-  # eval_per_steps: 100 # 550395 / 32 = 17199, 170801 / 8 = 21350
-  ckp_per_steps: 3 # 550395 / 32 = 17199, 170801 / 8 = 21350
+  ckp_per_steps: 1
+  eval_per_steps: 1 # 550395 / 32 = 17199, 170801 / 8 = 21350
 
-  eval_batch_size: 1
+  eval_batch_size: 2
   max_new_tokens: 4
   print_pred_per_n_steps: 1
   eval_valid_split: False

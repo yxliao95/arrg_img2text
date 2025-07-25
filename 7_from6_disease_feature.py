@@ -1183,7 +1183,7 @@ class StatusInfo:
 
     global_iters: int = field(default=0)
     global_update_steps: int = field(default=0)
-    dev_best: dict = field(default_factory=lambda: {"text_score": 0.0, "at_epoch": 0, "at_iter": 0, "check_at": ""})
+    dev_best: dict = field(default_factory=lambda: {"text_score": 0.0, "cls_score": 0.0, "sum_score": 0.0, "at_epoch": 0, "at_iter": 0, "check_at": ""})
 
     batch_loss: float = field(default=0.0)
     batch_gen_loss: float = field(default=0.0)
@@ -1195,9 +1195,19 @@ class StatusInfo:
     grad_accum_eval_mark: int = field(default=0)
     train_print_loss_mark: int = field(default=0)
 
-    def is_achieving_best_dev_score(self, text_score):
-        if text_score >= self.dev_best["text_score"]:
-            self.dev_best["text_score"] = text_score
+    def is_achieving_best_dev_score(self, text_score=None, cls_score=None):
+        sum_score = 0
+        if text_score:
+            sum_score += text_score
+            if text_score >= self.dev_best["text_score"]:
+                self.dev_best["text_score"] = text_score
+        if cls_score:
+            sum_score += cls_score
+            if cls_score >= self.dev_best["cls_score"]:
+                self.dev_best["cls_score"] = cls_score
+
+        if sum_score >= self.dev_best["sum_score"]:
+            self.dev_best["sum_score"] = sum_score
             self.dev_best["at_iter"] = self.curr_batch_iter
             self.dev_best["at_epoch"] = self.curr_epoch
             self.dev_best["check_at"] = self.curr_checkpoint_at
@@ -1290,7 +1300,7 @@ class MLflowTracker:
 #############################################
 
 
-def train(model, train_dataloader, train_cfg):
+def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_dataloader=None):
     global MLFLOW_TRACKER, STATUS_INFO
 
     # hyperparameters
@@ -1373,13 +1383,19 @@ def train(model, train_dataloader, train_cfg):
                 cls_loss = out.cls_loss.item() if out.cls_loss is not None else 0.0
                 log_and_update_status(curr_epoch=curr_epoch, curr_iter=curr_iter, loss=loss.item(), bsz=batch_inputs_dict["decoder_input_ids"].size(0), lr=scheduler.get_last_lr()[0], train_cfg=train_cfg, gen_loss=gen_loss, cls_loss=cls_loss)
 
-                # we dont do validation, as it cost too much time
-                check_and_save_checkpoint(max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
+                if model.config.classification_only:
+                    # 当 classification_only=True 时，使用 eval_per_steps 在 training 过程中进行验证和保存
+                    validation_process(model, valid_dataloader, max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
+                else:
+                    # 当 classification_only=False 时，不进行验证， 使用 ckp_per_steps 保存检查点
+                    check_and_save_checkpoint(max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
 
         end = time.time()
         LOGGER.info("Batch training time: %s ", seconds_to_time_str(end - start))
 
-    save_model(model, CONFIG["output_dir"]["model"])
+    if not model.config.classification_only:
+        # 当 classification_only=False 时，不进行验证，使用 ckp_per_steps 保存检查点，并在最后保存模型
+        save_model(model, CONFIG["output_dir"]["model"])
     MLFLOW_TRACKER.finish()
 
 
@@ -1537,7 +1553,7 @@ def validation_process(model, valid_dataloader, max_num_iters_per_epoch, train_c
 
     if do_eval:
         check_memory()
-        eval_result_dict = evaluate(model, target_dataloader=valid_dataloader)
+        eval_result_dict = evaluate(model, target_dataloader=valid_dataloader, overwrite_pred_file=True, **train_cfg)
         STATUS_INFO.grad_accum_eval_mark = STATUS_INFO.global_update_steps  # this line shoud runs before check_results_and_save_model(), to set the correct STATUS_INFO.grad_accum_eval_mark for checkpoingting
         check_results_and_save_model(model, eval_result_dict)
 
@@ -1554,25 +1570,30 @@ def check_results_and_save_model(model, eval_result_dict):
             )
             text_score += eval_result_dict[metric_key]
             num_metrics += 1
-    text_score = text_score / num_metrics
+    text_score = text_score / num_metrics if num_metrics > 0 else 0.0
+
+    cls_score = 0
+    if "overall" in eval_result_dict:
+        cls_score = eval_result_dict["overall"]["micro"]["f1"]
 
     LOGGER.info("****************************** Checkpoint ******************************")
-    LOGGER.info("Current [%s] text_avg_f1: %.3f, at epoch %d, iter %d (%s)", STATUS_INFO.curr_eval_split, text_score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_checkpoint_at)
-    LOGGER.info("Best [%s] avg-f1: %.3f, at epoch %d, iter %d", STATUS_INFO.curr_eval_split, STATUS_INFO.dev_best["text_score"] * 100, STATUS_INFO.dev_best["at_epoch"], STATUS_INFO.dev_best["at_iter"])
+    LOGGER.info("Current [%s] text_avg_f1: %.3f, cls_micro_f1: %.3f, at epoch %d, iter %d (%s)", STATUS_INFO.curr_eval_split, text_score * 100, cls_score * 100, STATUS_INFO.curr_epoch, STATUS_INFO.curr_batch_iter, STATUS_INFO.curr_checkpoint_at)
+    LOGGER.info("Best [%s] %s", STATUS_INFO.curr_eval_split, STATUS_INFO.dev_best)
     MLFLOW_TRACKER.log({f"{STATUS_INFO.curr_eval_split}_text_avg_f1": text_score}, step=STATUS_INFO.global_iters)
+    MLFLOW_TRACKER.log({f"{STATUS_INFO.curr_eval_split}_cls_avg_f1": cls_score}, step=STATUS_INFO.global_iters)
 
     # checkpointing
     save_checkpoint(checkpoint_dir=CONFIG["output_dir"]["checkpoint"])
 
     # Save the best
-    if STATUS_INFO.is_achieving_best_dev_score(text_score):
+    if STATUS_INFO.is_achieving_best_dev_score(text_score, cls_score):
         save_model(model, CONFIG["output_dir"]["model"])
 
 
 #############################################
 # Evaluation
 #############################################
-def evaluate(model, target_dataloader, **kwargs):
+def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
     GLOBAL_VARS.peak_mem = 0
 
     eval_bsz = kwargs["eval_batch_size"]
@@ -1580,6 +1601,14 @@ def evaluate(model, target_dataloader, **kwargs):
     print_pred_per_n_steps = kwargs["print_pred_per_n_steps"]
     num_beams = kwargs["num_beams"]
     classification_only = kwargs.get("classification_only", False)
+
+    if overwrite_pred_file:
+        data_split = target_dataloader.dataset.split
+        output_dir = CONFIG["output_dir"]["result"]
+        output_file = os.path.join(output_dir, f"{data_split}_{ACCELERATOR.process_index}.json")
+        if os.path.exists(output_file):
+            os.remove(output_file)
+            LOGGER.info("Removed existing prediction results file: %s", output_file)
 
     # 由于评估时间过长，pred结果将被存放到文件中，已经pred过的数据已经提前从dataset中移除
     LOGGER.info("****************************** Evaluation ******************************")
@@ -1722,6 +1751,7 @@ def evaluate(model, target_dataloader, **kwargs):
     gold_labels = [item["gold_label"] for item in pred_result_dict.values()]
 
     # Evaluate text results
+    text_scores_dict = {}
     if not classification_only:
         text_scores_dict = compute_generation_score(gold_text_list=gold_text, pred_text_list=pred_text)
         LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict, indent=4))
@@ -1732,6 +1762,7 @@ def evaluate(model, target_dataloader, **kwargs):
     end = time.time()
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
     check_memory()
+    return {**text_scores_dict, **label_scores_dict}
 
 
 def save_pred_results_per_batch(data_ids, pred_text, pred_labels, gold_text, gold_labels, data_split, output_dir):
@@ -2693,11 +2724,11 @@ def pretrain_model(model_base_cfg, train_cfg):
     global_init_accelerator(model, **train_cfg)
     check_memory()
     model.to(DEVICE)
-    train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    train_dataloader, valid_dataloader, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], ds_valid=ds_final["validation"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
     start = time.time()
-    train(model, train_dataloader, train_cfg=train_cfg)
+    train(model, train_dataloader, train_cfg=train_cfg, valid_dataloader=valid_dataloader)
     end = time.time()
     LOGGER.info("Total training time: %s", seconds_to_time_str(end - start))
 
@@ -2718,23 +2749,24 @@ def eval_pretrained_model(train_cfg):
     img_processor, tokenizer = load_processor(pretain_model_path)
     post_init_model_and_tokenizer(model, tokenizer)
     global_init_accelerator(model, **train_cfg)
-    # _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
-    train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    # TODO
+    _, valid_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    # train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
     model.to(DEVICE)
-    # model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
-    model, train_dataloader = ACCELERATOR.prepare(model, train_dataloader)
+    model, valid_dataloader, test_dataloader = ACCELERATOR.prepare(model, valid_dataloader, test_dataloader)
+    # model, train_dataloader = ACCELERATOR.prepare(model, train_dataloader)
     check_memory()
 
     start = time.time()
     start2 = start
     if train_cfg["eval_valid_split"]:
-        evaluate(model, validation_dataloader, **train_cfg)
+        evaluate(model, valid_dataloader, **train_cfg)
         start2 = time.time()
         LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
 
-    # evaluate(model, test_dataloader, **train_cfg)
-    evaluate(model, train_dataloader, **train_cfg)
+    evaluate(model, test_dataloader, **train_cfg)
+    # evaluate(model, train_dataloader, **train_cfg)
     end = time.time()
     LOGGER.info("Test time: %s", seconds_to_time_str(end - start2))
     LOGGER.info("Total evaluation time: %s", seconds_to_time_str(end - start))
@@ -2769,7 +2801,7 @@ def finetune_model(train_cfg):
     model.to(DEVICE)
 
     train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
-    # _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
+    # _, valid_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
     start = time.time()
@@ -2811,16 +2843,16 @@ def eval_finetuned_model(train_cfg):
     global_init_accelerator(model, fsdp_no_shard=True, **train_cfg)
     model.to(DEVICE)
 
-    _, validation_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    _, valid_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
-    model, validation_dataloader, test_dataloader = ACCELERATOR.prepare(model, validation_dataloader, test_dataloader)
+    model, valid_dataloader, test_dataloader = ACCELERATOR.prepare(model, valid_dataloader, test_dataloader)
     check_memory()
 
     start = time.time()
     start2 = start
     if train_cfg["eval_valid_split"]:
-        evaluate(model, validation_dataloader, **train_cfg)
+        evaluate(model, valid_dataloader, **train_cfg)
         start2 = time.time()
         LOGGER.info("Valid time: %s", seconds_to_time_str(start2 - start))
 
