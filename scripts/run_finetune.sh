@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=7_disease_features_pretrain_42obs_without_text_111_10-4
+#SBATCH --job-name=7_disease_features_pretrain_cls_only_42obs_1161_2x10-5
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -56,7 +56,10 @@ accelerate launch\
     --run_mode pretrain \
     --classification_only \
     --num_epochs 1 \
-    --batch_size 1 \
+    --batch_size 16 \
+    --grad_accum_steps 1 \
+    --lr 0.00002 \
+    --eval_per_steps 2000 \
     --grad_accum_steps 1 \
     # --resume_from_checkpoint
 echo "Script [pretrain] finished."

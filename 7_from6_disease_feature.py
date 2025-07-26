@@ -1314,6 +1314,10 @@ def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_datalo
 
     # 1. Prepare for multi GPUs. All prepared and registered objs will be checkpointed automatically
     model, train_dataloader, optimizer, scheduler = ACCELERATOR.prepare(model, train_dataloader, optimizer, scheduler)
+    if valid_dataloader:
+        valid_dataloader = ACCELERATOR.prepare(valid_dataloader)
+    if test_dataloader:
+        test_dataloader = ACCELERATOR.prepare(test_dataloader)
     STATUS_INFO = StatusInfo()
     ACCELERATOR.register_for_checkpointing(STATUS_INFO)
     # LOGGER.debug("Final model structure:\n%s", model)
@@ -1776,7 +1780,11 @@ def save_pred_results_per_batch(data_ids, pred_text, pred_labels, gold_text, gol
     output_file = os.path.join(output_dir, f"{data_split}_{ACCELERATOR.process_index}.json")
 
     with open(output_file, "a", encoding="utf-8") as f:
-        for data_id, p_text, p_label, g_text, g_label in zip(data_ids, pred_text, pred_labels, gold_text, gold_labels):
+        for idx, data_id in enumerate(data_ids):
+            p_text = pred_text[idx] if idx < len(pred_text) else ""
+            g_text = gold_text[idx] if idx < len(gold_text) else ""
+            p_label = pred_labels[idx] if idx < len(pred_labels) else {}
+            g_label = gold_labels[idx] if idx < len(gold_labels) else {}
             out_line = {"data_id": data_id, "pred_text": p_text, "pred_label": p_label, "gold_text": g_text, "gold_label": g_label}
             f.write(json.dumps(out_line))
             f.write("\n")
@@ -2633,7 +2641,9 @@ def global_init_proj_config():
     parser.add_argument("--num_epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--grad_accum_steps", type=int, default=None)
-    parser.add_argument("--lr", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--eval_per_steps", type=int, default=None)
+
 
     args = parser.parse_args()
 
@@ -2679,6 +2689,8 @@ def global_init_proj_config():
                 CONFIG[run_mode]["grad_accum_steps"] = args.grad_accum_steps
             if args.lr:
                 CONFIG[run_mode]["lr"] = args.lr
+            if args.eval_per_steps:
+                CONFIG[run_mode]["eval_per_steps"] = args.eval_per_steps
 
     else:
         CONFIG["jobid"] = "00000"

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=7_disease_features_pretrain_cls_only_42obs_111_10-4
+#SBATCH --job-name=7_disease_features_pretrain_cls_only_42obs_111_1x10-5
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -58,6 +58,8 @@ accelerate launch\
     --num_epochs 1 \
     --batch_size 1 \
     --grad_accum_steps 1 \
+    --lr 0.00001 \
+    --eval_per_steps 10000 \
     # --resume_from_checkpoint
 echo "Script [pretrain] finished."
 
@@ -88,7 +90,7 @@ else
   done
 fi
 
-python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【unbird Done】: $SLURM_JOB_NAME"
+python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Sunbird Done】: $SLURM_JOB_NAME"
 
 # sbatch /scratch/c.c21051562/workspace/arrg_img2text/scripts/run_finetune2.sh
 # scontrol show job JOBID
