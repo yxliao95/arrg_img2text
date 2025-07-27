@@ -392,7 +392,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
 
             # img clssifier
             classifier_outputs = self.obs_classifier(
-                img_features=image_features,
+                image_features,
                 image_indices_map=image_indices_map,
                 obs_ids=decoder_extra_inputs["obs_ids"],
                 obs_labels=decoder_extra_inputs.get("obs_labels", None),  # 如果是pred，则不会传入 obs_labels
@@ -1015,6 +1015,9 @@ def collate_fn(batch_data, img_processor, tokenizer, target_obs=None):
     image_indices_map = torch.tensor(image_idx_to_batch_idx, dtype=torch.long)  # torch.Size([bsz < x < 2*bsz])
 
     # 我们使用分类器时的分类目标，预训练时使用所有类别；微调时可以指定target_obs
+    # 当target_obs=['effusion', 'pneumothorax', 'opacity', 'normal']时，从每个样本的 radlex_types 中找到对应的标签
+    # obs_ids = tensor([0, 1, 2, 3]) 值对应的是 CONFIG["observation_map"] 中的idx
+    # obs_labels = tensor([[0, 0, 0, 0]]) 值对应的是 CONFIG["obs_classification_map"] 中的类别idx
     obs_name2id_dict = GLOBAL_VARS.obs_name2id_dict  # e.g. {'effusion': 0, ...}
     obs_id_list = []  # e.g. [0, 1, 2, 7, 8, ...] 每个值是一个类别的id
     if target_obs:
@@ -1054,8 +1057,7 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
     target_section = CONFIG["target_section"]
 
     gold_text_list = [" ".join(item["split_sents"]) for item in batch_data]
-    gold_labeldict_list = [item["radlex_types"] for item in batch_data]
-    label_name_list = list(gold_labeldict_list[0].keys())
+    label_name_list = [GLOBAL_VARS.obs_id2name_dict[idx] for idx in obs_ids.tolist()]
 
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
@@ -1122,8 +1124,7 @@ def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_
     target_section = CONFIG["target_section"]
 
     gold_text_list = [" ".join(item["split_sents"]) for item in batch_data]
-    gold_labeldict_list = [item["radlex_types"] for item in batch_data]
-    label_name_list = list(gold_labeldict_list[0].keys())
+    label_name_list = [GLOBAL_VARS.obs_id2name_dict[idx] for idx in obs_ids.tolist()]
 
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
@@ -1333,7 +1334,7 @@ def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_datalo
     LOGGER.info("Total optimization steps = %d", total_num_steps)
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
     LOGGER.info("Accelerator mixed_precision = %s", ACCELERATOR.mixed_precision)
-    LOGGER.info("Classification only = %s", train_cfg["classification_only"])
+    LOGGER.info("Classification only = %s", train_cfg.get("classification_only", False))
     check_memory()
 
     model.zero_grad()
@@ -2307,7 +2308,7 @@ def filter_dataset_by_data_id(ds, split):
     return ds
 
 
-def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_test=None, train_bsz=1, eval_bsz=1, use_debug_subset=False):
+def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_test=None, train_bsz=1, eval_bsz=1, use_debug_subset=False, target_observation=None):
 
     train_dataloader, valid_dataloader, test_dataloader = None, None, None
 
@@ -2317,7 +2318,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
                 train_dataset = ImageTextDataset(ds_train.select(range(len(ds_train) - 6, len(ds_train))), img_processor=img_processor, tokenizer=tokenizer, split="train")
             else:
                 train_dataset = ImageTextDataset(ds_train, img_processor=img_processor, tokenizer=tokenizer, split="train")
-        train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=train_bsz, drop_last=True)
+        train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, target_observation), batch_size=train_bsz, drop_last=True)
 
     if ds_valid:
         with ACCELERATOR.main_process_first():  # select是dataset caching 操作，主进程优先或许能快一点
@@ -2326,7 +2327,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
             else:
                 ds_valid = filter_dataset_by_data_id(ds_valid, split="validation")
                 vaild_dataset = ImageTextDataset(ds_valid, img_processor=img_processor, tokenizer=tokenizer, split="validation")
-        valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_bsz, drop_last=False)
+        valid_dataloader = DataLoader(vaild_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, target_observation), batch_size=eval_bsz, drop_last=False)
 
     if ds_test:
         with ACCELERATOR.main_process_first():
@@ -2335,7 +2336,7 @@ def get_dataloaders(img_processor, tokenizer, ds_train=None, ds_valid=None, ds_t
             else:
                 ds_test = filter_dataset_by_data_id(ds_test, split="test")
                 test_dataset = ImageTextDataset(ds_test, img_processor=img_processor, tokenizer=tokenizer, split="test")
-        test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer), batch_size=eval_bsz, drop_last=False)
+        test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=lambda batch: collate_fn(batch, img_processor, tokenizer, target_observation), batch_size=eval_bsz, drop_last=False)
 
     return train_dataloader, valid_dataloader, test_dataloader
 
@@ -2644,7 +2645,6 @@ def global_init_proj_config():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--eval_per_steps", type=int, default=None)
 
-
     args = parser.parse_args()
 
     if args.from_bash:
@@ -2812,7 +2812,7 @@ def finetune_model(train_cfg):
     check_memory()
     model.to(DEVICE)
 
-    train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    train_dataloader, _, _ = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_train=ds_final["train"], train_bsz=train_cfg["batch_size"], use_debug_subset=CONFIG["use_debug_subset"], target_observation=train_cfg["target_observation"])
     # _, valid_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], use_debug_subset=CONFIG["use_debug_subset"])
     check_memory()
 
@@ -2855,7 +2855,7 @@ def eval_finetuned_model(train_cfg):
     global_init_accelerator(model, fsdp_no_shard=True, **train_cfg)
     model.to(DEVICE)
 
-    _, valid_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"])
+    _, valid_dataloader, test_dataloader = get_dataloaders(img_processor=img_processor, tokenizer=tokenizer, ds_valid=ds_final["validation"], ds_test=ds_final["test"], eval_bsz=train_cfg["eval_batch_size"], use_debug_subset=CONFIG["use_debug_subset"], target_observation=train_cfg["target_observation"])
     check_memory()
 
     model, valid_dataloader, test_dataloader = ACCELERATOR.prepare(model, valid_dataloader, test_dataloader)
