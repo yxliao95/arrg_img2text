@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=5_3_fsdp_peft_4label_with_ent_rel_labels_111_10-4_r32_add_enc_lora
+#SBATCH --job-name=7_disease_fea_base8081612_finetune_effu_111_1x10-4
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -43,31 +43,44 @@ export TORCH_DISTRIBUTED_DEBUG=OFF # OFF, INFO, or DETAIL
 export NCCL_TIMEOUT=1800  # 默认是 1800 秒（30 分钟），你可以设置更大，比如 3600
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # 避免碎片化
 
-# accelerate launch\
-#     --multi_gpu \
-#     --num_processes 2 \
-#     --main_process_port $main_process_port \
-#     /scratch/c.c21051562/workspace/arrg_img2text/5_3_fsdp_peft_4label_with_ent_rel_labels.py \
-#     --from_bash \
-#     --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_3_fsdp_peft_4label_with_ent_rel_labels.yaml \
-#     --output_name $SLURM_JOB_NAME \
-#     --jobid $SLURM_JOB_ID \
-#     --mlflow_port $mlflow_port \
-#     --run_mode finetune \
-#     --resume_from_checkpoint
-# echo "Script [finetune] finished."
+accelerate launch\
+    --multi_gpu \
+    --num_processes 2 \
+    --main_process_port $main_process_port \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_from6_disease_feature.py \
+    --from_bash \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_disease_features.yaml \
+    --output_name $SLURM_JOB_NAME \
+    --jobid $SLURM_JOB_ID \
+    --mlflow_port $mlflow_port \
+    --run_mode finetune \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_disease_features_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion', 'pneumothorax']" \
+    --resume_from_checkpoint
+    # --num_epochs 1 \
+    # --batch_size 1 \
+    # --grad_accum_steps 1 \
+    # --lr 0.0001 \
+
+echo "Script [finetune] finished."
 
 accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/5_3_fsdp_peft_4label_with_ent_rel_labels.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_from6_disease_feature.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/5_3_fsdp_peft_4label_with_ent_rel_labels.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_disease_features.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
-    --run_mode eval_finetuned
+    --classification_only \
+    --run_mode eval_finetuned \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_disease_features_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion', 'pneumothorax']" \
+    
 echo "Script [eval_finetuned] finished."
 
 # 查找运行在该端口的 mlflow 进程

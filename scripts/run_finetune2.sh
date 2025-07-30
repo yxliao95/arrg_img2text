@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=7_disease_features_pretrain_cls_only_42obs_111_1x10-5
+#SBATCH --job-name=7_disease_fea_base8081612_finetune_effu_only_111_1x10-4
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -53,15 +53,17 @@ accelerate launch\
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
-    --run_mode pretrain \
-    --classification_only \
-    --num_epochs 1 \
-    --batch_size 1 \
-    --grad_accum_steps 1 \
-    --lr 0.00001 \
-    --eval_per_steps 10000 \
+    --run_mode finetune \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_disease_features_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion']" \
     # --resume_from_checkpoint
-echo "Script [pretrain] finished."
+    # --num_epochs 1 \
+    # --batch_size 1 \
+    # --grad_accum_steps 1 \
+    # --lr 0.0001 \
+
+echo "Script [finetune] finished."
 
 accelerate launch\
     --multi_gpu \
@@ -74,9 +76,12 @@ accelerate launch\
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --classification_only \
-    --run_mode eval_pretrained
+    --run_mode eval_finetuned \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_disease_features_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion']" \
     
-echo "Script [eval_pretrained] finished."
+echo "Script [eval_finetuned] finished."
 
 # 查找运行在该端口的 mlflow 进程
 pids=$(lsof -i :$mlflow_port -sTCP:LISTEN -t)

@@ -2644,6 +2644,9 @@ def global_init_proj_config():
     parser.add_argument("--grad_accum_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--eval_per_steps", type=int, default=None)
+    
+    parser.add_argument("--use_pretrained", action="store_true", default=None)
+    parser.add_argument("--pretain_model_path", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -2671,14 +2674,20 @@ def global_init_proj_config():
         if args.classification_only:
             CONFIG["classification_only"] = True
 
-        if args.target_observation:
-            CONFIG["target_observation"] = ast.literal_eval(args.target_observation)
-
         run_mode = None
         if "finetune" in CONFIG["run_mode"]:
             run_mode = "finetune"
+            if args.use_pretrained:
+                CONFIG[run_mode]["use_pretrained"] = args.use_pretrained
+            if args.pretain_model_path:
+                CONFIG[run_mode]["pretain_model_path"] = args.pretain_model_path
+            if args.target_observation:
+                CONFIG[run_mode]["target_observation"] = ast.literal_eval(args.target_observation)
+                
         elif "pretrain" in CONFIG["run_mode"]:
             run_mode = "pretrain"
+            if args.eval_per_steps:
+                CONFIG[run_mode]["eval_per_steps"] = args.eval_per_steps
 
         if run_mode:
             if args.num_epochs:
@@ -2689,8 +2698,7 @@ def global_init_proj_config():
                 CONFIG[run_mode]["grad_accum_steps"] = args.grad_accum_steps
             if args.lr:
                 CONFIG[run_mode]["lr"] = args.lr
-            if args.eval_per_steps:
-                CONFIG[run_mode]["eval_per_steps"] = args.eval_per_steps
+            
 
     else:
         CONFIG["jobid"] = "00000"

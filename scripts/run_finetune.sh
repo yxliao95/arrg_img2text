@@ -62,6 +62,7 @@ accelerate launch\
     --eval_per_steps 2000 \
     --grad_accum_steps 1 \
     # --resume_from_checkpoint
+    
 echo "Script [pretrain] finished."
 
 accelerate launch\

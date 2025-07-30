@@ -14,8 +14,6 @@ data_path:
   text_graph: /scratch/c.c21051562/resources/data/interpret_disease
 
 target_section: findings
-# ['effusion', 'pneumothorax', 'opacity', 'normal', 'consolidation', 'edema', 'atelectasis', 'tube', 'clear', 'catheter', 'pneumonia', 'infiltrate', 'pathophysiologic finding', 'infection', 'congestion', 'enlargement', 'wire', 'degeneration', 'fracture', 'thickening', 'pacemaker', 'emphysema', 'surgical drain', 'surgical clip', 'medical device', 'scoliosis', 'valve', 'chronic obstructive pulmonary disease', 'calcification', 'cirrhosis-associated nodules', 'atherosclerosis', 'calcifications', 'deformity', 'hernia', 'scar', 'pulmonary nodule', 'granuloma', 'automated implantable cardiac defibrillator', 'prosthesis', 'collapse', 'reticular pattern', 'heart failure']
-target_observation: ["effusion"]
 
 model_name_or_path:
   clip: /scratch/c.c21051562/resources/downloaded_models/clip-vit-base-patch32
@@ -64,7 +62,7 @@ pretrain:
   mixed_precision: "bf16" # no, fp16, bf16. bf16 recommended for A100, fp16 for V100
 
   print_loss_per_n_steps: 200 # logging loss on .log file
-  eval_per_steps: 2000 # 550395 / 32 = 17199, 170801 / 8 = 21350
+  eval_per_steps: 2000 # only available when classification_only=True
   ckp_per_steps: 10000 # 344394 / 32 = 10762, 170801 / 8 = 21350
 
   eval_batch_size: 16
@@ -76,8 +74,10 @@ pretrain:
 finetune:
   # if use pretrained=True, then load the pretrained img_projector weights from path,
   # else init the img_projector with random weights
-  use_pretrained: False
-  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/4_1_fsdo_peft_test_pretrain
+  use_pretrained: True
+  pretain_model_path: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_disease_features_pretrain_cls_only_42obs_1161_2x10-5
+
+  target_observation: ["effusion"]
 
   seed: 42
   num_epochs: 1
