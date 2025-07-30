@@ -31,7 +31,7 @@ model_name_or_path:
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 use_debug_subset: True
-run_mode: "finetune" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+run_mode: "pretrain" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 preprocess:
   image_processor: rad_dino_maira2
@@ -101,6 +101,9 @@ finetune:
   eval_valid_split: False
   num_beams: 2
 
+obs_cls_merge_map:
+  "": "absent"
+obs_classification_map: ["absent", "mentioned"]
 observation_map:
   [
     "effusion",
@@ -146,5 +149,3 @@ observation_map:
     "reticular pattern",
     "heart failure",
   ]
-
-obs_classification_map: ["", "mentioned", "absent"]

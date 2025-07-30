@@ -2,6 +2,7 @@
 # 基于6修改
 # 6使用单个疾病：使用graph后反而影响结果，猜测是loss不合适，但目前的方法没有更好的使用loss的方式，因此改用其他更直观的loss
 # 现在每个图可以用42个疾病标签表示，每个疾病有单独的特征表示方法
+# 由原本的3个标签，改为2个标签，合并“”和"absent"为一个标签，称为"absent"
 #############################################
 import argparse
 import ast
@@ -1027,24 +1028,51 @@ def collate_fn(batch_data, img_processor, tokenizer, target_obs=None):
     obs_ids = torch.tensor(obs_id_list, dtype=torch.long)
 
     # 多任务多分类标签
-    obs_cls2id_dict = GLOBAL_VARS.obs_cls2id_dict  # e.g. {'mentioned': 1, 'absent': 2, '': 0}
+    obs_cls2id_dict = GLOBAL_VARS.obs_cls2id_dict  # e.g. {'mentioned': 1, 'absent': 0}
+    obs_cls_merge_map = CONFIG["obs_cls_merge_map"]  # e.g. {'': 'absent'}
     obs_label_list = []
     for obs_label_dict in [data_item["radlex_types"] for data_item in batch_data]:
-        obs_cls_ids = []  # [0, 2, 1, ..., 1] 每个值是一个类别的三分类标签
+        obs_cls_ids = []  # [0, 2, 1, ..., 1] 每个值是一个类别的三分类标签。
         for obs_name, obs_cls_name in obs_label_dict.items():
             # 如果指定了target_obs，则只保留target_obs中的标签
             if target_obs and (obs_name not in target_obs):
                 continue
-            if obs_cls_name in obs_cls2id_dict:
-                obs_cls_ids.append(obs_cls2id_dict[obs_cls_name])
+            if obs_cls_name in obs_cls2id_dict or obs_cls_name in obs_cls_merge_map:
+                # 如果有obs_cls_merge_map，则使用映射后的类别名，这里将 ”“标签 射为 'absent'标签，由原先的三分类任务变为二分类任务
+                if obs_cls_name in obs_cls_merge_map:
+                    obs_cls_name = obs_cls_merge_map[obs_cls_name]
+                obs_cls_id = obs_cls2id_dict[obs_cls_name]
+                obs_cls_ids.append(obs_cls_id)
             else:
                 raise ValueError(f"Invalid observation label value: [{obs_cls_name}] for [{obs_name}]")
         obs_label_list.append(obs_cls_ids)
         assert len(obs_cls_ids) == len(obs_ids), f"obs_cls_ids should have the same length as obs_ids, but got {len(obs_cls_ids)} vs {len(obs_ids)}"
     obs_labels = torch.tensor(obs_label_list, dtype=torch.long)  # torch.Size([bsz, num_obs])
 
+    label_name_list = [GLOBAL_VARS.obs_id2name_dict[idx] for idx in obs_ids.tolist()]
+
+    if "pretrain" in CONFIG["run_mode"]:
+        # 预训练时，用所有的split_sents
+        gold_text_list = [" ".join(item["split_sents"]) for item in batch_data]
+    elif "finetune" in CONFIG["run_mode"]:
+        # 微调时，只使用与obs_ids对应的split_sents
+        gold_text_list = []
+        for item in batch_data:
+            gold_text_peritem = []
+            for obs_name in label_name_list:
+                split_sent_indices = item["radlex_to_splitsents_map"][obs_name]
+                for split_sent_idx in split_sent_indices:
+                    gold_text_peritem.append(item["split_sents"][split_sent_idx])
+            gold_text_list.append(" ".join(gold_text_peritem))
+
+        label_name_list = [GLOBAL_VARS.obs_id2name_dict[idx] for idx in obs_ids.tolist()]
+    else:
+        raise ValueError(f"Invalid run_mode {CONFIG['run_mode']}, expected to find either a string 'pretrain' or 'finetune'")
+
     return {
         "batch_data": batch_data,
+        "gold_text_list": gold_text_list,
+        "label_name_list": label_name_list,  # e.g. ['effusion', 'pneumothorax', 'opacity', 'normal' ...]
         "pixel_values": piexl_values_tensor.to(DEVICE),  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
         "image_indices_map": image_indices_map.to(DEVICE),  # torch.Size([bsz < x < 2*bsz]), # e.g. [0, 0, 1, 2, 2, ...]
         "obs_labels": obs_labels.to(DEVICE),  # torch.Size([bsz, num_obs]),
@@ -1052,21 +1080,7 @@ def collate_fn(batch_data, img_processor, tokenizer, target_obs=None):
     }
 
 
-def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_map, obs_labels, obs_ids):
-    # training中，多轮对话可以合并为一个input
-    target_section = CONFIG["target_section"]
-
-    label_name_list = [GLOBAL_VARS.obs_id2name_dict[idx] for idx in obs_ids.tolist()]
-
-    gold_text_list = []
-    for item in batch_data:
-        gold_text_peritem = []
-        for obs_name in gold_text_list:
-            split_sent_indices = item["radlex_to_splitsents_map"][obs_name]
-            for split_sent_idx in split_sent_indices:
-                gold_text_peritem.append(item["split_sents"][split_sent_idx])
-        gold_text_list.append(" ".join(gold_text_peritem))
-
+def get_inputs_for_training(tokenizer, batch_data, gold_text_list, label_name_list, pixel_values, image_indices_map, obs_labels, obs_ids):
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
     for idx, item in enumerate(batch_data):
@@ -1125,14 +1139,7 @@ def get_inputs_for_training(tokenizer, batch_data, pixel_values, image_indices_m
     }
 
 
-def get_inputs_for_inference(tokenizer, batch_data, pixel_values, image_indices_map, obs_labels, obs_ids):
-    # inference 中，多轮对话需要循环处理
-    # 第一轮 model_response = {"graph": [], "seq": []}
-    # 第二轮 model_response = {"graph": ["graph str", "..."], "seq": []}
-    target_section = CONFIG["target_section"]
-
-    gold_text_list = [" ".join(item["split_sents"]) for item in batch_data]
-    label_name_list = [GLOBAL_VARS.obs_id2name_dict[idx] for idx in obs_ids.tolist()]
+def get_inputs_for_inference(tokenizer, batch_data, gold_text_list, label_name_list, pixel_values, image_indices_map, obs_labels, obs_ids):
 
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
@@ -2661,7 +2668,7 @@ def global_init_proj_config():
     if args.from_bash:
         file_path = args.config_file
     else:
-        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/7_disease_fea.yaml"
+        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/7_1_disease_fea.yaml"
 
     with open(file_path, "r", encoding="utf-8") as f:
         CONFIG = yaml.safe_load(f)
