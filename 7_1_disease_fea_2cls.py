@@ -1953,8 +1953,16 @@ def compute_generation_score(gold_text_list, pred_text_list):
     else:
         use_metrics = ["BLEU", "ROUGEL", "radgraph", "chexbert", "bertscore"]
 
-    refs = [" ".join(wordpunct_tokenize(s.lower())) for s in gold_text_list]
-    hyps = [" ".join(wordpunct_tokenize(s.lower())) for s in pred_text_list]
+    # refs = [" ".join(wordpunct_tokenize(s.lower())) for s in gold_text_list]
+    # hyps = [" ".join(wordpunct_tokenize(s.lower())) for s in pred_text_list]
+    
+    # 我们想检查一下空报告样本对eval分数的影响
+    refs, hyps = [], []
+    for ref, hyp in zip(gold_text_list, pred_text_list):
+        if ref.strip() == "" or hyp.strip() == "":
+            continue
+        refs.append(" ".join(wordpunct_tokenize(ref.lower())))
+        hyps.append(" ".join(wordpunct_tokenize(hyp.lower())))
 
     # https://github.com/jbdel/vilmedic/blob/main/vilmedic/blocks/scorers/scores.py
     out_dict = compute_scores(use_metrics, refs=refs, hyps=hyps, split=None, seed=None, config=None, epoch=None, logger=LOGGER, dump=False)

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=7_disease_features_pretrain_cls_only_42obs_1161_2x10-5
+#SBATCH --job-name=7_1_pretrain_cls_only_42obs_1161_2x10-5
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -47,9 +47,9 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_from6_disease_feature.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_disease_features.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
@@ -59,8 +59,7 @@ accelerate launch\
     --batch_size 16 \
     --grad_accum_steps 1 \
     --lr 0.00002 \
-    --eval_per_steps 2000 \
-    --grad_accum_steps 1 \
+    --eval_per_steps 1000 \
     # --resume_from_checkpoint
     
 echo "Script [pretrain] finished."
@@ -69,9 +68,9 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_from6_disease_feature.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_disease_features.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \

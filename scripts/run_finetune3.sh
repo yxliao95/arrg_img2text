@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=7_disease_fea_base8081612_finetune_effu_111_1x10-4
+#SBATCH --job-name=7_1_base8081969_finetune_effu_tube_111_1x10-4
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -47,17 +47,17 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_from6_disease_feature.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_disease_features.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --run_mode finetune \
     --use_pretrained \
-    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_disease_features_pretrain_cls_only_42obs_1161_2x10-5 \
-    --target_observation "['effusion', 'pneumothorax']" \
-    --resume_from_checkpoint
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion', 'tube']" \
+    # --resume_from_checkpoint
     # --num_epochs 1 \
     # --batch_size 1 \
     # --grad_accum_steps 1 \
@@ -69,19 +69,17 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_from6_disease_feature.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_disease_features.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --classification_only \
     --run_mode eval_finetuned \
     --use_pretrained \
-    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_disease_features_pretrain_cls_only_42obs_1161_2x10-5 \
-    --target_observation "['effusion', 'pneumothorax']" \
-    
-echo "Script [eval_finetuned] finished."
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion', 'tube']" \
 
 # 查找运行在该端口的 mlflow 进程
 pids=$(lsof -i :$mlflow_port -sTCP:LISTEN -t)
