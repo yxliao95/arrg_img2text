@@ -80,6 +80,8 @@ accelerate launch\
     --use_pretrained \
     --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
     --target_observation "['effusion', 'tube']" \
+  
+echo "Script [finetune] finished."
 
 # 查找运行在该端口的 mlflow 进程
 pids=$(lsof -i :$mlflow_port -sTCP:LISTEN -t)

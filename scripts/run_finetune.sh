@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=7_1_pretrain_cls_only_42obs_1161_2x10-5
+#SBATCH --job-name=7_2_base8081969_finetune_do-cls-inject_effu_111_1x10-4
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
@@ -40,44 +40,48 @@ echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
 export TORCH_DISTRIBUTED_DEBUG=OFF # OFF, INFO, or DETAIL
-export NCCL_TIMEOUT=1800  # 默认是 1800 秒（30 分钟），你可以设置更大，比如 3600
+export NCCL_TIMEOUT=3600  # 默认是 1800 秒（30 分钟），你可以设置更大，比如 3600
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # 避免碎片化
 
 accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_2_disease_fea_2cls_rm_empty.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_2_disease_fea_2cls_rm_empty.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
-    --run_mode pretrain \
-    --classification_only \
-    --num_epochs 1 \
-    --batch_size 16 \
-    --grad_accum_steps 1 \
-    --lr 0.00002 \
-    --eval_per_steps 1000 \
+    --run_mode finetune \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion']" \
+    # --disable_classifier \
+    # --disable_inject_cls_token \
     # --resume_from_checkpoint
     
-echo "Script [pretrain] finished."
+echo "Script [finetune] finished."
 
 accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_2_disease_fea_2cls_rm_empty.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_2_disease_fea_2cls_rm_empty.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --classification_only \
-    --run_mode eval_pretrained
-    
-echo "Script [eval_pretrained] finished."
+    --run_mode eval_finetuned \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
+    --target_observation "['effusion']" \
+    # --disable_classifier \
+    # --disable_inject_cls_token \
+
+echo "Script [eval_finetuned] finished."
 
 # 查找运行在该端口的 mlflow 进程
 pids=$(lsof -i :$mlflow_port -sTCP:LISTEN -t)

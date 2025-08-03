@@ -1008,35 +1008,47 @@ class ImageTextDataset(Dataset):
     def _add_gold_text_column(self, hf_dataset):
         run_mode = CONFIG["run_mode"]
 
+        # 临时选择与gold_text计算相关的列
         if "pretrain" in run_mode:
+            temp_dataset = hf_dataset.select_columns(["split_sents"])
 
-            def get_gold_text_pretrain(example):
-                return {"gold_text": " ".join(example["split_sents"])}
+            def get_gold_text_pretrain(batch):
+                gold_texts = [" ".join(sents) for sents in batch["split_sents"]]
+                return {"gold_text": gold_texts}
 
-            hf_dataset = hf_dataset.map(get_gold_text_pretrain)
+            temp_dataset = temp_dataset.map(get_gold_text_pretrain, batched=True, batch_size=1000, num_proc=4)
 
         elif "finetune" in run_mode:
             if self.target_observations is None:
                 raise ValueError("target_observations must be provided for finetune mode")
 
-            def get_gold_text_finetune(example):
-                gold_text = []
-                for obs_name in self.target_observations:
-                    split_sent_indices = example["radlex_to_splitsents_map"][obs_name]
-                    for split_sent_idx in split_sent_indices:
-                        gold_text.append(example["split_sents"][split_sent_idx])
-                return {"gold_text": " ".join(gold_text)}
+            temp_dataset = hf_dataset.select_columns(["split_sents", "radlex_to_splitsents_map"])
+            target_observations = self.target_observations
 
-            hf_dataset = hf_dataset.map(get_gold_text_finetune)
+            def get_gold_text_finetune(batch):
+                gold_texts = []
+                for split_sents, radlex_map in zip(batch["split_sents"], batch["radlex_to_splitsents_map"]):
+                    gold_text = []
+                    for obs_name in target_observations:
+                        indices = radlex_map.get(obs_name, [])
+                        gold_text.extend([split_sents[idx] for idx in indices])
+                    gold_texts.append(" ".join(gold_text))
+                return {"gold_text": gold_texts}
+
+            temp_dataset = temp_dataset.map(get_gold_text_finetune, batched=True, batch_size=1000, num_proc=4)
 
         else:
-            raise ValueError(f"Invalid run_mode {run_mode}, expected to find either a string 'pretrain' or 'finetune'")
+            raise ValueError(f"Invalid run_mode {run_mode}, expected 'pretrain' or 'finetune'")
 
-        # Remove empty string
-        non_empty_section_indices = [idx for idx, txt in enumerate(hf_dataset["gold_text"]) if txt != ""]
-        filtered_dataset = hf_dataset.select(non_empty_section_indices)
-        num_removed_data = len(hf_dataset) - len(non_empty_section_indices)
-        LOGGER.info("Removed [%d] samples with empty [%s] gold_text from [%s] split", num_removed_data, self.target_section, self.split)
+        # 将 gold_text 列合并回原始 hf_dataset
+        hf_dataset = hf_dataset.add_column("gold_text", temp_dataset["gold_text"])
+
+        # Remove empty gold_text entries
+        non_empty_indices = [i for i, txt in enumerate(hf_dataset["gold_text"]) if txt != ""]
+        filtered_dataset = hf_dataset.select(non_empty_indices)
+        num_removed = len(hf_dataset) - len(non_empty_indices)
+        LOGGER.info("Removed [%d] samples with empty [%s] gold_text from [%s] split", num_removed, self.target_section, self.split)
+
         return filtered_dataset
 
     def __len__(self):
@@ -2753,8 +2765,8 @@ def global_init_proj_config():
     parser.add_argument("--use_pretrained", action="store_true", default=None)
     parser.add_argument("--pretain_model_path", type=str, default=None)
 
-    parser.add_argument("--use_classifier", action="store_true", default=None)
-    parser.add_argument("--inject_cls_token", action="store_true", default=None)
+    parser.add_argument("--disable_classifier", action="store_true", default=None)
+    parser.add_argument("--disable_inject_cls_token", action="store_true", default=None)
 
     args = parser.parse_args()
 
@@ -2791,10 +2803,10 @@ def global_init_proj_config():
                 CONFIG[run_mode]["pretain_model_path"] = args.pretain_model_path
             if args.target_observation:
                 CONFIG[run_mode]["target_observation"] = ast.literal_eval(args.target_observation)
-            if args.use_classifier:
-                CONFIG[run_mode]["use_classifier"] = args.use_classifier
-            if args.inject_cls_token:
-                CONFIG[run_mode]["inject_cls_token"] = args.inject_cls_token
+            if args.disable_classifier:
+                CONFIG[run_mode]["use_classifier"] = False
+            if args.disable_inject_cls_token:
+                CONFIG[run_mode]["inject_cls_token"] = False
 
         elif "pretrain" in CONFIG["run_mode"]:
             run_mode = "pretrain"
