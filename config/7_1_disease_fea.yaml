@@ -31,7 +31,7 @@ model_name_or_path:
 resume_from_checkpoint: False
 # if eval_only=True, it will load the best pre_trained model saved at `output_dir.model/output_name`, and eval the model on test set.
 use_debug_subset: True
-run_mode: "pretrain" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
+run_mode: "eval_finetuned" # Choose from [preprocess, pretrain, eval_pretrained, finetune, eval_finetuned]
 
 preprocess:
   image_processor: rad_dino_maira2
@@ -76,9 +76,15 @@ finetune:
   # if use pretrained=True, then load the pretrained img_projector weights from path,
   # else init the img_projector with random weights
   use_pretrained: True
-  pretain_model_path: /home/yuxiang/liao/workspace/arrg_img2text/outputs/models/test_001
+  pretain_model_path: /home/yuxiang/liao/workspace/arrg_img2text/outputs/models/test_000
 
-  # ['effusion', 'pneumothorax', 'opacity', 'normal', 'consolidation', 'edema', 'atelectasis', 'tube', 'clear', 'catheter', 'pneumonia', 'infiltrate', 'pathophysiologic finding', 'infection', 'congestion', 'enlargement', 'wire', 'degeneration', 'fracture', 'thickening', 'pacemaker', 'emphysema', 'surgical drain', 'surgical clip', 'medical device', 'scoliosis', 'valve', 'chronic obstructive pulmonary disease', 'calcification', 'cirrhosis-associated nodules', 'atherosclerosis', 'calcifications', 'deformity', 'hernia', 'scar', 'pulmonary nodule', 'granuloma', 'automated implantable cardiac defibrillator', 'prosthesis', 'collapse', 'reticular pattern', 'heart failure']
+  # if use_classifier=True and inject_cls_token=True, then do classification and inject classifier hidden state to generate text,
+  # if use_classifier=True and inject_cls_token=False, then do classification, but not inject
+  # if use_classifier=False, inject_cls_token will be disable, and use only the encoder and decoder to generate text
+  # by default, use_classifier=True and inject_cls_token=True
+  use_classifier: False
+  inject_cls_token: False
+
   target_observation: ["effusion", "pneumothorax", "opacity", "normal"]
 
   seed: 42
