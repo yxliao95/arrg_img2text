@@ -4,6 +4,7 @@
 # 现在每个图可以用42个疾病标签表示，每个疾病有单独的特征表示方法
 # 由原本的3个标签，改为2个标签，合并“”和"absent"为一个标签，称为"absent"
 # 训练和评估时，移除空的文本数据，这是合理的，因为findings为空时，可能impression有数据，如果保留空数据用于训练和评估，实际上就是引入了错误数据
+# 使用分类器，但不将分类特征注入decoder
 #############################################
 import argparse
 import ast
@@ -392,46 +393,39 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 # img2beam0 -> sample1beam0, img2beam1 -> sample1beam1, img2beam2 -> sample1beam2
                 image_indices_map = self._expand_image_indices_map_generation(image_indices_map=decoder_extra_inputs["image_indices_map"], expand_size=decoder_extra_inputs["num_beams"])
 
-            # 这两个是 finetune mode 的参数，用于消融实验
-            # 在 pretrain mode，它们的值被默认为True，且无法通过config修改
-            use_classifier = decoder_extra_inputs.get("use_classifier", True)
-            inject_cls_token = decoder_extra_inputs.get("inject_cls_token", True)
-            assert isinstance(use_classifier, bool), f"use_classifier should be bool, but got {use_classifier}"
-            assert isinstance(inject_cls_token, bool), f"inject_cls_token should be bool, but got {inject_cls_token}"
+            # img clssifier
+            classifier_outputs = self.obs_classifier(
+                image_features,
+                image_indices_map=image_indices_map,
+                obs_ids=decoder_extra_inputs["obs_ids"],
+                obs_labels=decoder_extra_inputs.get("obs_labels", None),  # 如果是pred，则不会传入 obs_labels
+                output_loss=output_loss,
+            )
+            # 在分布式训练时，如果不使用就不要取出来，不然在保存checkpoint时会出问题（因为无法正确的追踪/还原/消耗计算图？）
+            # label_features = classifier_outputs.hidden_states  # torch.Size([2, num_obs, dec_dim])，如果是pred，则是 [num_beams * bsz, num_obs, dec_dim]；在pred阶段，label_features 跟 decoder_input_ids 是一一对应的，不需要进行额外处理
 
-            if use_classifier:
-                # img clssifier
-                classifier_outputs = self.obs_classifier(
-                    image_features,
-                    image_indices_map=image_indices_map,
-                    obs_ids=decoder_extra_inputs["obs_ids"],
-                    obs_labels=decoder_extra_inputs.get("obs_labels", None),  # 如果是pred，则不会传入 obs_labels
-                    output_loss=output_loss,
+            # pred时，将logits传递到 generate() 方法中
+            if decoder_extra_outputs is not None:
+                if "num_beams" in decoder_extra_inputs:
+                    # 在pred阶段，cls_logits 是被 expand 的， 我们只需要每 expand_size 个元素取第一个
+                    expand_size = decoder_extra_inputs["num_beams"]
+                    cls_logits = classifier_outputs.logits
+                    cls_logits = cls_logits[::expand_size, :, :]
+                    decoder_extra_outputs["cls_logits"] = cls_logits
+                else:
+                    decoder_extra_outputs["cls_logits"] = classifier_outputs.logits  # torch.Size([2, num_obs, 3])；
+
+            # 如果是 classification_only 模式，则只返回分类器的输出就可以结束，后面的组件已经被移除
+            if self.config.classification_only:
+                return Vision2LanguageOutputWithPast(
+                    loss=classifier_outputs.loss,
+                    logits=classifier_outputs.logits,
+                    hidden_states=classifier_outputs.hidden_states,
+                    past_key_values=None,  # classification_only 时不需要 past_key_values
+                    image_hidden_states=None,  # 返回图像特征
+                    gen_loss=None,  # for logging purposes
+                    cls_loss=classifier_outputs.loss,  # for logging purposes
                 )
-                label_features = classifier_outputs.hidden_states  # torch.Size([2, num_obs, dec_dim])，如果是pred，则是 [num_beams * bsz, num_obs, dec_dim]；在pred阶段，label_features 跟 decoder_input_ids 是一一对应的，不需要进行额外处理
-
-                # pred时，将logits传递到 generate() 方法中
-                if decoder_extra_outputs is not None:
-                    if "num_beams" in decoder_extra_inputs:
-                        # 在pred阶段，cls_logits 是被 expand 的， 我们只需要每 expand_size 个元素取第一个
-                        expand_size = decoder_extra_inputs["num_beams"]
-                        cls_logits = classifier_outputs.logits
-                        cls_logits = cls_logits[::expand_size, :, :]
-                        decoder_extra_outputs["cls_logits"] = cls_logits
-                    else:
-                        decoder_extra_outputs["cls_logits"] = classifier_outputs.logits  # torch.Size([2, num_obs, 3])；
-
-                # 如果是 classification_only 模式，则只返回分类器的输出就可以结束，后面的组件已经被移除
-                if self.config.classification_only:
-                    return Vision2LanguageOutputWithPast(
-                        loss=classifier_outputs.loss,
-                        logits=classifier_outputs.logits,
-                        hidden_states=classifier_outputs.hidden_states,
-                        past_key_values=None,  # classification_only 时不需要 past_key_values
-                        image_hidden_states=None,  # 返回图像特征
-                        gen_loss=None,  # for logging purposes
-                        cls_loss=classifier_outputs.loss,  # for logging purposes
-                    )
 
             # project image features
             image_features = self.v2l_projector(image_features)  # torch.Size([2, 1370, 2048])
@@ -445,16 +439,16 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 image_indices_map=image_indices_map,
             )
 
-            if use_classifier and inject_cls_token:
-                # inject observation label features into text embeddings
-                # 无论是 train 还是 pred 阶段，label_features 与 decoder_inputs_embeds 的每个样本都是对齐的，只需要按照顺序注入即可
-                assert (decoder_input_ids == self.config.label_token_index).any(), f"label_token_id {self.config.label_token_index} (<|label_token|>) not found in decoder_input_ids"
-                decoder_inputs_embeds = self._inject_features(
-                    input_ids=decoder_input_ids,
-                    decoder_inputs_embeds=decoder_inputs_embeds,
-                    target_token_id=self.config.label_token_index,
-                    target_features=label_features,
-                )
+            # 不注入分类特征
+            # # inject observation label features into text embeddings
+            # # 无论是 train 还是 pred 阶段，label_features 与 decoder_inputs_embeds 的每个样本都是对齐的，只需要按照顺序注入即可
+            # assert (decoder_input_ids == self.config.label_token_index).any(), f"label_token_id {self.config.label_token_index} (<|label_token|>) not found in decoder_input_ids"
+            # decoder_inputs_embeds = self._inject_features(
+            #     input_ids=decoder_input_ids,
+            #     decoder_inputs_embeds=decoder_inputs_embeds,
+            #     target_token_id=self.config.label_token_index,
+            #     target_features=label_features,
+            # )
 
         # Text generation. decoder_inputs_embeds is used in replace of decoder_input_ids on decoder in all cases.
         # In train statge, decoder_input_ids is encoded into decoder_inputs_embeds and then merged with image features.
@@ -496,7 +490,7 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
             ce_loss_fct = nn.CrossEntropyLoss()
             gen_loss = ce_loss_fct(active_shift_logits, active_shift_labels)
 
-            cls_loss = classifier_outputs.loss if use_classifier else None
+            cls_loss = classifier_outputs.loss
             if cls_loss:
                 loss = gen_loss + cls_loss
             else:
@@ -1139,7 +1133,7 @@ def collate_fn(batch_data, img_processor, tokenizer, target_obs=None):
     }
 
 
-def get_inputs_for_training(tokenizer, batch_data, gold_text_list, label_name_list, pixel_values, image_indices_map, obs_labels, obs_ids, use_classifier, inject_cls_token):
+def get_inputs_for_training(tokenizer, batch_data, gold_text_list, label_name_list, pixel_values, image_indices_map, obs_labels, obs_ids):
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
     for idx, item in enumerate(batch_data):
@@ -1149,8 +1143,6 @@ def get_inputs_for_training(tokenizer, batch_data, gold_text_list, label_name_li
 
         content_list = []
         content_list.append({"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens})
-        if use_classifier is not False and inject_cls_token is not False:
-            content_list.append({"type": "label", "obs_labels": label_name_list})
         content_list.append({"type": "text", "text": "Based on the provided chest X-ray images and the preliminary key radiological findings, please verify the findings on the images and generate an accurate report accordingly."})
 
         conversations.append(
@@ -1197,7 +1189,7 @@ def get_inputs_for_training(tokenizer, batch_data, gold_text_list, label_name_li
     }
 
 
-def get_inputs_for_inference(tokenizer, batch_data, gold_text_list, label_name_list, pixel_values, image_indices_map, obs_labels, obs_ids, use_classifier=None, inject_cls_token=None):
+def get_inputs_for_inference(tokenizer, batch_data, gold_text_list, label_name_list, pixel_values, image_indices_map, obs_labels, obs_ids):
 
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
@@ -1206,8 +1198,6 @@ def get_inputs_for_inference(tokenizer, batch_data, gold_text_list, label_name_l
 
         content_list = []
         content_list.append({"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens})
-        if use_classifier is not False and inject_cls_token is not False:
-            content_list.append({"type": "label", "obs_labels": label_name_list})
         content_list.append({"type": "text", "text": "Based on the provided chest X-ray images and the preliminary key radiological findings, please verify the findings on the images and generate an accurate report accordingly."})
 
         conversations.append(
@@ -1378,9 +1368,6 @@ class MLflowTracker:
 
 def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_dataloader=None):
     global MLFLOW_TRACKER, STATUS_INFO
-    # only used during fintune mode
-    use_classifier = train_cfg.get("use_classifier", True)
-    inject_cls_token = train_cfg.get("inject_cls_token", True)
 
     # hyperparameters
     model_params = list(model.named_parameters())
@@ -1413,7 +1400,7 @@ def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_datalo
     LOGGER.info("Gradient accumulation steps = %d", train_cfg["grad_accum_steps"])
     LOGGER.info("Accelerator mixed_precision = %s", ACCELERATOR.mixed_precision)
     LOGGER.info("[For pretrain] Classification only = %s", train_cfg.get("classification_only", False))
-    LOGGER.info("[For finetune] Use classifier = %s, inject_cls_token = %s", use_classifier, inject_cls_token)
+    LOGGER.info("[For finetune] Use classifier = True, inject_cls_token = False")
     check_memory()
 
     model.zero_grad()
@@ -1435,7 +1422,7 @@ def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_datalo
                 # Accelerate enables automatic mixed precision, so autocast() is only needed if there are other mixed precision operations besides those performed on loss by backward() which already handles the scaling.
 
                 # 由于训练和推理时的输入数据不同，所以需要在这里分开处理
-                batch_inputs_dict = get_inputs_for_training(tokenizer=active_dataloader.dataset.tokenizer, use_classifier=use_classifier, inject_cls_token=inject_cls_token, **batch_inputs_dict)
+                batch_inputs_dict = get_inputs_for_training(tokenizer=active_dataloader.dataset.tokenizer, **batch_inputs_dict)
 
                 with ACCELERATOR.autocast():
                     model.train()
@@ -1448,8 +1435,6 @@ def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_datalo
                             "image_indices_map": batch_inputs_dict["image_indices_map"],
                             "obs_labels": batch_inputs_dict["obs_labels"],
                             "obs_ids": batch_inputs_dict["obs_ids"],
-                            "use_classifier": use_classifier,
-                            "inject_cls_token": inject_cls_token,
                         },
                         output_loss=True,
                     )
@@ -1508,7 +1493,8 @@ def prepare_optimizer_grouped_parameters(model_params, train_cfg):
     elif CONFIG["run_mode"] == "finetune":
         # When using peft, params requires_grad are set during initialization of PeftModel. See `apply_peft_to_model()`.
         # We only need to group them for optimizer.
-        optimizer_grouped_parameters.append({"params": [p for n, p in model_params if p.requires_grad], "lr": train_cfg["lr"], "weight_decay": 0.0})
+        optimizer_grouped_parameters.append({"params": [p for n, p in model_params if p.requires_grad and "obs_classifier" not in n], "lr": train_cfg["lr"], "weight_decay": 0.0})
+        optimizer_grouped_parameters.append({"params": [p for n, p in model_params if p.requires_grad and "obs_classifier" in n], "lr": train_cfg["cls_lr"], "weight_decay": 0.0})
 
     return optimizer_grouped_parameters
 
@@ -1689,8 +1675,6 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
     classification_only = kwargs.get("classification_only", False)
 
     # only used during fintune mode
-    use_classifier = kwargs.get("use_classifier", True)
-    inject_cls_token = kwargs.get("inject_cls_token", True)
     target_obs = kwargs.get("target_observation", None)
 
     if overwrite_pred_file:
@@ -1708,7 +1692,7 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
     LOGGER.info("Num samples = %d", len(target_dataloader.dataset))
     LOGGER.info("Max new tokens = %d, Num beams = %d", max_new_tokens, num_beams)
     LOGGER.info("[For pretrain] Classification only = %s", classification_only)
-    LOGGER.info("[For finetune] Use classifier = %s, inject_cls_token = %s", use_classifier, inject_cls_token)
+    LOGGER.info("[For finetune] Use classifier = True, inject_cls_token = False")
     tokenizer = target_dataloader.dataset.tokenizer
 
     LOGGER.info("****************************** Model Predicting ******************************")
@@ -1716,11 +1700,11 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
     model.eval()
     with torch.no_grad():
         for batch_idx, input_tensors_dict in enumerate(target_dataloader):
-            if len(input_tensors_dict["batch_data"]) == 0:
+            if len(target_dataloader.dataset) == 0 or input_tensors_dict is None:
                 LOGGER.info("No data remain unpredicted, stop model inference")
                 break
 
-            input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, use_classifier=use_classifier, inject_cls_token=inject_cls_token, **input_tensors_dict)
+            input_tensors_dict = get_inputs_for_inference(tokenizer=tokenizer, **input_tensors_dict)
 
             data_ids = input_tensors_dict["data_id_list"]
             pred_labels, gold_labels, pred_text, gold_text = [], [], [], []
@@ -1781,8 +1765,6 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
                             "image_indices_map": input_tensors_dict["image_indices_map"],
                             "obs_ids": input_tensors_dict["obs_ids"],
                             "num_beams": num_beams,
-                            "use_classifier": use_classifier,
-                            "inject_cls_token": inject_cls_token,
                         },
                         decoder_extra_outputs={"cls_logits": None},
                     )
@@ -1796,35 +1778,23 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
                 pred_text = pred_sequences
                 gold_text = input_tensors_dict["gold_text_list"]
 
-                if use_classifier:
-                    pred_obs_logits = extra_outputs["cls_logits"]  # torch.Size([bsz, num_obs, 3])
-                    pred_obs_labels = pred_obs_logits.argmax(dim=-1)
-                    pred_label_ids = pred_obs_labels.tolist()
-                    gold_label_ids = input_tensors_dict["obs_labels"].tolist()
+                pred_obs_logits = extra_outputs["cls_logits"]  # torch.Size([bsz, num_obs, 3])
+                pred_obs_labels = pred_obs_logits.argmax(dim=-1)
+                pred_label_ids = pred_obs_labels.tolist()
+                gold_label_ids = input_tensors_dict["obs_labels"].tolist()
 
-                    assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
+                assert len(pred_label_ids) == len(gold_label_ids) == len(pred_text) == len(gold_text), f"All lists must have the same length: [pred_label_ids: {len(pred_label_ids)}, gold_label_ids: {len(gold_label_ids)}, pred_text: {len(pred_text)}, gold_text: {len(gold_text)}]"
 
-                    for i in range(len(pred_label_ids)):
-                        pred_labels_inbatch, gold_labels_inbatch = {}, {}
-                        for obs_id, pred_label_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), pred_label_ids[i], gold_label_ids[i]):
-                            obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
-                            pred_cls_label = GLOBAL_VARS.obs_id2cls_dict[pred_label_id]
-                            gold_cls_label = GLOBAL_VARS.obs_id2cls_dict[gold_label_id]
-                            pred_labels_inbatch[obs_name] = pred_cls_label
-                            gold_labels_inbatch[obs_name] = gold_cls_label
-                        pred_labels.append(pred_labels_inbatch)
-                        gold_labels.append(gold_labels_inbatch)
-                else:
-                    # 只获取gold labels 用于检查
-                    gold_label_ids = input_tensors_dict["obs_labels"].tolist()
-                    gold_labels = []
-                    for i in range(len(gold_label_ids)):
-                        gold_labels_inbatch = {}
-                        for obs_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), gold_label_ids[i]):
-                            obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
-                            gold_cls_label = GLOBAL_VARS.obs_id2cls_dict[gold_label_id]
-                            gold_labels_inbatch[obs_name] = gold_cls_label
-                        gold_labels.append(gold_labels_inbatch)
+                for i in range(len(pred_label_ids)):
+                    pred_labels_inbatch, gold_labels_inbatch = {}, {}
+                    for obs_id, pred_label_id, gold_label_id in zip(input_tensors_dict["obs_ids"].tolist(), pred_label_ids[i], gold_label_ids[i]):
+                        obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
+                        pred_cls_label = GLOBAL_VARS.obs_id2cls_dict[pred_label_id]
+                        gold_cls_label = GLOBAL_VARS.obs_id2cls_dict[gold_label_id]
+                        pred_labels_inbatch[obs_name] = pred_cls_label
+                        gold_labels_inbatch[obs_name] = gold_cls_label
+                    pred_labels.append(pred_labels_inbatch)
+                    gold_labels.append(gold_labels_inbatch)
 
                 if (print_pred_per_n_steps > 0 and batch_idx % print_pred_per_n_steps == 0) or (batch_idx + 1 == len(target_dataloader)):
                     LOGGER.info(
@@ -1862,12 +1832,11 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
         LOGGER.info("[TextGen]: %s", json.dumps(text_scores_dict, indent=4))
 
     label_scores_dict = {}
-    if use_classifier:
-        label_scores_dict = compute_multilabel_multiclass_scores(gold_labels_list=gold_labels, pred_labels_list=pred_labels, obs_names=list(GLOBAL_VARS.obs_name2id_dict.keys()), obs_labels=list(GLOBAL_VARS.obs_cls2id_dict.keys()))
-        if target_obs:
-            # 只保留指定的 observation 的结果
-            label_scores_dict = {obs: label_scores_dict[obs] for obs in label_scores_dict if obs in target_obs}
-        LOGGER.info("[ClsPred]: %s", custom_dumps(label_scores_dict, max_indent_level=2, indent=4))
+    label_scores_dict = compute_multilabel_multiclass_scores(gold_labels_list=gold_labels, pred_labels_list=pred_labels, obs_names=list(GLOBAL_VARS.obs_name2id_dict.keys()), obs_labels=list(GLOBAL_VARS.obs_cls2id_dict.keys()))
+    if target_obs:
+        # 只保留指定的 observation 的结果
+        label_scores_dict = {obs: label_scores_dict[obs] for obs in label_scores_dict if obs in target_obs}
+    LOGGER.info("[ClsPred]: %s", custom_dumps(label_scores_dict, max_indent_level=2, indent=4))
 
     end = time.time()
     LOGGER.info("Evaluation time: %s", seconds_to_time_str(end - start))
@@ -2764,9 +2733,6 @@ def global_init_proj_config():
     parser.add_argument("--use_pretrained", action="store_true", default=None)
     parser.add_argument("--pretain_model_path", type=str, default=None)
 
-    parser.add_argument("--disable_classifier", action="store_true", default=None)
-    parser.add_argument("--disable_inject_cls_token", action="store_true", default=None)
-
     args = parser.parse_args()
 
     if args.from_bash:
@@ -2802,10 +2768,6 @@ def global_init_proj_config():
                 CONFIG[run_mode]["pretain_model_path"] = args.pretain_model_path
             if args.target_observation:
                 CONFIG[run_mode]["target_observation"] = ast.literal_eval(args.target_observation)
-            if args.disable_classifier:
-                CONFIG[run_mode]["use_classifier"] = False
-            if args.disable_inject_cls_token:
-                CONFIG[run_mode]["inject_cls_token"] = False
 
         elif "pretrain" in CONFIG["run_mode"]:
             run_mode = "pretrain"

@@ -1,11 +1,11 @@
 #!/bin/bash
 
-#SBATCH --job-name=7_1_base8081969_finetune_effu_tube_111_1x10-4
+#SBATCH --job-name=7_3_text_effu_tube
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
-#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stdout/stdout_%J.log
-#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs/%x/stderr/stderr_%J.log
+#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3/logs/%x/stdout/stdout_%J.log
+#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
 #SBATCH --partition=accel_ai
@@ -35,7 +35,7 @@ nvcc -V
 
 python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Sunbird Start】: $SLURM_JOB_NAME"
 
-nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
+nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3/mlruns > /dev/null 2>&1 &
 echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
@@ -47,21 +47,15 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_cls_inject.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --run_mode finetune \
-    --use_pretrained \
-    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
     --target_observation "['effusion', 'tube']" \
     # --resume_from_checkpoint
-    # --num_epochs 1 \
-    # --batch_size 1 \
-    # --grad_accum_steps 1 \
-    # --lr 0.0001 \
 
 echo "Script [finetune] finished."
 
@@ -69,19 +63,18 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_1_disease_fea_2cls.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_1_disease_features_2cls.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_cls_inject.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --classification_only \
     --run_mode eval_finetuned \
-    --use_pretrained \
-    --pretain_model_path /scratch/c.c21051562/workspace/arrg_img2text/outputs/models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
     --target_observation "['effusion', 'tube']" \
-  
-echo "Script [finetune] finished."
+
+echo "Script [eval_finetuned] finished."
+
 
 # 查找运行在该端口的 mlflow 进程
 pids=$(lsof -i :$mlflow_port -sTCP:LISTEN -t)
@@ -102,7 +95,7 @@ python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Su
 # scontrol show job JOBID | grep NodeList
 # scancel JOBID
 
-# tensorboard --logdir=/scratch/c.c21051562/workspace/arrg_img2text/outputs/logs --port=6006
+# tensorboard --logdir=/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3/logs --port=6006
 
 # Check process and kill
 # ps aux | grep <进程名>
@@ -113,5 +106,5 @@ python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Su
 
 # ssh -L 6007:localhost:6006 -J c.c21051562@hawklogin.cf.ac.uk c.c21051562@sunbird.swansea.ac.uk
 # conda activate arrg_img2text
-# mlflow server --host 127.0.0.1 --port 6006 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns
+# mlflow server --host 127.0.0.1 --port 6006 --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3/mlruns
 
