@@ -35,7 +35,7 @@ nvcc -V
 
 python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Sunbird Start】: $SLURM_JOB_NAME"
 
-nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3/mlruns > /dev/null 2>&1 &
+nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs/mlruns > /dev/null 2>&1 &
 echo "MLflow server started"
 
 echo "Running script ... (job: $SLURM_JOB_NAME $SLURM_JOB_ID)"
@@ -59,7 +59,7 @@ accelerate launch\
     --target_observation "['effusion', 'tube']" \
     # --resume_from_checkpoint
     
-echo "Script [finetune] finished."
+# echo "Script [finetune] finished."
 
 accelerate launch\
     --multi_gpu \

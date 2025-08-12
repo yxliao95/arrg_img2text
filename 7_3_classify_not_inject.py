@@ -1459,7 +1459,8 @@ def train(model, train_dataloader, train_cfg, valid_dataloader=None, test_datalo
                     validation_process(model, valid_dataloader, max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
                 else:
                     # 当 classification_only=False 时，不进行验证， 使用 ckp_per_steps 保存检查点
-                    check_and_save_checkpoint(max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
+                    # check_and_save_checkpoint(max_num_iters_per_epoch=len(train_dataloader), train_cfg=train_cfg)
+                    pass
 
         end = time.time()
         LOGGER.info("Batch training time: %s ", seconds_to_time_str(end - start))
