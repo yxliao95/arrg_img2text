@@ -51,7 +51,10 @@ accelerate launch\
     --main_process_port $main_process_port \
     /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_not_cls_not_inject.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_mix.yaml \
+    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_text/results \
+    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_text/models \
+    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_text/checkpoints \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
@@ -67,7 +70,10 @@ accelerate launch\
     --main_process_port $main_process_port \
     /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_not_cls_not_inject.yaml \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_mix.yaml \
+    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_text/results \
+    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_text/models \
+    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_text/checkpoints \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \

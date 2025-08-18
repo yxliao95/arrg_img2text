@@ -1,9 +1,9 @@
 output_name: 00_test
 
 output_dir:
-  result: /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_anat/results
-  model: /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_anat/models
-  checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_anat/checkpoints
+  result: /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/results
+  model: /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/models
+  checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/checkpoints
 
 # For preprocess, we will load data from data_path
 # For training, we will load dataset from preprocess.cache_path
@@ -11,7 +11,7 @@ data_path:
   mimic: /scratch/c.c21051562/resources/data/mimic-cxr
   interpret: /scratch/c.c21051562/resources/data/interpret-cxr
   interpret-test-public: /scratch/c.c21051562/resources/data/interpret-cxr-test-public
-  text_graph: /scratch/c.c21051562/resources/data/interpret_anatomy
+  text_graph: /scratch/c.c21051562/resources/data/interpret_anatomy/43_anatomy
 
 target_section: findings
 
@@ -101,8 +101,8 @@ finetune:
   num_beams: 3
 
 obs_cls_merge_map:
-  "": "absent"
-obs_classification_map: ["absent", "mentioned"]
+  "absent": ""
+obs_classification_map: ["", "mentioned"]
 observation_map:
   [
     'lung',

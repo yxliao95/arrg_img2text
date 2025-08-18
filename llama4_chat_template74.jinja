@@ -1,0 +1,46 @@
+{% if not add_generation_prompt is defined %}
+    {% set add_generation_prompt = false %}
+{% endif %}
+
+{{ '<|begin_of_text|>' }}
+
+{% for message in messages %}
+    {{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n' }}
+
+    {# Render all images first #}
+    {% for content in message['content'] | selectattr('type', 'equalto', 'image') %}
+        {{ "Here's a set of chest X-ray images:\n" }}
+        {% for i in range(content["num_images"]) %}
+            {{ '<|image_start|>' }}
+            {% for j in range(content["num_image_tokens"]) %}{{ '<|image_token|>' }}{% endfor %}
+            {{ '<|image_end|>\n' }}
+        {% endfor %}
+    {% endfor %}
+
+    {# Render all obs labels #}
+    {% for content in message['content'] | selectattr('type', 'equalto', 'label') %}
+        {{ "Here's a set of preliminary key radiological findings:\n" }}
+        {% for label_name in content["obs_labels"] %}
+            {{ label_name + ': <|label_start|><|label_token|><|label_end|>\n' }}
+        {% endfor %}
+    {% endfor %}
+
+    {# Render all text next #}
+    {# See description for `generation`: https://huggingface.co/docs/transformers/internal/tokenization_utils#transformers.PreTrainedTokenizerBase.apply_chat_template.return_assistant_tokens_mask #}
+    {% for content in message['content'] | selectattr('type', 'equalto', 'text') %}
+        {% if message['role'] == 'assistant' %}
+            {% generation %}{{ content['text'] + '<|eot_id|>' }}{% endgeneration %}
+        {% else %}
+            {{ content['text'] + '<|eot_id|>' }}
+        {% endif %}
+    {% endfor %}
+
+    {% if not loop.last %}{{ '\n' }}{% endif %}
+{% endfor %}
+
+
+{% if add_generation_prompt %}
+    {{ '\n<|start_header_id|>assistant<|end_header_id|>\n' }}
+{% else %}
+    {{ '<|end_of_text|>' }}
+{% endif %}

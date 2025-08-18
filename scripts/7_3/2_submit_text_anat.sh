@@ -1,45 +1,57 @@
 #!/bin/bash
-MLFLOW_START=6123
-MAIN_START=29123
-JOB_NAME="7_3_text"
+MLFLOW_START=6223
+MAIN_START=29223
+JOB_NAME="8_3_text"
 
-target_script=/scratch/c.c21051562/workspace/arrg_img2text/scripts/7_3/1_run_7_3_text.sh
+target_script=/scratch/c.c21051562/workspace/arrg_img2text/scripts/7_3/2_run_8_3_text_anat.sh
 
 # 对于findings来说，只考虑以下30个即可
-# ["effusion", "pneumothorax", "normal", "consolidation", "opacity", "clear", "atelectasis", "edema", "tube", "catheter", "pneumonia", "infiltrate", "pathophysiologic finding", "congestion", "degeneration", "wire", "enlargement", "infection", "thickening", "fracture", "pacemaker", "scoliosis", "chronic obstructive pulmonary disease", "medical device", "calcifications", "emphysema", "surgical clip", "atherosclerosis", "calcification", "granuloma"]
+# ['lung', 'lungs', 'heart', 'lobe', 'lining', 'contour', 'base', 'thorax', 'parenchyma', 'lower lobe of left lung', 'hemidiaphragm', 'carina', 'aorta', 'rib', 'caudomedial auditory cortex', 'base of prostate', 'stomach', 'mediastinum', 'spine', 'vasculature', 'airspace', 'lung zone', 'costophrenic sulcus', 'wall', 'hemithorax', 'collateral trigone of lateral ventricle', 'portion of tissue', 'right atrium', 'lower lobe of right lung', 'fluid', 'middle', 'chest wall', 'superior vena cava', 'upper lobe of right lung', 'thoracic vertebral column', 'vein', 'diaphragm', 'hilum', 'upper extremity', 'limb of body', 'paranasal sinuses', 'thoracic aorta', 'apex of prostate']
 pairs=(
-    "effu|['effusion']"
-    "pneu|['pneumothorax']"
-    "norm|['normal']"
-    "consolidation|['consolidation']"
-    "opac|['opacity']"
-    "clear|['clear']"
-    "atelectasis|['atelectasis']"
-    "edema|['edema']"
-    "tube|['tube']"
-    "catheter|['catheter']"
-    "pneumonia|['pneumonia']"
-    "infiltrate|['infiltrate']"
-    "pathFinding|['pathophysiologic finding']"
-    "congestion|['congestion']"
-    "degeneration|['degeneration']"
-    "wire|['wire']"
-    "enlargement|['enlargement']"
-    "infection|['infection']"
-    "thickening|['thickening']"
-    "fracture|['fracture']"
-    "pacemaker|['pacemaker']"
-    "scoliosis|['scoliosis']"
-    "copd|['chronic obstructive pulmonary disease']"
-    "medicalDevice|['medical device']"
-    "calcifications|['calcifications']"
-    "emphysema|['emphysema']"
-    "surgicalClip|['surgical clip']"
-    "atherosclerosis|['atherosclerosis']"
-    "calcification|['calcification']"
-    "granuloma|['granuloma']"
+  "lung|['lung']"
+  "lungs|['lungs']"
+  "heart|['heart']"
+  "lobe|['lobe']"
+  "lining|['lining']"
+  "contour|['contour']"
+  "base|['base']"
+  "thorax|['thorax']"
+  "parenchyma|['parenchyma']"
+  "lowerLobeLeftLung|['lower lobe of left lung']"
+  "hemidiaphragm|['hemidiaphragm']"
+  "carina|['carina']"
+  "aorta|['aorta']"
+  "rib|['rib']"
+  "caudomedialAuditoryCortex|['caudomedial auditory cortex']"
+  "baseProstate|['base of prostate']"
+  "stomach|['stomach']"
+  "mediastinum|['mediastinum']"
+  "spine|['spine']"
+  "vasculature|['vasculature']"
+  "airspace|['airspace']"
+  "lungZone|['lung zone']"
+  "costophrenicSulcus|['costophrenic sulcus']"
+  "wall|['wall']"
+  "hemithorax|['hemithorax']"
+  "collateralTrigoneLateralVentricle|['collateral trigone of lateral ventricle']"
+  "portionTissue|['portion of tissue']"
+  "rightAtrium|['right atrium']"
+  "lowerLobeRightLung|['lower lobe of right lung']"
+  "fluid|['fluid']"
+  "middle|['middle']"
+  "chestWall|['chest wall']"
+  "superiorVenaCava|['superior vena cava']"
+  "upperLobeRightLung|['upper lobe of right lung']"
+  "thoracicVertebralColumn|['thoracic vertebral column']"
+  "vein|['vein']"
+  "diaphragm|['diaphragm']"
+  "hilum|['hilum']"
+  "upperExtremity|['upper extremity']"
+  "limbBody|['limb of body']"
+  "paranasalSinuses|['paranasal sinuses']"
+  "thoracicAorta|['thoracic aorta']"
+  "apexProstate|['apex of prostate']"
 )
-
 
 i=0
 for pair in "${pairs[@]}"; do

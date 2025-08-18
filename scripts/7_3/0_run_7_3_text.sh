@@ -1,11 +1,11 @@
 #!/bin/bash
 
-#SBATCH --job-name=8_3_text_anat_
+#SBATCH --job-name=7_3_text_
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
-#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/logs/%x/stdout/stdout_%J.log
-#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/logs/%x/stderr/stderr_%J.log
+#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_mix/logs/%x/stdout/stdout_%J.log
+#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_mix/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
 #SBATCH --partition=accel_ai
@@ -19,6 +19,7 @@
 mlflow_port=${1}
 main_process_port=${2}
 target_observation=${3}
+num_epoch=${4}
 
 cuda=CUDA/12.4
 conda=anaconda/2024.06
@@ -36,7 +37,7 @@ nvcc -V
 
 python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Sunbird Start】: $SLURM_JOB_NAME"
 
-nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/mlruns > /dev/null 2>&1 &
+nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_mix/mlruns > /dev/null 2>&1 &
 echo "MLflow server started"
 
 
@@ -51,15 +52,13 @@ accelerate launch\
     --main_process_port $main_process_port \
     /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/8_3_text_anat.yaml \
-    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/results \
-    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/models \
-    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/checkpoints \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_mix.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --run_mode finetune \
     --target_observation "${target_observation}" \
+    --num_epochs $num_epoch \
     # --resume_from_checkpoint
 
 echo "Script [finetune] finished."
@@ -70,10 +69,7 @@ accelerate launch\
     --main_process_port $main_process_port \
     /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/8_3_text_anat.yaml \
-    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/results \
-    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/models \
-    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/checkpoints \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_mix.yaml \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \

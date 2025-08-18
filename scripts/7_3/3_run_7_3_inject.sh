@@ -1,11 +1,11 @@
 #!/bin/bash
 
-#SBATCH --job-name=8_3_text_anat_
+#SBATCH --job-name=7_3_inject_
 #SBATCH --account=scw2258
 
 # Job stdout file. The '%J' = job number. %x = job name
-#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/logs/%x/stdout/stdout_%J.log
-#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/logs/%x/stderr/stderr_%J.log
+#SBATCH --output=/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/logs/%x/stdout/stdout_%J.log
+#SBATCH --error=/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/logs/%x/stderr/stderr_%J.log
 
 # Number of GPUs to allocate (don't forget to select a partition with GPUs)
 #SBATCH --partition=accel_ai
@@ -36,7 +36,7 @@ nvcc -V
 
 python /scratch/c.c21051562/workspace/test_email.py --from_bash --subject "【Sunbird Start】: $SLURM_JOB_NAME"
 
-nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/mlruns > /dev/null 2>&1 &
+nohup mlflow server --host localhost --port $mlflow_port --backend-store-uri file:/scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/mlruns > /dev/null 2>&1 &
 echo "MLflow server started"
 
 
@@ -49,16 +49,18 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_3_classify_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/8_3_text_anat.yaml \
-    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/results \
-    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/models \
-    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/checkpoints \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_mix.yaml \
+    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/results \
+    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/models \
+    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/checkpoints \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --run_mode finetune \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/resources/downloaded_models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
     --target_observation "${target_observation}" \
     # --resume_from_checkpoint
 
@@ -68,17 +70,19 @@ accelerate launch\
     --multi_gpu \
     --num_processes 2 \
     --main_process_port $main_process_port \
-    /scratch/c.c21051562/workspace/arrg_img2text/7_3_not_clsssify_not_inject.py \
+    /scratch/c.c21051562/workspace/arrg_img2text/7_3_classify_inject.py \
     --from_bash \
-    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/8_3_text_anat.yaml \
-    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/results \
-    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/models \
-    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_8_3_text_anat/checkpoints \
+    --config_file /scratch/c.c21051562/workspace/arrg_img2text/config/sunbird/7_3_mix.yaml \
+    --output_result_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/results \
+    --output_model_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/models \
+    --output_checkpoint_dir /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_inject/checkpoints \
     --output_name $SLURM_JOB_NAME \
     --jobid $SLURM_JOB_ID \
     --mlflow_port $mlflow_port \
     --classification_only \
     --run_mode eval_finetuned \
+    --use_pretrained \
+    --pretain_model_path /scratch/c.c21051562/resources/downloaded_models/7_1_pretrain_cls_only_42obs_1161_2x10-5 \
     --target_observation "${target_observation}" \
 
 echo "Script [eval_finetuned] finished."

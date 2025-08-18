@@ -1,9 +1,9 @@
 output_name: 00_test
 
 output_dir:
-  result: /scratch/c.c21051562/workspace/arrg_img2text/outputs/results
-  model: /scratch/c.c21051562/workspace/arrg_img2text/outputs/models
-  checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs/checkpoints
+  result: /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_mix/results
+  model: /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_mix/models
+  checkpoint: /scratch/c.c21051562/workspace/arrg_img2text/outputs_7_3_mix/checkpoints
 
 # For preprocess, we will load data from data_path
 # For training, we will load dataset from preprocess.cache_path
@@ -77,7 +77,7 @@ finetune:
   use_pretrained: False
   pretain_model_path: 
 
-  target_observation: ["effusion"]
+  target_observation: 
 
   seed: 42
   num_epochs: 1
@@ -97,7 +97,7 @@ finetune:
   eval_batch_size: 1
   max_new_tokens: 512
   print_pred_per_n_steps: 500
-  eval_valid_split: False
+  eval_valid_split: True
   num_beams: 3
 
 obs_cls_merge_map:

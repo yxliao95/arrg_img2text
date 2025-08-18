@@ -2735,6 +2735,10 @@ def global_init_proj_config():
 
     parser.add_argument("--use_pretrained", action="store_true", default=None)
     parser.add_argument("--pretain_model_path", type=str, default=None)
+    
+    parser.add_argument("--output_result_dir", type=str)
+    parser.add_argument("--output_model_dir", type=str)
+    parser.add_argument("--output_checkpoint_dir", type=str)
 
     args = parser.parse_args()
 
@@ -2761,6 +2765,11 @@ def global_init_proj_config():
 
         if args.classification_only:
             CONFIG["classification_only"] = True
+        
+        if args.output_result_dir:
+            CONFIG["output_dir"]["result"] = args.output_result_dir
+            CONFIG["output_dir"]["model"] = args.output_model_dir
+            CONFIG["output_dir"]["checkpoint"] = args.output_checkpoint_dir
 
         run_mode = None
         if "finetune" in CONFIG["run_mode"]:
@@ -2786,7 +2795,7 @@ def global_init_proj_config():
                 CONFIG[run_mode]["grad_accum_steps"] = args.grad_accum_steps
             if args.lr:
                 CONFIG[run_mode]["lr"] = args.lr
-
+        
     else:
         CONFIG["jobid"] = "00000"
 
