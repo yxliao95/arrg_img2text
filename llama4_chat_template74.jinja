@@ -17,14 +17,6 @@
         {% endfor %}
     {% endfor %}
 
-    {# Render all obs labels #}
-    {% for content in message['content'] | selectattr('type', 'equalto', 'label') %}
-        {{ "Here's a set of preliminary key radiological findings:\n" }}
-        {% for label_name in content["obs_labels"] %}
-            {{ label_name + ': <|label_start|><|label_token|><|label_end|>\n' }}
-        {% endfor %}
-    {% endfor %}
-
     {# Render all text next #}
     {# See description for `generation`: https://huggingface.co/docs/transformers/internal/tokenization_utils#transformers.PreTrainedTokenizerBase.apply_chat_template.return_assistant_tokens_mask #}
     {% for content in message['content'] | selectattr('type', 'equalto', 'text') %}

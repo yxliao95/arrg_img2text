@@ -394,25 +394,28 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 image_indices_map = self._expand_image_indices_map_generation(image_indices_map=decoder_extra_inputs["image_indices_map"], expand_size=decoder_extra_inputs["num_beams"])
 
             # img clssifier
-            classifier_outputs = self.obs_classifier(
-                image_features,
-                image_indices_map=image_indices_map,
-                obs_ids=decoder_extra_inputs["obs_ids"],
-                obs_labels=decoder_extra_inputs.get("obs_labels", None),  # 如果是pred，则不会传入 obs_labels
-                output_loss=output_loss,
-            )
-            label_features = classifier_outputs.hidden_states  # torch.Size([2, num_obs, dec_dim])，如果是pred，则是 [num_beams * bsz, num_obs, dec_dim]；在pred阶段，label_features 跟 decoder_input_ids 是一一对应的，不需要进行额外处理
+            # update：pred节点，图像分类已经在 generate() 方法中完成了，因此这里不需要再进行图像分类
+            if "num_beams" not in decoder_extra_inputs:
+                classifier_outputs = self.obs_classifier(
+                    image_features,
+                    image_indices_map=image_indices_map,
+                    obs_ids=decoder_extra_inputs["obs_ids"],
+                    obs_labels=decoder_extra_inputs.get("obs_labels", None),  # 如果是pred，则不会传入 obs_labels
+                    output_loss=output_loss,
+                )
+                label_features = classifier_outputs.hidden_states  # torch.Size([2, num_obs, dec_dim])，如果是pred，则是 [num_beams * bsz, num_obs, dec_dim]；在pred阶段，label_features 跟 decoder_input_ids 是一一对应的，不需要进行额外处理
 
             # pred时，将logits传递到 generate() 方法中
-            if decoder_extra_outputs is not None:
-                if "num_beams" in decoder_extra_inputs:
-                    # 在pred阶段，cls_logits 是被 expand 的， 我们只需要每 expand_size 个元素取第一个
-                    expand_size = decoder_extra_inputs["num_beams"]
-                    cls_logits = classifier_outputs.logits
-                    cls_logits = cls_logits[::expand_size, :, :]
-                    decoder_extra_outputs["cls_logits"] = cls_logits
-                else:
-                    decoder_extra_outputs["cls_logits"] = classifier_outputs.logits  # torch.Size([2, num_obs, 3])；
+            # update：改为在 generate() 方法中处理
+            # if decoder_extra_outputs is not None:
+            #     if "num_beams" in decoder_extra_inputs:
+            #         # 在pred阶段，cls_logits 是被 expand 的， 我们只需要每 expand_size 个元素取第一个
+            #         expand_size = decoder_extra_inputs["num_beams"]
+            #         cls_logits = classifier_outputs.logits
+            #         cls_logits = cls_logits[::expand_size, :, :]
+            #         decoder_extra_outputs["cls_logits"] = cls_logits
+            #     else:
+            #         decoder_extra_outputs["cls_logits"] = classifier_outputs.logits  # torch.Size([2, num_obs, 3])；
 
             # 如果是 classification_only 模式，则只返回分类器的输出就可以结束，后面的组件已经被移除
             if self.config.classification_only:
@@ -438,15 +441,17 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 image_indices_map=image_indices_map,
             )
 
-            # inject observation label features into text embeddings
-            # 无论是 train 还是 pred 阶段，label_features 与 decoder_inputs_embeds 的每个样本都是对齐的，只需要按照顺序注入即可
-            assert (decoder_input_ids == self.config.label_token_index).any(), f"label_token_id {self.config.label_token_index} (<|label_token|>) not found in decoder_input_ids"
-            decoder_inputs_embeds = self._inject_features(
-                input_ids=decoder_input_ids,
-                decoder_inputs_embeds=decoder_inputs_embeds,
-                target_token_id=self.config.label_token_index,
-                target_features=label_features,
-            )
+            # update：
+            # 训练阶段，使用teacher forcing，在构造模型输入时，就已经将 cls labels 注入到 decoder_input_ids 中了
+            # # inject observation label features into text embeddings
+            # # 无论是 train 还是 pred 阶段，label_features 与 decoder_inputs_embeds 的每个样本都是对齐的，只需要按照顺序注入即可
+            # assert (decoder_input_ids == self.config.label_token_index).any(), f"label_token_id {self.config.label_token_index} (<|label_token|>) not found in decoder_input_ids"
+            # decoder_inputs_embeds = self._inject_features(
+            #     input_ids=decoder_input_ids,
+            #     decoder_inputs_embeds=decoder_inputs_embeds,
+            #     target_token_id=self.config.label_token_index,
+            #     target_features=label_features,
+            # )
 
         # Text generation. decoder_inputs_embeds is used in replace of decoder_input_ids on decoder in all cases.
         # In train statge, decoder_input_ids is encoded into decoder_inputs_embeds and then merged with image features.
@@ -544,7 +549,8 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
         inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(inputs, generation_config.bos_token_id, model_kwargs)
         # batch_size = inputs_tensor.shape[0]
         # encoder和decoder的bsz可能不一样，我们以decoder的bsz为准
-        batch_size = model_kwargs["decoder_input_ids"].shape[0]
+        # batch_size = model_kwargs["decoder_input_ids"].shape[0]
+        batch_size = len(kwargs["decoder_extra_inputs"]["batch_data"])
 
         device = inputs_tensor.device
         self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
@@ -571,8 +577,46 @@ class Vision2LanguageModel(VisionEncoderDecoderModel):
                 raise ValueError("`attention_mask` passed to `generate` must be 2D.")
 
         if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
-            # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
+            # if model is encoder decoder, encoder_outputs are created and added to `model_kwargs`
             model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(inputs_tensor, model_kwargs, model_input_name, generation_config)
+
+            ##### Update: 处理 CID 的部分 #####
+            # 在这里处理 CID 的部分，主要是为了在生成过程中使用分类器进行预测
+            # 并将预测结果转化为文字后注入到 decoder_input_ids 中
+            classifier_outputs = self.obs_classifier(
+                model_kwargs["encoder_outputs"].last_hidden_state,
+                image_indices_map=kwargs["decoder_extra_inputs"]["image_indices_map"],
+                obs_ids=kwargs["decoder_extra_inputs"]["obs_ids"],
+                obs_labels=None,  # 如果是pred，则不会传入 obs_labels
+                output_loss=False,
+            )
+
+            pred_obs_logits = classifier_outputs.logits  # torch.Size([bsz, num_obs, 3])
+            pred_obs_labels = pred_obs_logits.argmax(dim=-1)
+            pred_label_ids = pred_obs_labels.tolist()
+
+            pred_obs_label_list = []
+            for i in range(len(pred_label_ids)):
+                pred_obs_label_insample = []  # 初始化每个样本的预测标签列表
+                for obs_id, pred_label_id in zip(kwargs["decoder_extra_inputs"]["obs_ids"].tolist(), pred_label_ids[i]):
+                    obs_name = GLOBAL_VARS.obs_id2name_dict[obs_id]
+                    pred_cls_label = GLOBAL_VARS.obs_id2cls_dict[pred_label_id]
+                    if pred_cls_label == "mentioned":
+                        pred_obs_label_insample.append(obs_name)
+                pred_obs_label_list.append(pred_obs_label_insample)
+
+            tokenizer_outputs = get_inputs_during_generation(
+                tokenizer=kwargs["decoder_extra_inputs"]["tokenizer"],
+                batch_data=kwargs["decoder_extra_inputs"]["batch_data"],
+                label_name_list=kwargs["decoder_extra_inputs"]["label_name_list"],
+                pred_obs_labels=pred_obs_label_list,
+            )
+            model_kwargs["decoder_input_ids"] = tokenizer_outputs["decoder_input_ids"]
+            model_kwargs["decoder_attention_mask"] = tokenizer_outputs["decoder_attention_mask"]
+
+            kwargs["decoder_extra_outputs"]["pred_seq_start_ids"] = tokenizer_outputs["decoder_input_ids"].size(1)
+            kwargs["decoder_extra_outputs"]["cls_logits"] = pred_obs_logits
+            ##################
 
             # 5. Prepare `input_ids` which will be used for auto-regressive generation
             # 原始方法，当input_ids不是以decoder_start_token_id开头时，添加decoder_start_token_id
@@ -1041,7 +1085,7 @@ class ImageTextDataset(Dataset):
         LOGGER.info("Removed [%d] samples with empty [%s] gold_text from [%s] split", num_removed, self.target_section, self.split)
 
         return filtered_dataset
-    
+
     def __len__(self):
         return len(self.samples)
 
@@ -1138,11 +1182,11 @@ def get_inputs_for_training(tokenizer, batch_data, gold_text_list, label_name_li
         num_images = len(item["images"])
 
         assistaant_output_text = gold_text_list[idx]
+        gold_labels = [x for x, flag in zip(label_name_list, obs_labels[idx]) if flag]
 
         content_list = []
         content_list.append({"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens})
-        content_list.append({"type": "label", "obs_labels": label_name_list})
-        content_list.append({"type": "text", "text": "Based on the provided chest X-ray images and the preliminary key radiological findings, please verify the findings on the images and generate an accurate report accordingly."})
+        content_list.append({"type": "text", "text": f"Based on the provided chest X-ray images, please generate an accurate report accordingly. The following findings are identified in the images, please alwarys describe them in the report: [{', '.join(gold_labels)}]."})
 
         conversations.append(
             [
@@ -1190,15 +1234,30 @@ def get_inputs_for_training(tokenizer, batch_data, gold_text_list, label_name_li
 
 def get_inputs_for_inference(tokenizer, batch_data, gold_text_list, label_name_list, pixel_values, image_indices_map, obs_labels, obs_ids):
 
+    return {
+        "batch_data": batch_data,
+        "pixel_values": pixel_values,  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
+        "image_indices_map": image_indices_map,  # [0, 0, 1, 2, 2, ...]
+        "data_id_list": [i["data_key"] for i in batch_data],
+        "gold_text_list": gold_text_list,
+        "obs_labels": obs_labels,
+        "obs_ids": obs_ids,
+        "label_name_list": label_name_list,
+    }
+
+
+def get_inputs_during_generation(tokenizer, batch_data, label_name_list, pred_obs_labels):
+
     conversations = []
     num_image_tokens = GLOBAL_VARS.num_image_tokens
     for idx, item in enumerate(batch_data):
         num_images = len(item["images"])
 
+        pred_labels = [x for x, flag in zip(label_name_list, pred_obs_labels[idx]) if flag]
+
         content_list = []
         content_list.append({"type": "image", "num_images": num_images, "num_image_tokens": num_image_tokens})
-        content_list.append({"type": "label", "obs_labels": label_name_list})
-        content_list.append({"type": "text", "text": "Based on the provided chest X-ray images and the preliminary key radiological findings, please verify the findings on the images and generate an accurate report accordingly."})
+        content_list.append({"type": "text", "text": f"Based on the provided chest X-ray images, please generate an accurate report accordingly. The following findings are identified in the images, please alwarys describe them in the report: [{', '.join(pred_labels)}]."})
 
         conversations.append(
             [
@@ -1225,15 +1284,8 @@ def get_inputs_for_inference(tokenizer, batch_data, gold_text_list, label_name_l
     input_text_tensor_dict = tokenizer.apply_chat_template(conversations, add_generation_prompt=add_generation_prompt, tokenize=True, padding=True, return_dict=True, return_tensors="pt", tokenizer_kwargs=tokenizer_kwargs, return_assistant_tokens_mask=return_assistant_tokens_mask)
 
     return {
-        "batch_data": batch_data,
-        "pixel_values": pixel_values,  # torch.Size([bsz < x < 2*bsz, 3, 224, 224])
-        "image_indices_map": image_indices_map,  # [0, 0, 1, 2, 2, ...]
         "decoder_input_ids": input_text_tensor_dict.input_ids.to(DEVICE),
         "decoder_attention_mask": input_text_tensor_dict.attention_mask.to(DEVICE),
-        "data_id_list": [i["data_key"] for i in batch_data],
-        "gold_text_list": gold_text_list,
-        "obs_labels": obs_labels,
-        "obs_ids": obs_ids,
     }
 
 
@@ -1713,8 +1765,8 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
                 with ACCELERATOR.autocast():
                     outputs = model.forward(
                         pixel_values=input_tensors_dict["pixel_values"],
-                        decoder_input_ids=input_tensors_dict["decoder_input_ids"],
-                        decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
+                        decoder_input_ids=None,
+                        decoder_attention_mask=None,
                         decoder_extra_inputs={
                             "image_indices_map": input_tensors_dict["image_indices_map"],
                             "obs_labels": input_tensors_dict["obs_labels"],
@@ -1759,20 +1811,23 @@ def evaluate(model, target_dataloader, overwrite_pred_file=False, **kwargs):
                     outputs, extra_outputs = model.generate(
                         generation_config=generation_config,
                         inputs=input_tensors_dict["pixel_values"],
-                        decoder_input_ids=input_tensors_dict["decoder_input_ids"],
-                        decoder_attention_mask=input_tensors_dict["decoder_attention_mask"],
+                        decoder_input_ids=None,
+                        decoder_attention_mask=None,
                         decoder_extra_inputs={
                             "image_indices_map": input_tensors_dict["image_indices_map"],
                             "obs_ids": input_tensors_dict["obs_ids"],
                             "num_beams": num_beams,
+                            "tokenizer": target_dataloader.dataset.tokenizer,
+                            "batch_data": input_tensors_dict["batch_data"],
+                            "label_name_list": input_tensors_dict["label_name_list"],
                         },
-                        decoder_extra_outputs={"cls_logits": None},
+                        decoder_extra_outputs={"cls_logits": None, "pred_seq_start_ids": None},
                     )
                     check_memory(show_only_if_peak=True)
 
                 # Gathers input_data and potentially drops duplicates in the last batch if on a distributed system.
                 # 没有使用 gather，而是在 load_pred_results 中对结果进行去重
-                pred_seq_start_ids = input_tensors_dict["decoder_input_ids"].size(1)  # 生成的序列的起始位置
+                pred_seq_start_ids = extra_outputs["pred_seq_start_ids"]  # 生成的序列的起始位置
                 pred_sequences_ids = outputs.sequences[:, pred_seq_start_ids:]
                 pred_sequences = tokenizer.batch_decode(pred_sequences_ids, skip_special_tokens=True)
                 pred_text = pred_sequences
@@ -2732,7 +2787,7 @@ def global_init_proj_config():
 
     parser.add_argument("--use_pretrained", action="store_true", default=None)
     parser.add_argument("--pretain_model_path", type=str, default=None)
-    
+
     parser.add_argument("--output_result_dir", type=str)
     parser.add_argument("--output_model_dir", type=str)
     parser.add_argument("--output_checkpoint_dir", type=str)
@@ -2742,7 +2797,7 @@ def global_init_proj_config():
     if args.from_bash:
         file_path = args.config_file
     else:
-        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/7_1_disease_fea.yaml"
+        file_path = "/home/yuxiang/liao/workspace/arrg_img2text/config/7_4_cid.yaml"
 
     with open(file_path, "r", encoding="utf-8") as f:
         CONFIG = yaml.safe_load(f)
@@ -2762,7 +2817,7 @@ def global_init_proj_config():
 
         if args.classification_only:
             CONFIG["classification_only"] = True
-        
+
         if args.output_result_dir:
             CONFIG["output_dir"]["result"] = args.output_result_dir
             CONFIG["output_dir"]["model"] = args.output_model_dir
@@ -2792,7 +2847,7 @@ def global_init_proj_config():
                 CONFIG[run_mode]["grad_accum_steps"] = args.grad_accum_steps
             if args.lr:
                 CONFIG[run_mode]["lr"] = args.lr
-        
+
     else:
         CONFIG["jobid"] = "00000"
 
@@ -2950,6 +3005,13 @@ def eval_finetuned_model(train_cfg):
         # 理论上，加载processor和init_processor的效果是一样的，tokenizer
         # img_processor, tokenizer = init_processor(vision_model_path, language_model_path, model_base_cfg)
         img_processor, tokenizer = load_processor(peft_model_path)
+
+    # TODO 用于在linux上debug
+    # post_init_model_and_tokenizer(model, tokenizer)
+    # model = apply_peft_to_model(model)
+    # global_init_accelerator(model, **train_cfg)
+    # check_memory()
+    # model.to(DEVICE)
 
     post_init_model_and_tokenizer(model, tokenizer)
     model = load_peft_model(base_model=model, peft_model_path=peft_model_path)
